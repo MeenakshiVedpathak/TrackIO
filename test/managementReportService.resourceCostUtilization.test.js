@@ -162,3 +162,24 @@ test('exportResourceCostUtilization: calls the repo with exportAll=true and skip
     restore();
   }
 });
+
+test('getResourceCostUtilization: BU and Sub-BU come through as separate fields (null Sub BU for a top-level-only row)', async () => {
+  try {
+    managementReportRepo.getResourceCostUtilization = async () => ({
+      rows: [
+        { ...SAMPLE_ROW, bu_name: 'DATA + AI', sub_bu_name: 'DAS, IBM' },
+        { ...SAMPLE_ROW, employee_id: 2, bu_name: 'Software Solutions', sub_bu_name: null },
+      ],
+      total: 2,
+      summary: [],
+    });
+    const result = await managementReportService.getResourceCostUtilization(QUERY, [1]);
+    const [withSub, noSub] = result.data;
+    assert.equal(withSub.buName, 'DATA + AI');
+    assert.equal(withSub.subBuName, 'DAS, IBM');
+    assert.equal(noSub.buName, 'Software Solutions');
+    assert.equal(noSub.subBuName, null);
+  } finally {
+    restore();
+  }
+});

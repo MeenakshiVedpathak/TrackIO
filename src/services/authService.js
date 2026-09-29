@@ -59,6 +59,7 @@ function expiryToDate(expiry) {
 function sanitiseEmployee(employee) {
   const plain = employee.toJSON ? employee.toJSON() : { ...employee };
   delete plain.password;
+  delete plain.microsoft_object_id;
   return plain;
 }
 
@@ -380,7 +381,10 @@ async function login(email, password, ipAddress, userAgent) {
 async function loginWithMicrosoft(idToken, ipAddress, userAgent) {
   const { email, oid } = await microsoftAuthService.verifyMicrosoftIdToken(idToken);
 
-  const employee = await authRepository.findEmployeeByEmail(email);
+  // Microsoft's stable `oid` first (survives an email/UPN rename in Azure),
+  // then email — every employee who has never used Microsoft SSO yet.
+  const employee = (oid && await authRepository.findEmployeeByMicrosoftObjectId(oid))
+    || await authRepository.findEmployeeByEmail(email);
   if (!employee) {
     logger.warn('Microsoft SSO login attempt with unregistered email', { email });
     throw emailNotRegisteredError();
@@ -390,10 +394,13 @@ async function loginWithMicrosoft(idToken, ipAddress, userAgent) {
 
   logger.info('Employee logged in successfully via Microsoft SSO', { employeeId: employee.id, email: employee.email });
 
-  // Best-effort: remember Microsoft's stable identifier for this employee
-  // for future audit/hardening. Never blocks login on failure — email is,
-  // and remains, the sole login-matching key.
-  if (oid) {
+  // Best-effort: remember Microsoft's stable identifier for this employee so
+  // later logins match on it. Never blocks login on failure — the email
+  // fallback above keeps working either way.
+  if (oid && employee.microsoft_object_id !== oid) {
+    if (employee.microsoft_object_id) {
+      logger.warn('Replacing linked microsoft_object_id for employee', { employeeId: employee.id });
+    }
     authRepository.updateMicrosoftObjectId(employee.id, oid).catch((err) => {
       logger.warn('Failed to persist microsoft_object_id', { employeeId: employee.id, error: err.message });
     });

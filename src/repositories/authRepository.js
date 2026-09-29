@@ -210,11 +210,27 @@ async function deleteEmployeeSessions(employeeId) {
 }
 
 /**
+ * Find the employee already linked to a Microsoft object id (the `oid`
+ * claim) — Microsoft's stable per-user key, unlike email/UPN which can change.
+ * Same includes as findEmployeeByEmail(). `withMicrosoftIdentity` scope: the
+ * default scope hides microsoft_object_id, which the caller compares.
+ *
+ * @param {string} microsoftObjectId
+ * @returns {Promise<Employee|null>}
+ */
+async function findEmployeeByMicrosoftObjectId(microsoftObjectId) {
+  return Employee.scope('withMicrosoftIdentity').findOne({
+    where: { microsoft_object_id: microsoftObjectId },
+    include: [ROLES_INCLUDE, BUSINESS_UNITS_INCLUDE],
+  });
+}
+
+/**
  * Persist Microsoft's stable object id (the `oid` claim) against an employee
  * on a successful Microsoft SSO login — see authService.loginWithMicrosoft().
  * Best-effort by design: the caller treats a failure here as non-fatal to
- * the login itself, since email remains the sole login-matching key and this
- * value is stored for audit/future hardening only.
+ * the login itself — later logins match on this value first
+ * (findEmployeeByMicrosoftObjectId()), falling back to email if it's unset.
  *
  * @param {number} employeeId
  * @param {string} microsoftObjectId
@@ -238,5 +254,6 @@ module.exports = {
   revokeFamily,
   revokeSessionByJti,
   deleteEmployeeSessions,
+  findEmployeeByMicrosoftObjectId,
   updateMicrosoftObjectId,
 };

@@ -189,9 +189,9 @@ module.exports = (sequelize) => {
       },
       // Microsoft Entra ID's stable, per-tenant, non-reassignable identifier
       // (the `oid` claim) — captured on first successful Microsoft SSO login,
-      // see authRepository.updateMicrosoftObjectId(). Email remains the sole
-      // login-matching key; this is stored for audit/future hardening only,
-      // not currently used to gate access. NULL for every employee who has
+      // see authRepository.updateMicrosoftObjectId(), and matched BEFORE email
+      // on every later one (authRepository.findEmployeeByMicrosoftObjectId()),
+      // so an email/UPN rename in Azure doesn't break login. NULL for every employee who has
       // never signed in via Microsoft SSO — see database/migrations/
       // 20260881_add_employee_microsoft_object_id.sql.
       microsoft_object_id: {
@@ -222,13 +222,19 @@ module.exports = (sequelize) => {
       indexes: [
         { unique: true, fields: ['company_id', 'employee_code'], name: 'uq_employees_company_code' },
       ],
-      // Password excluded by default; use Employee.scope('withPassword') when needed.
+      // Password and the linked Microsoft object id are excluded by default,
+      // so no Employee Master/list/profile response ever exposes them; only
+      // the Microsoft SSO login path reads them, via
+      // Employee.scope('withPassword') or Employee.scope('withMicrosoftIdentity').
       defaultScope: {
-        attributes: { exclude: ['password'] },
+        attributes: { exclude: ['password', 'microsoft_object_id'] },
       },
       scopes: {
         withPassword: {
           attributes: {},
+        },
+        withMicrosoftIdentity: {
+          attributes: { exclude: ['password'] },
         },
       },
       hooks: {

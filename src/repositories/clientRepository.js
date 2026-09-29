@@ -89,11 +89,21 @@ const findAll = async (filters = {}, pagination = {}, sort = {}) => {
     where.status = status;
   }
 
-  // Full-text search on client_name and client_code
+  // Search every text column the Client Master list shows. In its own
+  // [Op.and] entry — NOT `where[Op.or] = ...`: for a company-less Admin,
+  // companyScope() above is itself an [Op.or] (owned BUs OR own BU-less
+  // clients), and assigning the search to the same key REPLACED it, so any
+  // Admin search matched clients across every tenant.
   if (search && search.trim()) {
-    where[Op.or] = [
-      { client_name: { [Op.iLike]: `%${search.trim()}%` } },
-      { client_code: { [Op.iLike]: `%${search.trim()}%` } },
+    where[Op.and] = [
+      ...(where[Op.and] || []),
+      {
+        [Op.or]: [
+          { client_name: { [Op.iLike]: `%${search.trim()}%` } },
+          { client_code: { [Op.iLike]: `%${search.trim()}%` } },
+          { industry: { [Op.iLike]: `%${search.trim()}%` } },
+        ],
+      },
     ];
   }
 

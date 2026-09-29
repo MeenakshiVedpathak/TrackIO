@@ -75,10 +75,19 @@ const findAll = async (filters = {}, pagination = {}, sort = {}) => {
 
     if (filters.search && filters.search.trim()) {
       const searchTerm = `%${filters.search.trim()}%`;
-      where[Op.or] = [
-        { sub_project_name: { [Op.iLike]: searchTerm } },
-        { sub_project_code: { [Op.iLike]: searchTerm } },
-        { description: { [Op.iLike]: searchTerm } },
+      // Own [Op.and] entry so it can never overwrite an [Op.or]-shaped
+      // company scope (same bug found in clientRepository.findAll()).
+      where[Op.and] = [
+        ...(where[Op.and] || []),
+        {
+          [Op.or]: [
+            { sub_project_name: { [Op.iLike]: searchTerm } },
+            { sub_project_code: { [Op.iLike]: searchTerm } },
+            { description: { [Op.iLike]: searchTerm } },
+            // Service PO column (servicePOInclude below).
+            { '$servicePO.service_po_name$': { [Op.iLike]: searchTerm } },
+          ],
+        },
       ];
     }
 
@@ -106,6 +115,9 @@ const findAll = async (filters = {}, pagination = {}, sort = {}) => {
       limit: pagination.limit || 20,
       offset: pagination.offset || 0,
       distinct: true,
+      // servicePOInclude is belongsTo-only (no row multiplication); keeps the
+      // join in the same SELECT so the search's $servicePO...$ column resolves.
+      subQuery: false,
     });
 
     return result;

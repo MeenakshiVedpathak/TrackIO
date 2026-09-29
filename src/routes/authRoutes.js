@@ -117,10 +117,13 @@ router.post('/login', authLimiter, validate(loginSchema), authController.login);
  *     description: |
  *       The frontend completes an Authorization Code + PKCE sign-in via MSAL
  *       entirely client-side, then sends ONLY the resulting Microsoft ID
- *       token here. The backend verifies its signature (against Microsoft's
- *       JWKS), issuer, audience, expiration, and tenant ID before trusting
- *       any claim from it — email/name/role are never accepted from the
- *       request body itself.
+ *       token here. Multi-tenant: a work/school account from ANY Microsoft
+ *       Entra tenant can present a token. The backend verifies its signature
+ *       (against Microsoft's tenant-independent JWKS), audience, expiration,
+ *       and issuer against the token's own tenant ID, and requires the
+ *       email's domain to be verified in that tenant, before trusting any
+ *       claim from it — email/name/role are never accepted from the request
+ *       body itself. Employee Master decides who may log in.
  *
  *       Once the verified email resolves to an existing Employee, behavior
  *       is IDENTICAL to POST /auth/login from that point on: an Employee
@@ -145,9 +148,9 @@ router.post('/login', authLimiter, validate(loginSchema), authController.login);
  *       200:
  *         description: Login successful, OR role selection required (see requiresRoleSelection) — same response shape as POST /auth/login
  *       401:
- *         description: Invalid, expired, or wrong-tenant Microsoft token
+ *         description: Invalid or expired Microsoft token (signature, audience, issuer, tid/oid claims)
  *       403:
- *         description: Account or role is inactive
+ *         description: Account or role is inactive, or MICROSOFT_EMAIL_DOMAIN_NOT_VERIFIED (email domain not verified in the user's own tenant)
  *       404:
  *         description: Email ID is not registered
  *       422:

@@ -225,10 +225,30 @@ const findAll = async (filters = {}, pagination = {}, sort = {}) => {
   }
 
   if (search && search.trim()) {
+    // Every text column the PO Master list shows: PO name/code, Client,
+    // Project, Service Type, description, and any assigned Project Manager.
+    // Joined columns use Sequelize's $alias.column$ syntax against this
+    // query's own includes (subQuery: false below keeps them in one SELECT).
+    // The PM match uses the same rule as the list's `project_managers` column
+    // (employeeServicePOMappingService.getProjectManagersByServicePOIds): an
+    // active mapping flagged is_project_manager, Employee not soft-deleted.
+    const term = `%${search.trim()}%`;
     where[Op.and].push({
       [Op.or]: [
-        { service_po_name: { [Op.iLike]: `%${search.trim()}%` } },
-        { service_po_code: { [Op.iLike]: `%${search.trim()}%` } },
+        { service_po_name: { [Op.iLike]: term } },
+        { service_po_code: { [Op.iLike]: term } },
+        { service_description: { [Op.iLike]: term } },
+        { '$client.client_name$': { [Op.iLike]: term } },
+        { '$project.project_name$': { [Op.iLike]: term } },
+        { '$serviceType.service_type_name$': { [Op.iLike]: term } },
+        literal(`EXISTS (
+          SELECT 1 FROM employee_servicepo_mapping pm_search_m
+          INNER JOIN employees pm_search_e ON pm_search_e.id = pm_search_m.employee_id AND pm_search_e.is_deleted = false
+          WHERE pm_search_m.service_po_id = "ServicePO"."id"
+            AND pm_search_m.status = 'active'
+            AND pm_search_m.is_project_manager = true
+            AND pm_search_e.full_name ILIKE ${sequelize.escape(term)}
+        )`),
       ],
     });
   }

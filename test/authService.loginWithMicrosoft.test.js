@@ -14,6 +14,7 @@ const authService = require('../src/services/authService');
 
 const ORIGINAL = {
   findEmployeeByEmail: authRepository.findEmployeeByEmail,
+  findEmployeeByMicrosoftObjectId: authRepository.findEmployeeByMicrosoftObjectId,
   createSession: authRepository.createSession,
   updateLastLogin: authRepository.updateLastLogin,
   updateMicrosoftObjectId: authRepository.updateMicrosoftObjectId,
@@ -23,6 +24,7 @@ const ORIGINAL = {
 
 function restore() {
   authRepository.findEmployeeByEmail = ORIGINAL.findEmployeeByEmail;
+  authRepository.findEmployeeByMicrosoftObjectId = ORIGINAL.findEmployeeByMicrosoftObjectId;
   authRepository.createSession = ORIGINAL.createSession;
   authRepository.updateLastLogin = ORIGINAL.updateLastLogin;
   authRepository.updateMicrosoftObjectId = ORIGINAL.updateMicrosoftObjectId;
@@ -31,6 +33,7 @@ function restore() {
 }
 
 function stubHappyPathSideEffects() {
+  authRepository.findEmployeeByMicrosoftObjectId = async () => null;
   authRepository.createSession = async () => ({});
   authRepository.updateLastLogin = async () => {};
   authRepository.updateMicrosoftObjectId = async () => {};
@@ -63,6 +66,8 @@ function baseEmployee(overrides) {
 }
 
 function stubVerifiedToken(claims) {
+  // No employee linked by oid unless a test says otherwise — falls through to email.
+  authRepository.findEmployeeByMicrosoftObjectId = async () => null;
   microsoftAuthService.verifyMicrosoftIdToken = async () => ({
     email: 'employee@example.com',
     oid: 'ms-oid-123',
@@ -197,5 +202,51 @@ test('loginWithMicrosoft() never calls the Microsoft token verifier with anythin
   await authService.loginWithMicrosoft('the-raw-id-token');
 
   assert.equal(receivedArg, 'the-raw-id-token');
+  restore();
+});
+
+test('loginWithMicrosoft() matches an already-linked oid first — works after the email is renamed in Azure, no email lookup', async () => {
+  stubHappyPathSideEffects();
+  stubVerifiedToken({ email: 'new.name@example.com', oid: 'ms-oid-123' });
+  authRepository.findEmployeeByMicrosoftObjectId = async (oid) =>
+    (oid === 'ms-oid-123' ? baseEmployee({ id: 7, email: 'old.name@example.com', microsoft_object_id: 'ms-oid-123' }) : null);
+  let emailLookups = 0;
+  authRepository.findEmployeeByEmail = async () => { emailLookups += 1; return null; };
+  let persisted = false;
+  authRepository.updateMicrosoftObjectId = async () => { persisted = true; };
+
+  const result = await authService.loginWithMicrosoft('some-id-token');
+
+  assert.equal(result.employee.id, 7);
+  assert.equal(emailLookups, 0);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(persisted, false, 'already linked to this oid — no rewrite');
+  restore();
+});
+
+test('loginWithMicrosoft() falls back to email for an employee never linked yet (new employee) and links their oid', async () => {
+  stubHappyPathSideEffects();
+  stubVerifiedToken({ email: 'new.hire@example.com', oid: 'ms-oid-new' });
+  authRepository.findEmployeeByEmail = async () => baseEmployee({ id: 9, email: 'new.hire@example.com', microsoft_object_id: null });
+  let persisted = null;
+  authRepository.updateMicrosoftObjectId = async (employeeId, oid) => { persisted = { employeeId, oid }; };
+
+  const result = await authService.loginWithMicrosoft('some-id-token');
+
+  assert.equal(result.employee.id, 9);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(persisted, { employeeId: 9, oid: 'ms-oid-new' });
+  restore();
+});
+
+test('loginWithMicrosoft() never exposes microsoft_object_id (or password) in the login response', async () => {
+  stubHappyPathSideEffects();
+  stubVerifiedToken();
+  authRepository.findEmployeeByMicrosoftObjectId = async () => baseEmployee({ microsoft_object_id: 'ms-oid-123' });
+
+  const result = await authService.loginWithMicrosoft('some-id-token');
+
+  assert.equal('microsoft_object_id' in result.employee, false);
+  assert.equal('password' in result.employee, false);
   restore();
 });

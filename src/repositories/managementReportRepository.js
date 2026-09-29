@@ -1925,7 +1925,15 @@ async function getResourceCostUtilization(filters) {
         -- STRING_AGG(DISTINCT ... company_name) convention platformAdminRepository.
         -- buildSyncedWorkLogQuery already uses for this exact "an employee can
         -- be mapped to more than one BU" case.
-        STRING_AGG(DISTINCT comp.company_name, ', ' ORDER BY comp.company_name) AS bu_name,
+        --
+        -- BU Hierarchy: bu_name lists the TOP-LEVEL BUs (a Sub-BU mapping
+        -- contributes its Parent's name) and sub_bu_name lists the Sub-BUs
+        -- themselves — previously both were mixed into one bu_name string.
+        -- STRING_AGG skips the NULLs a root BU produces for sub_bu_name.
+        STRING_AGG(DISTINCT COALESCE(pcomp.company_name, comp.company_name), ', '
+                   ORDER BY COALESCE(pcomp.company_name, comp.company_name)) AS bu_name,
+        STRING_AGG(DISTINCT CASE WHEN pcomp.id IS NOT NULL THEN comp.company_name END, ', '
+                   ORDER BY CASE WHEN pcomp.id IS NOT NULL THEN comp.company_name END) AS sub_bu_name,
         sp.id AS service_po_id, sp.service_po_code, sp.service_po_name,
         c.id AS client_id, c.client_name,
         p.id AS project_id, p.project_name,
@@ -1937,6 +1945,7 @@ async function getResourceCostUtilization(filters) {
       LEFT JOIN projects p    ON p.id  = sp.project_id
       LEFT JOIN employee_business_units ebu ON ebu.employee_id = e.id AND ebu.status = 'active'
       LEFT JOIN companies comp ON comp.id = ebu.business_unit_id AND comp.is_deleted = false
+      LEFT JOIN companies pcomp ON pcomp.id = comp.parent_business_unit_id AND pcomp.is_deleted = false
       LEFT JOIN pm_names pm   ON pm.service_po_id = sp.id
       ${rosterWhere}
       GROUP BY e.id, e.employee_code, e.full_name,
@@ -1991,7 +2000,7 @@ async function getResourceCostUtilization(filters) {
     ${sharedCte},
     roster_page AS (${rosterPageSelect})
     SELECT
-      rp.employee_id, rp.employee_code, rp.employee_name, rp.bu_name,
+      rp.employee_id, rp.employee_code, rp.employee_name, rp.bu_name, rp.sub_bu_name,
       rp.service_po_id, rp.service_po_code, rp.service_po_name,
       rp.client_id, rp.client_name, rp.project_id, rp.project_name,
       rp.project_managers,
@@ -2001,7 +2010,7 @@ async function getResourceCostUtilization(filters) {
     LEFT JOIN resource_budget_by_month rb ON rb.emp_id = rp.employee_id AND rb.service_po_id = rp.service_po_id AND rb.month_start = m.month_start
     LEFT JOIN logged_by_month lg          ON lg.employee_id = rp.employee_id AND lg.service_po_id = rp.service_po_id AND lg.month_start = m.month_start
     LEFT JOIN monthly_cost_by_month mc    ON mc.employee_id = rp.employee_id AND mc.month_start = m.month_start
-    GROUP BY rp.employee_id, rp.employee_code, rp.employee_name, rp.bu_name,
+    GROUP BY rp.employee_id, rp.employee_code, rp.employee_name, rp.bu_name, rp.sub_bu_name,
              rp.service_po_id, rp.service_po_code, rp.service_po_name,
              rp.client_id, rp.client_name, rp.project_id, rp.project_name, rp.project_managers
     ORDER BY rp.${safeSort} ${safeOrder}, rp.employee_id, rp.service_po_id

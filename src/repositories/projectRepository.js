@@ -107,6 +107,9 @@ const findAll = async (filters = {}, pagination = {}, sort = {}) => {
       [Op.or]: [
         { project_name: { [Op.iLike]: `%${search.trim()}%` } },
         { project_code: { [Op.iLike]: `%${search.trim()}%` } },
+        // Client column (CLIENT_INCLUDE below; subQuery: false keeps the
+        // join in the same SELECT so the WHERE can see it).
+        { '$client.client_name$': { [Op.iLike]: `%${search.trim()}%` } },
       ],
     });
   }
@@ -124,6 +127,8 @@ const findAll = async (filters = {}, pagination = {}, sort = {}) => {
     offset,
     order: [[safeSortBy, safeSortOrder]],
     attributes: ['id', 'client_id', 'project_code', 'project_name', 'project_description', 'status', 'company_id', 'created_at', 'updated_at', 'created_by'],
+    // Every include is belongsTo (one row each), so no row multiplication.
+    subQuery: false,
   });
 };
 

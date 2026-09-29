@@ -25,7 +25,7 @@ test('exportResourceCostUtilization: same-year range groups columns as plain APR
   try {
     managementReportService.exportResourceCostUtilization = async () => ({
       data: [{
-        employeeCode: 'EMP001', employeeName: 'Ravichandran', monthlyCtc: 4167, buName: 'IBM',
+        employeeCode: 'EMP001', employeeName: 'Ravichandran', monthlyCtc: 4167, buName: 'DATA + AI', subBuName: 'IBM',
         projectManagers: ['Balaji', 'Suresh'], client: 'LIC', project: 'Capital-M', spo: 'Capital-M',
         months: [
           { monthNumber: 4, year: 2026, cappedHours: 176, loggedHours: 88, projectionPercentage: 73.86, actualPercentage: 50, contribution: 2083.5 },
@@ -53,7 +53,7 @@ test('exportResourceCostUtilization: same-year range groups columns as plain APR
     assert.equal(sheet.getCell(2, 1).master.address, sheet.getCell(1, 1).address);
 
     // Month group headers: plain APR / MAY, no year suffix (same-year range).
-    const empColCount = 10; // Emp Code..SPO
+    const empColCount = 11; // Emp Code..SPO (incl. Sub BU Name)
     assert.equal(sheet.getCell(1, empColCount + 1).value, 'APR');
     assert.equal(sheet.getCell(2, empColCount + 1).value, 'Hours');
     assert.equal(sheet.getCell(2, empColCount + 2).value, 'Logged Hrs');
@@ -66,8 +66,12 @@ test('exportResourceCostUtilization: same-year range groups columns as plain APR
     const dataRow = sheet.getRow(3);
     assert.equal(dataRow.getCell(1).value, 'EMP001');
     assert.equal(dataRow.getCell(3).value, null); // Expected CTC blank
-    assert.equal(dataRow.getCell(6).value, null); // Billed Status blank
-    assert.equal(dataRow.getCell(7).value, 'Balaji, Suresh'); // merged PMs, one cell
+    assert.equal(sheet.getCell(1, 5).value, 'BU Name');
+    assert.equal(sheet.getCell(1, 6).value, 'Sub BU Name');
+    assert.equal(dataRow.getCell(5).value, 'DATA + AI'); // top-level BU
+    assert.equal(dataRow.getCell(6).value, 'IBM');       // its Sub-BU, own column
+    assert.equal(dataRow.getCell(7).value, null); // Billed Status blank
+    assert.equal(dataRow.getCell(8).value, 'Balaji, Suresh'); // merged PMs, one cell
     assert.equal(dataRow.getCell(empColCount + 1).value, 176);
     assert.equal(dataRow.getCell(empColCount + 2).value, 88);
     assert.equal(dataRow.getCell(empColCount + 5).value, 2083.5);
@@ -91,7 +95,7 @@ test('exportResourceCostUtilization: a year-crossing range (Nov->Feb) suffixes m
     await workbook.xlsx.load(res.sentBuffer);
     const sheet = workbook.worksheets[0];
 
-    const empColCount = 10;
+    const empColCount = 11;
     assert.equal(sheet.getCell(1, empColCount + 1).value, 'NOV-26');
     assert.equal(sheet.getCell(1, empColCount + 6).value, 'DEC-26');
     assert.equal(sheet.getCell(1, empColCount + 11).value, 'JAN-27');
@@ -122,7 +126,7 @@ test('exportResourceCostUtilization: a roster row missing a month in range still
     const workbook = new ExcelJS.Workbook();
     await workbook.xlsx.load(res.sentBuffer);
     const sheet = workbook.worksheets[0];
-    const empColCount = 10;
+    const empColCount = 11;
     const dataRow = sheet.getRow(3);
     assert.equal(dataRow.getCell(empColCount + 6).value, 176); // May Hours still 176, not blank
     assert.equal(dataRow.getCell(empColCount + 7).value, 0);   // May Logged Hrs defaults to 0

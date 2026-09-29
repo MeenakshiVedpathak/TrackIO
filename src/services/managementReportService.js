@@ -819,7 +819,10 @@ async function buildResourceCostUtilization(query, companyIds, { exportAll = fal
       // still uses THAT month's own Monthly CTC internally, never this one
       // flat value (see requirement: Monthly CTC may differ per month).
       monthlyCtc: months.length > 0 ? months[0].monthlyCtc : 0,
+      // Top-level BU name(s) — a Sub-BU mapping contributes its Parent here —
+      // and the Sub-BU name(s) themselves, comma-separated when several.
       buName: row.bu_name || null,
+      subBuName: row.sub_bu_name || null,
       // Not sourced from the DB — left blank for manual entry, same as
       // Expected CTC (no existing business rule computes this today).
       billedStatus: null,

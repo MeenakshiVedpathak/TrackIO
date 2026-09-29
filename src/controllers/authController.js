@@ -72,8 +72,9 @@ const login = async (req, res, next) => {
  *   { success: true, message: string, data: { accessToken, refreshToken, expiresIn, employee, roles, forms } }
  * Response 200 (multiple active roles):
  *   { success: true, message: string, data: { requiresRoleSelection: true, loginTicket, roles } }
- * Response 401: invalid/expired/wrong-tenant Microsoft token
- * Response 403: account or role inactive
+ * Response 401: invalid/expired Microsoft token
+ * Response 403: account or role inactive, or email domain not verified in
+ *   the user's own Microsoft tenant (MICROSOFT_EMAIL_DOMAIN_NOT_VERIFIED)
  * Response 404: { success: false, message: 'Email ID is not registered.' }
  * Response 503: Microsoft SSO is not configured on this server
  */
