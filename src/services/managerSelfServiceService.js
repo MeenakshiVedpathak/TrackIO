@@ -12,6 +12,7 @@ const employeeRepository = require('../repositories/employeeRepository');
 const { resolveCentralisedServicePOTenant } = require('./companyAccessControlService');
 const { createAuditLog } = require('../middlewares/auditLog');
 const logger = require('../utils/logger');
+const { parseIdList } = require('../utils/idListParser');
 
 // Platform Admin (1) / Admin (2) / Entity Admin (3) — full cross-company scope, no mapping check needed.
 const ADMIN_TIER_MAX_RANK = 3;
@@ -742,6 +743,107 @@ const getApprovalSummary = async (managerUserId, employeeId, ownEmployeeId, comp
 };
 
 /**
+ * The combined "all my Employees" Timesheet Approval Summary — every mapped
+ * Employee's day/month buckets in ONE server-paginated, server-sorted list,
+ * replacing the frontend's one-getApprovalSummary()-call-per-Employee
+ * fan-out (N requests, each silently capped at 100 buckets).
+ *
+ * Team = getMyEmployees() — exactly the list the Manager/Team Lead screen
+ * already shows (same tier rules, same Business Unit narrowing, the caller's
+ * own record never included), optionally narrowed further by `employee_ids`
+ * (never widened). Bucket shape matches getApprovalSummary()'s, plus the
+ * owning Employee's identity on every row since one response now spans many.
+ *
+ * Project Manager scope matches assertOwnEmployeeForApproval() per employee
+ * (see employeeWorkLogRepository.findApprovalSummaryBucketsPage's poScope):
+ * own-Service-PO rows always; Centralised-PO rows only for Employees with
+ * real work on one of those POs. A PM with no Service PO of their own gets an
+ * empty list here (the single-employee endpoint 403s instead).
+ *
+ * @param {number} managerUserId
+ * @param {number[]} companyIds - req.companyIds (resolveMyTeamBusinessUnitScope)
+ * @param {number|null} hierarchyRank
+ * @param {number|null} explicitBusinessUnitId - req.explicitBusinessUnitId
+ * @param {number[]} callerBuIds
+ * @param {object} query - log_type, startDate, endDate, status, service_po_id,
+ *   search, employee_ids, sortBy, sortOrder, page, limit
+ * @returns {Promise<{ data: object[], meta: object }>}
+ */
+const getApprovalSummaryAll = async (managerUserId, companyIds, hierarchyRank, explicitBusinessUnitId, callerBuIds, query) => {
+  const page = parseInt(query.page, 10) || 1;
+  const limit = parseInt(query.limit, 10) || 20;
+  const emptyResult = { data: [], meta: { total: 0, page, limit, totalPages: 0, hasNext: false, hasPrev: false } };
+
+  const team = await getMyEmployees(managerUserId, companyIds, hierarchyRank, explicitBusinessUnitId);
+  let employeeIds = team.map((employee) => employee.id);
+  const requestedIds = parseIdList(query.employee_ids);
+  if (requestedIds) {
+    const requested = new Set(requestedIds);
+    employeeIds = employeeIds.filter((id) => requested.has(id));
+  }
+  if (employeeIds.length === 0) return emptyResult;
+
+  let poScope = null;
+  if (hierarchyRank === PROJECT_MANAGER_RANK) {
+    const ownPoIds = await employeeServicePOMappingService.getProjectManagerServicePOIds(managerUserId);
+    if (ownPoIds.length === 0) return emptyResult;
+    // Only this Project Manager's OWN Admin tenant's Centralised POs — same
+    // seed as assertOwnEmployeeForApproval().
+    const centralisedPOs = await servicePORepository.getActiveCentralisedPOIds(
+      await resolveCentralisedServicePOTenant(callerBuIds, managerUserId)
+    );
+    poScope = { ownPoIds, centralisedPoIds: centralisedPOs.map((po) => po.id) };
+  }
+
+  const isMonthly = query.log_type === 'monthly';
+  const { rows, total } = await employeeWorkLogRepository.findApprovalSummaryBucketsPage({
+    employeeIds,
+    startDate: query.startDate,
+    endDate: query.endDate,
+    isMonthly,
+    poScope,
+    status: query.status && query.status !== 'all' ? query.status : null,
+    servicePoId: query.service_po_id ? parseInt(query.service_po_id, 10) : null,
+    search: query.search || null,
+    sortBy: query.sortBy || null,
+    sortOrder: query.sortOrder || 'desc',
+    limit,
+    offset: (page - 1) * limit,
+  });
+
+  // Only this page's entries are loaded (one query), in the bucket's own order.
+  const entryIds = rows.flatMap((row) => row.entry_ids || []);
+  const entries = await employeeWorkLogRepository.findByIdsWithIncludes(entryIds);
+  const entryById = new Map(entries.map((entry) => [entry.id, entry.toJSON()]));
+
+  const data = rows.map((row) => {
+    const periodDate = typeof row.period_date === 'string'
+      ? row.period_date.slice(0, 10)
+      : new Date(row.period_date).toISOString().slice(0, 10);
+    const period = isMonthly
+      ? { month: parseInt(periodDate.slice(5, 7), 10), year: parseInt(periodDate.slice(0, 4), 10) }
+      : { date: periodDate };
+    return {
+      employee_id: row.employee_id,
+      employee_name: row.full_name,
+      employee_code: row.employee_code,
+      employee: { id: row.employee_id, full_name: row.full_name, employee_code: row.employee_code },
+      ...period,
+      entries: (row.entry_ids || []).map((id) => entryById.get(id)).filter(Boolean),
+      total_hours: parseFloat(row.total_hours) || 0,
+      entry_count: row.entry_count,
+      approval_status: row.approval_status,
+    };
+  });
+
+  const totalPages = Math.ceil(total / limit) || 0;
+  return {
+    data,
+    meta: { total, page, limit, totalPages, hasNext: page < totalPages, hasPrev: page > 1 },
+  };
+};
+
+/**
  * Bulk-approve — one action across several dates (daily) or several
  * months (monthly) for one Employee's PENDING Employee Work Log entries
  * (never `timesheets` — approval happens before Sync). Exactly one of
@@ -967,6 +1069,7 @@ module.exports = {
   getTimesheets,
   approveTimesheet,
   getApprovalSummary,
+  getApprovalSummaryAll,
   bulkApproveTimesheets,
   rejectWorkLogEntry,
   assignServicePOToEmployee,

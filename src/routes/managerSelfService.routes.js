@@ -28,6 +28,7 @@ const {
   listMyEmployeesQuerySchema,
   listMyTeamTimesheetsQuerySchema,
   approvalSummaryQuerySchema,
+  approvalSummaryAllQuerySchema,
   bulkApproveTimesheetsSchema,
   rejectWorkLogSchema,
 } = require('../validations/managerSelfServiceValidation');
@@ -189,6 +190,45 @@ router.get(
   authorize(['manager.view_mapped_employees', 'servicepo.view_mapped_employees']),
   validate(approvalSummaryQuerySchema, 'query'),
   controller.getApprovalSummary
+);
+
+/**
+ * @swagger
+ * /my-team/timesheets/approval-summary/all:
+ *   get:
+ *     summary: >
+ *       Every mapped Employee's Timesheet Approval buckets in ONE
+ *       server-paginated, server-sorted list (the Manager/Team Lead landing
+ *       table). Same bucket shape as /timesheets/approval-summary, plus
+ *       employee_id/employee_name/employee_code on every row. The team is
+ *       exactly GET /my-team/employees (same auth + Business Unit scope).
+ *     tags: [MyTeam]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - { in: query, name: page, schema: { type: integer, default: 1 } }
+ *       - { in: query, name: limit, schema: { type: integer, default: 20, maximum: 200 } }
+ *       - { in: query, name: log_type, schema: { type: string, enum: [daily, monthly], default: daily } }
+ *       - { in: query, name: startDate, schema: { type: string, format: date } }
+ *       - { in: query, name: endDate, schema: { type: string, format: date } }
+ *       - { in: query, name: status, schema: { type: string, enum: [all, pending, approved, rejected], default: all } }
+ *       - { in: query, name: service_po_id, schema: { type: integer }, description: Only buckets containing an entry on this Service PO }
+ *       - { in: query, name: search, schema: { type: string }, description: Employee name/code OR a Service PO name on the bucket }
+ *       - { in: query, name: employee_ids, schema: { type: string }, description: Comma-separated subset of the caller's own team }
+ *       - { in: query, name: business_unit_id, schema: { type: integer } }
+ *       - { in: query, name: sortBy, schema: { type: string, enum: [employee, period, hours, entries, status] }, description: Omitted = pending first, newest period, then name }
+ *       - { in: query, name: sortOrder, schema: { type: string, enum: [asc, desc], default: desc } }
+ *     responses:
+ *       200:
+ *         description: Paginated buckets across all mapped Employees
+ */
+router.get(
+  '/timesheets/approval-summary/all',
+  authenticate.authenticateIdentity,
+  validate(approvalSummaryAllQuerySchema, 'query'),
+  resolveMyTeamBusinessUnitScope,
+  authorize(['manager.view_mapped_employees', 'servicepo.view_mapped_employees']),
+  controller.getApprovalSummaryAll
 );
 
 /**

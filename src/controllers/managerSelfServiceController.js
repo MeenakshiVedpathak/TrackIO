@@ -110,6 +110,29 @@ const getApprovalSummary = async (req, res) => {
   }
 };
 
+/**
+ * GET /my-team/timesheets/approval-summary/all — every mapped Employee's
+ * buckets in one server-paginated list (see
+ * managerSelfServiceService.getApprovalSummaryAll).
+ */
+const getApprovalSummaryAll = async (req, res) => {
+  try {
+    const { data, meta } = await managerSelfServiceService.getApprovalSummaryAll(
+      req.userId,
+      req.companyIds,
+      req.hierarchyRank,
+      req.explicitBusinessUnitId,
+      callerBuIds(req),
+      req.query
+    );
+    return sendPaginated(res, data, meta, 'Approval summary fetched successfully.');
+  } catch (error) {
+    if (error.statusCode === 403) return sendError(res, error.message, 403);
+    logger.error('getApprovalSummaryAll error', { error: error.message, userId: req.userId });
+    return sendError(res, error.message, error.statusCode || 500);
+  }
+};
+
 const bulkApproveTimesheets = async (req, res) => {
   try {
     const result = await managerSelfServiceService.bulkApproveTimesheets(
@@ -286,6 +309,7 @@ module.exports = {
   getTimesheets,
   approveTimesheet,
   getApprovalSummary,
+  getApprovalSummaryAll,
   bulkApproveTimesheets,
   rejectWorkLogEntry,
   assignServicePO,

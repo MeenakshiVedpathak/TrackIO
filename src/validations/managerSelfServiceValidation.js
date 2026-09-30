@@ -58,6 +58,30 @@ const approvalSummaryQuerySchema = Joi.object({
   log_type: Joi.string().valid('daily', 'monthly').default('daily'),
 });
 
+/**
+ * GET /my-team/timesheets/approval-summary/all — the combined, server-
+ * paginated "all my Employees" variant. Same date/log_type filters as the
+ * single-employee schema above, plus the filters/sort the landing table
+ * used to apply client-side. `employee_ids` optionally narrows (never
+ * widens) the caller's own team.
+ */
+const approvalSummaryAllQuerySchema = Joi.object({
+  page: Joi.number().integer().min(1).default(1),
+  limit: Joi.number().integer().min(1).max(200).default(20),
+  startDate: Joi.date().iso().optional(),
+  endDate: Joi.date().iso().optional(),
+  log_type: Joi.string().valid('daily', 'monthly').default('daily'),
+  business_unit_id: Joi.number().integer().positive().optional(),
+  employee_ids: Joi.string().trim().pattern(/^\d+(,\d+)*$/).optional().messages({
+    'string.pattern.base': 'employee_ids must be a comma-separated list of ids.',
+  }),
+  status: Joi.string().valid('all', 'pending', 'approved', 'rejected').default('all'),
+  service_po_id: Joi.number().integer().positive().optional(),
+  search: Joi.string().trim().max(100).allow('').optional(),
+  sortBy: Joi.string().valid('employee', 'period', 'hours', 'entries', 'status').optional(),
+  sortOrder: Joi.string().lowercase().valid('asc', 'desc').default('desc'),
+});
+
 const dateItem = Joi.date().iso().messages({
   'date.format': 'Each date must be in ISO format (YYYY-MM-DD).',
 });
@@ -104,6 +128,7 @@ module.exports = {
   listMyEmployeesQuerySchema,
   listMyTeamTimesheetsQuerySchema,
   approvalSummaryQuerySchema,
+  approvalSummaryAllQuerySchema,
   bulkApproveTimesheetsSchema,
   rejectWorkLogSchema,
 };

@@ -1,7 +1,7 @@
 'use strict';
 
-const { Op, fn, col, literal } = require('sequelize');
-const { EmployeeWorkLog, Employee, ServicePO, SubProject, Project, ServicePOHierarchy, EmployeeWorkLogTimeEntry } = require('../models');
+const { Op, fn, col, literal, QueryTypes } = require('sequelize');
+const { sequelize, EmployeeWorkLog, Employee, ServicePO, SubProject, Project, ServicePOHierarchy, EmployeeWorkLogTimeEntry } = require('../models');
 
 /**
  * Employee Work Log Repository
@@ -808,6 +808,151 @@ const findForApprovalSummary = async ({ employeeId, startDate, endDate, serviceP
   });
 };
 
+// Server-side sort columns for findApprovalSummaryBucketsPage() — the same
+// ids ManagerAllEmployeesTimesheetView/TeamLeadAllEmployeesTimesheetView's
+// column headers use. Whitelisted: never interpolate a caller value directly.
+const APPROVAL_BUCKET_SORT_SQL = {
+  employee: 'full_name',
+  period: 'period_date',
+  hours: 'total_hours',
+  entries: 'entry_count',
+  status: 'approval_status',
+};
+
+/**
+ * One PAGE of Timesheet Approval Summary buckets across MANY employees — the
+ * combined "all my Employees" landing table. A bucket is one (employee, day)
+ * — or (employee, month) when `isMonthly` — exactly like
+ * managerSelfServiceService.getApprovalSummary()'s per-employee buckets, but
+ * grouped, filtered, sorted and paginated in SQL so page N is a real query
+ * (never "download everything, slice in the browser").
+ *
+ * approval_status uses the same priority as getApprovalSummary(): any
+ * 'pending' row -> 'pending'; else any 'rejected' -> 'rejected'; else
+ * 'approved' (approved/synced).
+ *
+ * `poScope` (Project Manager callers only — null for every other tier)
+ * mirrors assertOwnEmployeeForApproval()'s per-employee rule in one
+ * predicate: rows on the PM's own Service POs always count; rows on a
+ * Centralised PO (Leave/Bench/...) count only for employees who have logged
+ * work on one of the PM's own POs.
+ *
+ * Deliberately NOT company/BU-scoped — `employeeIds` is always the caller's
+ * already-authorized team (managerSelfServiceService.getMyEmployees), same
+ * reasoning as findForApprovalSummaryByEmployees() below.
+ *
+ * @param {object} params
+ * @param {number[]} params.employeeIds
+ * @param {string} [params.startDate]
+ * @param {string} [params.endDate]
+ * @param {boolean} [params.isMonthly]
+ * @param {{ ownPoIds: number[], centralisedPoIds: number[] }|null} [params.poScope]
+ * @param {'pending'|'approved'|'rejected'|null} [params.status]
+ * @param {number|null} [params.servicePoId] - bucket must contain a row on this PO
+ * @param {string|null} [params.search] - employee name/code OR a row's Service PO name
+ * @param {string|null} [params.sortBy] - key of APPROVAL_BUCKET_SORT_SQL; null = pending first, newest period
+ * @param {'asc'|'desc'} [params.sortOrder]
+ * @param {number} params.limit
+ * @param {number} params.offset
+ * @returns {Promise<{ rows: object[], total: number }>} rows carry employee_id,
+ *   full_name, employee_code, period_date (YYYY-MM-DD; month start when
+ *   monthly), total_hours, entry_count, approval_status, entry_ids
+ */
+const findApprovalSummaryBucketsPage = async ({
+  employeeIds, startDate, endDate, isMonthly = false, poScope = null,
+  status = null, servicePoId = null, search = null, sortBy = null, sortOrder = 'desc', limit, offset,
+}) => {
+  if (!employeeIds || employeeIds.length === 0) return { rows: [], total: 0 };
+
+  const replacements = { employeeIds };
+  const scopeConditions = ['wl.employee_id IN (:employeeIds)'];
+  if (startDate) { scopeConditions.push('wl.work_date >= :startDate'); replacements.startDate = startDate; }
+  if (endDate) { scopeConditions.push('wl.work_date <= :endDate'); replacements.endDate = endDate; }
+  if (poScope) {
+    if (!poScope.ownPoIds || poScope.ownPoIds.length === 0) return { rows: [], total: 0 };
+    replacements.ownPoIds = poScope.ownPoIds;
+    const centralised = poScope.centralisedPoIds && poScope.centralisedPoIds.length > 0;
+    if (centralised) replacements.centralisedPoIds = poScope.centralisedPoIds;
+    scopeConditions.push(centralised
+      ? `(wl.service_po_id IN (:ownPoIds) OR (wl.service_po_id IN (:centralisedPoIds) AND wl.employee_id IN (
+           SELECT own.employee_id FROM employee_work_logs own
+           WHERE own.employee_id IN (:employeeIds) AND own.service_po_id IN (:ownPoIds))))`
+      : 'wl.service_po_id IN (:ownPoIds)');
+  }
+
+  const periodExpr = isMonthly ? "date_trunc('month', wl.work_date)::date" : 'wl.work_date';
+  const searchTerm = search && search.trim() ? `%${search.trim()}%` : null;
+  if (searchTerm) replacements.search = searchTerm;
+  if (servicePoId) replacements.servicePoId = servicePoId;
+
+  const bucketFilters = [];
+  if (status) { bucketFilters.push('b.approval_status = :status'); replacements.status = status; }
+  if (servicePoId) bucketFilters.push('b.has_service_po');
+  if (searchTerm) bucketFilters.push('(e.full_name ILIKE :search OR e.employee_code ILIKE :search OR b.service_po_matches_search)');
+  const bucketWhere = bucketFilters.length ? `WHERE ${bucketFilters.join(' AND ')}` : '';
+
+  const base = `
+    WITH buckets AS (
+      SELECT
+        wl.employee_id,
+        ${periodExpr} AS period_date,
+        SUM(wl.hours) AS total_hours,
+        COUNT(*)::int AS entry_count,
+        CASE
+          WHEN bool_or(wl.status = 'pending') THEN 'pending'
+          WHEN bool_or(wl.status = 'rejected') THEN 'rejected'
+          ELSE 'approved'
+        END AS approval_status,
+        ${servicePoId ? 'bool_or(wl.service_po_id = :servicePoId)' : 'false'} AS has_service_po,
+        ${searchTerm ? 'COALESCE(bool_or(sp.service_po_name ILIKE :search), false)' : 'false'} AS service_po_matches_search,
+        array_agg(wl.id ORDER BY wl.work_date DESC, wl.id ASC) AS entry_ids
+      FROM employee_work_logs wl
+      LEFT JOIN service_pos sp ON sp.id = wl.service_po_id
+      WHERE ${scopeConditions.join(' AND ')}
+      GROUP BY wl.employee_id, ${periodExpr}
+    )
+    SELECT b.*, e.full_name, e.employee_code
+    FROM buckets b
+    INNER JOIN employees e ON e.id = b.employee_id
+    ${bucketWhere}`;
+
+  const direction = String(sortOrder).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+  const sortColumn = APPROVAL_BUCKET_SORT_SQL[sortBy];
+  // Tie-breakers keep page boundaries stable across requests.
+  const orderBy = sortColumn
+    ? `${sortColumn} ${direction}, period_date DESC, full_name ASC, employee_id ASC`
+    : `CASE WHEN approval_status = 'pending' THEN 0 ELSE 1 END ASC, period_date DESC, full_name ASC, employee_id ASC`;
+
+  const [rows, [countRow]] = await Promise.all([
+    sequelize.query(`${base} ORDER BY ${orderBy} LIMIT :limit OFFSET :offset`, {
+      replacements: { ...replacements, limit, offset },
+      type: QueryTypes.SELECT,
+    }),
+    sequelize.query(`SELECT COUNT(*)::int AS total FROM (${base}) counted`, {
+      replacements,
+      type: QueryTypes.SELECT,
+    }),
+  ]);
+
+  return { rows, total: countRow ? countRow.total : 0 };
+};
+
+/**
+ * Full work log rows (with the same includes as findForApprovalSummary())
+ * for a set of ids — the `entries` of one findApprovalSummaryBucketsPage()
+ * page. Callers pass only ids that query already scoped.
+ * @param {number[]} ids
+ * @returns {Promise<EmployeeWorkLog[]>}
+ */
+const findByIdsWithIncludes = async (ids) => {
+  if (!ids || ids.length === 0) return [];
+  return EmployeeWorkLog.findAll({
+    where: { id: { [Op.in]: ids } },
+    include: buildIncludes(),
+    order: [['work_date', 'DESC'], ['id', 'ASC']],
+  });
+};
+
 /**
  * Same as findForApprovalSummary() above, but for MULTIPLE employees at
  * once — the source data for the Timesheet Approval Status Report
@@ -1423,6 +1568,8 @@ module.exports = {
   getWorkLogTimeReportRows,
   findForApprovalSummary,
   findForApprovalSummaryByEmployees,
+  findApprovalSummaryBucketsPage,
+  findByIdsWithIncludes,
   approveByEmployeeAndDates,
   approveByEmployeeAndMonths,
   markApprovedByIds,
