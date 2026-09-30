@@ -89,8 +89,8 @@ module.exports = (sequelize) => {
       defaultValue: 'ALL',
       validate: {
         isIn: {
-          args: [['ALL', 'ALT_1_3', 'ALT_2_4', 'NONE']],
-          msg: 'saturday_off_rule must be ALL, ALT_1_3, ALT_2_4, or NONE.',
+          args: [['ALL', 'ALT_1_3', 'ALT_2_4', 'ALT_1_3_5', 'NONE']],
+          msg: 'saturday_off_rule must be ALL, ALT_1_3, ALT_2_4, ALT_1_3_5, or NONE.',
         },
       },
     },

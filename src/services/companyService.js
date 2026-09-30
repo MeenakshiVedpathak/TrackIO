@@ -1,5 +1,6 @@
 'use strict';
 
+const { sequelize } = require('../models');
 const companyRepository = require('../repositories/companyRepository');
 const employeeBusinessUnitRepository = require('../repositories/employeeBusinessUnitRepository');
 const { createAuditLog } = require('../middlewares/auditLog');
@@ -261,21 +262,60 @@ const create = async (data, actorId, ipAddress = null, entityIds = []) => {
   return company;
 };
 
+/**
+ * Update a Business Unit.
+ *
+ * Week Off Policy (saturday_off_rule) — a Sub-BU ALWAYS follows its Parent
+ * (decided 2026-09-30; create() already copied the Parent's rule, but a later
+ * Parent change never reached its Sub-BUs, so they drifted):
+ *   - Parent BU: a changed saturday_off_rule is also written to every one of
+ *     its Sub-BUs, in the same transaction.
+ *   - Sub-BU: saturday_off_rule is read-only — whatever the request sends is
+ *     replaced by its Parent's rule (not rejected, so a form that resubmits
+ *     every field still saves). Moving a BU under a new Parent adopts that
+ *     Parent's rule.
+ */
 const update = async (id, data, actorId, ipAddress = null, entityIds = []) => {
   const existing = await getById(id, entityIds);
   const oldValues = existing.toJSON();
+  const payload = { ...data };
 
   // BU Hierarchy — re-validate whenever parent_business_unit_id is being
   // changed (including explicitly detaching it back to a top-level Parent
   // BU via `null`, which needs no extra checks: a promoted BU starts with
   // zero Sub-BUs of its own by construction).
-  if (Object.prototype.hasOwnProperty.call(data, 'parent_business_unit_id') && data.parent_business_unit_id != null) {
-    await validateParentBusinessUnit(data.parent_business_unit_id, entityIds, id);
+  const parentChanging = Object.prototype.hasOwnProperty.call(payload, 'parent_business_unit_id');
+  let newParent = null;
+  if (parentChanging && payload.parent_business_unit_id != null) {
+    newParent = await validateParentBusinessUnit(payload.parent_business_unit_id, entityIds, id);
   }
 
-  const updated = await companyRepository.update(id, data);
+  const resultingParentId = parentChanging ? payload.parent_business_unit_id : existing.parent_business_unit_id;
+  if (resultingParentId != null) {
+    // Sub-BU: always its Parent's rule.
+    const parent = newParent || await companyRepository.findById(resultingParentId);
+    if (parent) payload.saturday_off_rule = parent.saturday_off_rule;
+  }
+
+  const cascadeRule = resultingParentId == null
+    && payload.saturday_off_rule !== undefined
+    && payload.saturday_off_rule !== existing.saturday_off_rule;
+
+  let updated;
+  let subBusUpdated = 0;
+  await sequelize.transaction(async (transaction) => {
+    updated = await companyRepository.update(id, payload, { transaction });
+    if (cascadeRule) {
+      subBusUpdated = await companyRepository.updateSubBuSaturdayOffRule(id, payload.saturday_off_rule, { transaction });
+    }
+  });
 
   await createAuditLog(actorId, 'UPDATE', 'companies', id, oldValues, updated.toJSON(), ipAddress);
+  if (cascadeRule) {
+    logger.info('Week Off Policy cascaded to Sub-BUs', {
+      companyId: id, saturdayOffRule: payload.saturday_off_rule, subBusUpdated, actorId,
+    });
+  }
 
   return updated;
 };

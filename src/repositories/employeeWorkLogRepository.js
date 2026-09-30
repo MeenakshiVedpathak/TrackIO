@@ -820,6 +820,79 @@ const APPROVAL_BUCKET_SORT_SQL = {
 };
 
 /**
+ * The shared, fully authorized + filtered bucket CTE (see
+ * findApprovalSummaryBucketsPage()'s doc comment for the access rule) —
+ * everything but ORDER BY / LIMIT, so the paged endpoint and the export
+ * (findApprovalSummaryBuckets()) read exactly the same rows. Each bucket
+ * also carries `service_po_names` — the distinct Service PO names touched
+ * that day/month (array; a bucket almost always has exactly one, but an
+ * Employee can log against more than one PO on the same date) — for the
+ * export's "Service PO Name" column; the paged JSON endpoint's own
+ * row-mapping doesn't read it, so this is free to both callers.
+ *
+ * @returns {{ base: string, replacements: object }}
+ */
+function buildApprovalSummaryBucketsBase({
+  employeeIds, startDate, endDate, isMonthly = false, poScope = null,
+  status = null, servicePoId = null, search = null,
+}) {
+  const replacements = { employeeIds };
+  const scopeConditions = ['wl.employee_id IN (:employeeIds)'];
+  if (startDate) { scopeConditions.push('wl.work_date >= :startDate'); replacements.startDate = startDate; }
+  if (endDate) { scopeConditions.push('wl.work_date <= :endDate'); replacements.endDate = endDate; }
+  if (poScope) {
+    if (!poScope.ownPoIds || poScope.ownPoIds.length === 0) return null;
+    replacements.ownPoIds = poScope.ownPoIds;
+    const centralised = poScope.centralisedPoIds && poScope.centralisedPoIds.length > 0;
+    if (centralised) replacements.centralisedPoIds = poScope.centralisedPoIds;
+    scopeConditions.push(centralised
+      ? `(wl.service_po_id IN (:ownPoIds) OR (wl.service_po_id IN (:centralisedPoIds) AND wl.employee_id IN (
+           SELECT own.employee_id FROM employee_work_logs own
+           WHERE own.employee_id IN (:employeeIds) AND own.service_po_id IN (:ownPoIds))))`
+      : 'wl.service_po_id IN (:ownPoIds)');
+  }
+
+  const periodExpr = isMonthly ? "date_trunc('month', wl.work_date)::date" : 'wl.work_date';
+  const searchTerm = search && search.trim() ? `%${search.trim()}%` : null;
+  if (searchTerm) replacements.search = searchTerm;
+  if (servicePoId) replacements.servicePoId = servicePoId;
+
+  const bucketFilters = [];
+  if (status) { bucketFilters.push('b.approval_status = :status'); replacements.status = status; }
+  if (servicePoId) bucketFilters.push('b.has_service_po');
+  if (searchTerm) bucketFilters.push('(e.full_name ILIKE :search OR e.employee_code ILIKE :search OR b.service_po_matches_search)');
+  const bucketWhere = bucketFilters.length ? `WHERE ${bucketFilters.join(' AND ')}` : '';
+
+  const base = `
+    WITH buckets AS (
+      SELECT
+        wl.employee_id,
+        ${periodExpr} AS period_date,
+        SUM(wl.hours) AS total_hours,
+        COUNT(*)::int AS entry_count,
+        CASE
+          WHEN bool_or(wl.status = 'pending') THEN 'pending'
+          WHEN bool_or(wl.status = 'rejected') THEN 'rejected'
+          ELSE 'approved'
+        END AS approval_status,
+        ${servicePoId ? 'bool_or(wl.service_po_id = :servicePoId)' : 'false'} AS has_service_po,
+        ${searchTerm ? 'COALESCE(bool_or(sp.service_po_name ILIKE :search), false)' : 'false'} AS service_po_matches_search,
+        array_agg(DISTINCT sp.service_po_name) FILTER (WHERE sp.service_po_name IS NOT NULL) AS service_po_names,
+        array_agg(wl.id ORDER BY wl.work_date DESC, wl.id ASC) AS entry_ids
+      FROM employee_work_logs wl
+      LEFT JOIN service_pos sp ON sp.id = wl.service_po_id
+      WHERE ${scopeConditions.join(' AND ')}
+      GROUP BY wl.employee_id, ${periodExpr}
+    )
+    SELECT b.*, e.full_name, e.employee_code
+    FROM buckets b
+    INNER JOIN employees e ON e.id = b.employee_id
+    ${bucketWhere}`;
+
+  return { base, replacements };
+}
+
+/**
  * One PAGE of Timesheet Approval Summary buckets across MANY employees — the
  * combined "all my Employees" landing table. A bucket is one (employee, day)
  * — or (employee, month) when `isMonthly` — exactly like
@@ -856,7 +929,7 @@ const APPROVAL_BUCKET_SORT_SQL = {
  * @param {number} params.offset
  * @returns {Promise<{ rows: object[], total: number }>} rows carry employee_id,
  *   full_name, employee_code, period_date (YYYY-MM-DD; month start when
- *   monthly), total_hours, entry_count, approval_status, entry_ids
+ *   monthly), total_hours, entry_count, approval_status, service_po_names, entry_ids
  */
 const findApprovalSummaryBucketsPage = async ({
   employeeIds, startDate, endDate, isMonthly = false, poScope = null,
@@ -864,57 +937,11 @@ const findApprovalSummaryBucketsPage = async ({
 }) => {
   if (!employeeIds || employeeIds.length === 0) return { rows: [], total: 0 };
 
-  const replacements = { employeeIds };
-  const scopeConditions = ['wl.employee_id IN (:employeeIds)'];
-  if (startDate) { scopeConditions.push('wl.work_date >= :startDate'); replacements.startDate = startDate; }
-  if (endDate) { scopeConditions.push('wl.work_date <= :endDate'); replacements.endDate = endDate; }
-  if (poScope) {
-    if (!poScope.ownPoIds || poScope.ownPoIds.length === 0) return { rows: [], total: 0 };
-    replacements.ownPoIds = poScope.ownPoIds;
-    const centralised = poScope.centralisedPoIds && poScope.centralisedPoIds.length > 0;
-    if (centralised) replacements.centralisedPoIds = poScope.centralisedPoIds;
-    scopeConditions.push(centralised
-      ? `(wl.service_po_id IN (:ownPoIds) OR (wl.service_po_id IN (:centralisedPoIds) AND wl.employee_id IN (
-           SELECT own.employee_id FROM employee_work_logs own
-           WHERE own.employee_id IN (:employeeIds) AND own.service_po_id IN (:ownPoIds))))`
-      : 'wl.service_po_id IN (:ownPoIds)');
-  }
-
-  const periodExpr = isMonthly ? "date_trunc('month', wl.work_date)::date" : 'wl.work_date';
-  const searchTerm = search && search.trim() ? `%${search.trim()}%` : null;
-  if (searchTerm) replacements.search = searchTerm;
-  if (servicePoId) replacements.servicePoId = servicePoId;
-
-  const bucketFilters = [];
-  if (status) { bucketFilters.push('b.approval_status = :status'); replacements.status = status; }
-  if (servicePoId) bucketFilters.push('b.has_service_po');
-  if (searchTerm) bucketFilters.push('(e.full_name ILIKE :search OR e.employee_code ILIKE :search OR b.service_po_matches_search)');
-  const bucketWhere = bucketFilters.length ? `WHERE ${bucketFilters.join(' AND ')}` : '';
-
-  const base = `
-    WITH buckets AS (
-      SELECT
-        wl.employee_id,
-        ${periodExpr} AS period_date,
-        SUM(wl.hours) AS total_hours,
-        COUNT(*)::int AS entry_count,
-        CASE
-          WHEN bool_or(wl.status = 'pending') THEN 'pending'
-          WHEN bool_or(wl.status = 'rejected') THEN 'rejected'
-          ELSE 'approved'
-        END AS approval_status,
-        ${servicePoId ? 'bool_or(wl.service_po_id = :servicePoId)' : 'false'} AS has_service_po,
-        ${searchTerm ? 'COALESCE(bool_or(sp.service_po_name ILIKE :search), false)' : 'false'} AS service_po_matches_search,
-        array_agg(wl.id ORDER BY wl.work_date DESC, wl.id ASC) AS entry_ids
-      FROM employee_work_logs wl
-      LEFT JOIN service_pos sp ON sp.id = wl.service_po_id
-      WHERE ${scopeConditions.join(' AND ')}
-      GROUP BY wl.employee_id, ${periodExpr}
-    )
-    SELECT b.*, e.full_name, e.employee_code
-    FROM buckets b
-    INNER JOIN employees e ON e.id = b.employee_id
-    ${bucketWhere}`;
+  const built = buildApprovalSummaryBucketsBase({
+    employeeIds, startDate, endDate, isMonthly, poScope, status, servicePoId, search,
+  });
+  if (!built) return { rows: [], total: 0 }; // poScope.ownPoIds was empty
+  const { base, replacements } = built;
 
   const direction = String(sortOrder).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
   const sortColumn = APPROVAL_BUCKET_SORT_SQL[sortBy];
@@ -935,6 +962,32 @@ const findApprovalSummaryBucketsPage = async ({
   ]);
 
   return { rows, total: countRow ? countRow.total : 0 };
+};
+
+/**
+ * EVERY Timesheet Approval Summary bucket matching the filters (no
+ * pagination, no count query) — the Excel export's row source. Same
+ * authorized buildApprovalSummaryBucketsBase() as the paged endpoint above,
+ * in that endpoint's own default order (pending first, newest period, then
+ * employee name) — export ignores sortBy/sortOrder, same convention as
+ * teamLeadEmployeeProjectHoursReportRepository's export query.
+ * @param {object} params - as findApprovalSummaryBucketsPage(), minus sortBy/sortOrder/limit/offset
+ * @returns {Promise<object[]>}
+ */
+const findApprovalSummaryBuckets = async ({
+  employeeIds, startDate, endDate, isMonthly = false, poScope = null,
+  status = null, servicePoId = null, search = null,
+}) => {
+  if (!employeeIds || employeeIds.length === 0) return [];
+
+  const built = buildApprovalSummaryBucketsBase({
+    employeeIds, startDate, endDate, isMonthly, poScope, status, servicePoId, search,
+  });
+  if (!built) return []; // poScope.ownPoIds was empty
+  const { base, replacements } = built;
+
+  const orderBy = "CASE WHEN approval_status = 'pending' THEN 0 ELSE 1 END ASC, period_date DESC, full_name ASC, employee_id ASC";
+  return sequelize.query(`${base} ORDER BY ${orderBy}`, { replacements, type: QueryTypes.SELECT });
 };
 
 /**
@@ -1569,6 +1622,7 @@ module.exports = {
   findForApprovalSummary,
   findForApprovalSummaryByEmployees,
   findApprovalSummaryBucketsPage,
+  findApprovalSummaryBuckets,
   findByIdsWithIncludes,
   approveByEmployeeAndDates,
   approveByEmployeeAndMonths,

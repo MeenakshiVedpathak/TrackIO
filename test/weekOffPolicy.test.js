@@ -53,6 +53,31 @@ test('isOffDay: ALT_2_4 marks only the 2nd and 4th Saturday off', () => {
   assert.equal(isOffDay(fourth, 'ALT_2_4'), true);
 });
 
+test('isOffDay: ALT_1_3_5 marks the 1st, 3rd and 5th Saturday off (5-Saturday month)', () => {
+  // August 2026 has five Saturdays: 1st, 8th, 15th, 22nd, 29th.
+  const aug = ['2026-08-01', '2026-08-08', '2026-08-15', '2026-08-22', '2026-08-29'];
+  assert.deepEqual(aug.map((d) => isOffDay(d, 'ALT_1_3_5')), [true, false, true, false, true]);
+});
+
+test('isOffDay: ALT_1_3_5 in a 4-Saturday month behaves like ALT_1_3 (there is no 5th Saturday)', () => {
+  const [first, second, third, fourth] = SATURDAYS;
+  assert.deepEqual([first, second, third, fourth].map((d) => isOffDay(d, 'ALT_1_3_5')), [true, false, true, false]);
+  assert.equal(isOffDay(WEEKDAY, 'ALT_1_3_5'), false);
+});
+
+test('isOffDay: ALT_1_3_5 is a recognised rule (not the unknown-value fallback, not treated as ALT_2_4)', () => {
+  assert.ok(SATURDAY_OFF_RULES.includes('ALT_1_3_5'));
+  assert.equal(isOffDay('2026-08-08', 'ALT_1_3_5'), false); // fallback (ALL) would say true
+  assert.equal(isOffDay('2026-08-01', 'ALT_1_3_5'), true);  // ALT_2_4 would say false
+});
+
+test('company validation accepts ALT_1_3_5 on create and update, still rejects unknown values', () => {
+  const { createCompanySchema, updateCompanySchema } = require('../src/validations/companyValidation');
+  assert.equal(updateCompanySchema.validate({ saturday_off_rule: 'ALT_1_3_5' }).error, undefined);
+  assert.equal(createCompanySchema.validate({ saturday_off_rule: 'ALT_1_3_5' }).value.saturday_off_rule, 'ALT_1_3_5');
+  assert.ok(updateCompanySchema.validate({ saturday_off_rule: 'ALT_5' }).error);
+});
+
 test('isOffDay: an unrecognized rule falls back to ALL rather than throwing', () => {
   assert.equal(isOffDay(SATURDAYS[0], 'BOGUS'), true);
   assert.equal(isOffDay(SATURDAYS[0], undefined), true);

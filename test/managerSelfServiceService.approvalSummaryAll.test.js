@@ -18,6 +18,7 @@ const managerSelfServiceService = require('../src/services/managerSelfServiceSer
 const ORIGINAL = {
   employeeFindAll: Employee.findAll,
   bucketsPage: employeeWorkLogRepository.findApprovalSummaryBucketsPage,
+  buckets: employeeWorkLogRepository.findApprovalSummaryBuckets,
   byIds: employeeWorkLogRepository.findByIdsWithIncludes,
   findByManager: managerEmployeeMappingRepository.findByManager,
   pmPoIds: employeeServicePOMappingService.getProjectManagerServicePOIds,
@@ -29,6 +30,7 @@ const ORIGINAL = {
 function restore() {
   Employee.findAll = ORIGINAL.employeeFindAll;
   employeeWorkLogRepository.findApprovalSummaryBucketsPage = ORIGINAL.bucketsPage;
+  employeeWorkLogRepository.findApprovalSummaryBuckets = ORIGINAL.buckets;
   employeeWorkLogRepository.findByIdsWithIncludes = ORIGINAL.byIds;
   managerEmployeeMappingRepository.findByManager = ORIGINAL.findByManager;
   employeeServicePOMappingService.getProjectManagerServicePOIds = ORIGINAL.pmPoIds;
@@ -185,6 +187,117 @@ test('monthly buckets expose month/year (not date), like the single-employee end
     assert.equal(data[0].month, 8);
     assert.equal(data[0].year, 2026);
     assert.equal('date' in data[0], false);
+  } finally {
+    restore();
+  }
+});
+
+// ---- exportApprovalSummaryAll() — same team/poScope resolution, no pagination ----
+
+function captureAllBuckets(rows = []) {
+  const calls = [];
+  employeeWorkLogRepository.findApprovalSummaryBuckets = async (params) => {
+    calls.push(params);
+    return rows;
+  };
+  return calls;
+}
+
+test('export: team = my mapped Employees (same resolution as the paged endpoint); every filter passed through, but no sortBy/sortOrder/limit/offset', async () => {
+  stubTeamLeadTeam([11, 12, 13]);
+  const calls = captureAllBuckets([]);
+  try {
+    await managerSelfServiceService.exportApprovalSummaryAll(99, [1], TEAM_LEAD_RANK, null, [1], {
+      log_type: 'monthly', startDate: '2026-08-01', endDate: '2026-08-31',
+      status: 'pending', service_po_id: '401', search: 'Kotak', employee_ids: '11,12,777',
+    });
+    assert.equal(calls.length, 1);
+    const p = calls[0];
+    assert.deepEqual(p.employeeIds, [11, 12]); // 777 is not on my team
+    assert.equal(p.isMonthly, true);
+    assert.equal(p.status, 'pending');
+    assert.equal(p.servicePoId, 401);
+    assert.equal(p.search, 'Kotak');
+    assert.equal(p.poScope, null); // Team Lead: no Service-PO restriction
+    assert.equal('sortBy' in p, false);
+    assert.equal('limit' in p, false);
+    assert.equal('offset' in p, false);
+  } finally {
+    restore();
+  }
+});
+
+test('export: empty team -> empty rows, no bucket query (never a 500 for a login with no mapped team)', async () => {
+  stubTeamLeadTeam([99]); // only the manager themselves
+  const calls = captureAllBuckets([]);
+  try {
+    const { rows, columns } = await managerSelfServiceService.exportApprovalSummaryAll(99, [1], TEAM_LEAD_RANK, null, [1], {});
+    assert.deepEqual(rows, []);
+    assert.ok(columns.length > 0); // still a valid (empty) sheet, not an error
+    assert.equal(calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+test('export: Project Manager with no Service PO of their own -> empty rows, no bucket query', async () => {
+  employeeServicePOMappingService.getProjectManagerServicePOIds = async () => [];
+  const calls = captureAllBuckets([]);
+  try {
+    const { rows } = await managerSelfServiceService.exportApprovalSummaryAll(99, [40], PROJECT_MANAGER_RANK, null, [40], {});
+    assert.deepEqual(rows, []);
+    assert.equal(calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+test('export: row shaping — Employee "Name (Code)", daily Date as-is, Total Hours numeric, distinct Service PO names joined, Status capitalised', async () => {
+  stubTeamLeadTeam([11]);
+  captureAllBuckets([{
+    employee_id: 11, full_name: 'Priya', employee_code: 'E11', period_date: '2026-08-05',
+    total_hours: '7.50', entry_count: 2, approval_status: 'pending',
+    service_po_names: ['Portal Build', 'Data Migration'], entry_ids: [501, 502],
+  }]);
+  try {
+    const { rows } = await managerSelfServiceService.exportApprovalSummaryAll(99, [1], TEAM_LEAD_RANK, null, [1], {});
+    assert.deepEqual(rows[0], {
+      employee: 'Priya (E11)',
+      period: '2026-08-05',
+      service_po_name: 'Portal Build, Data Migration',
+      total_hours: 7.5,
+      entry_count: 2,
+      approval_status: 'Pending',
+    });
+  } finally {
+    restore();
+  }
+});
+
+test('export: row shaping — monthly period renders as "Month YYYY"', async () => {
+  stubTeamLeadTeam([11]);
+  captureAllBuckets([{
+    employee_id: 11, full_name: 'Ravi', employee_code: 'E11', period_date: '2026-08-01',
+    total_hours: '160.00', entry_count: 20, approval_status: 'approved', service_po_names: ['Portal Build'], entry_ids: [],
+  }]);
+  try {
+    const { rows } = await managerSelfServiceService.exportApprovalSummaryAll(99, [1], TEAM_LEAD_RANK, null, [1], { log_type: 'monthly' });
+    assert.equal(rows[0].period, 'August 2026');
+    assert.equal(rows[0].approval_status, 'Approved');
+  } finally {
+    restore();
+  }
+});
+
+test('export: a bucket with no Service PO at all (e.g. a Leave entry with none logged) never throws — empty string, not "undefined"', async () => {
+  stubTeamLeadTeam([11]);
+  captureAllBuckets([{
+    employee_id: 11, full_name: 'Ravi', employee_code: 'E11', period_date: '2026-08-05',
+    total_hours: '0', entry_count: 1, approval_status: 'approved', service_po_names: null, entry_ids: [],
+  }]);
+  try {
+    const { rows } = await managerSelfServiceService.exportApprovalSummaryAll(99, [1], TEAM_LEAD_RANK, null, [1], {});
+    assert.equal(rows[0].service_po_name, '');
   } finally {
     restore();
   }

@@ -5,6 +5,8 @@ const { sendPaginated, sendSuccess, sendError } = require('../utils/response');
 const logger = require('../utils/logger');
 const employeeWorkLogHoursSummaryService = require('../services/employeeWorkLogHoursSummaryService');
 const projectTimesheetReportService = require('../services/projectTimesheetReportService');
+const employeeRoleBuMappingReportService = require('../services/employeeRoleBuMappingReportService');
+const teamLeadEmployeeProjectHoursReportService = require('../services/teamLeadEmployeeProjectHoursReportService');
 const { toMultiSheetExcelBuffer, toCsvExportBuffer } = require('../utils/reportExporter');
 
 /**
@@ -635,8 +637,89 @@ async function getProjectTimesheetReport(req, res, next) {
   }
 }
 
+/**
+ * GET /api/v1/reports/employee-role-bu-mapping
+ * One row per Employee: Roles, BUs, Sub BUs. Filters: entityIds, buIds,
+ * subBuIds, roleIds, employeeId, search.
+ * format=json (paged) | excel (every row matching the same filters).
+ */
+async function getEmployeeRoleBuMappingReport(req, res, next) {
+  try {
+    if ((req.query.format || 'json') === 'json') {
+      const { data, meta } = await employeeRoleBuMappingReportService.getReport(req.query, req.companyIds);
+      return sendPaginated(res, data, meta, 'Employee role & organization mapping report fetched successfully.');
+    }
+
+    const { rows, columns } = await employeeRoleBuMappingReportService.getExport(req.query, req.companyIds);
+    const buffer = await toMultiSheetExcelBuffer([{ name: 'Employee Role & Org Mapping', columns, rows }]);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="employee-role-bu-mapping.xlsx"');
+    return res.send(Buffer.from(buffer));
+  } catch (err) {
+    if (err.statusCode) return sendError(res, err.message, err.statusCode);
+    logger.error('getEmployeeRoleBuMappingReport error', { error: err.message, stack: err.stack });
+    return next(err);
+  }
+}
+
+/**
+ * GET /api/v1/reports/team-lead-employee-project-hours
+ * Work log entries of the Employees mapped to the CALLER as Primary/Secondary
+ * manager. The Team Lead is always req.employeeId — never a query param.
+ */
+async function getTeamLeadEmployeeProjectHoursReport(req, res, next) {
+  try {
+    const { data, meta, summary } = await teamLeadEmployeeProjectHoursReportService.getReport(req.query, req.employeeId);
+    return sendPaginated(res, { records: data, summary }, meta, 'Team Lead employee project hours report fetched successfully.');
+  } catch (err) {
+    if (err.statusCode) return sendError(res, err.message, err.statusCode);
+    logger.error('getTeamLeadEmployeeProjectHoursReport error', { error: err.message, stack: err.stack });
+    return next(err);
+  }
+}
+
+/**
+ * GET /api/v1/reports/team-lead-employee-project-hours/export?format=excel
+ * Every row matching the report's filters as one .xlsx — same caller-only
+ * manager scoping as the report (req.employeeId, never a query param).
+ */
+async function exportTeamLeadEmployeeProjectHoursReport(req, res, next) {
+  try {
+    const { rows, columns, period } = await teamLeadEmployeeProjectHoursReportService.getExport(req.query, req.employeeId);
+    const buffer = await toMultiSheetExcelBuffer([{ name: 'Team Lead Project Hours', columns, rows }]);
+    const periodSuffix = [period.startDate, period.endDate].filter(Boolean).join('_to_');
+    const filename = `team-lead-employee-project-hours${periodSuffix ? `_${periodSuffix}` : ''}.xlsx`;
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    return res.send(Buffer.from(buffer));
+  } catch (err) {
+    if (err.statusCode) return sendError(res, err.message, err.statusCode);
+    logger.error('exportTeamLeadEmployeeProjectHoursReport error', { error: err.message, stack: err.stack });
+    return next(err);
+  }
+}
+
+/**
+ * GET /api/v1/reports/team-lead-employee-project-hours/filter-options
+ * Dropdown options limited to the caller's own Primary/Secondary-mapped Employees.
+ */
+async function getTeamLeadEmployeeProjectHoursFilterOptions(req, res, next) {
+  try {
+    const options = await teamLeadEmployeeProjectHoursReportService.getFilterOptions(req.query, req.employeeId);
+    return sendSuccess(res, options, 'Filter options fetched successfully.');
+  } catch (err) {
+    if (err.statusCode) return sendError(res, err.message, err.statusCode);
+    logger.error('getTeamLeadEmployeeProjectHoursFilterOptions error', { error: err.message, stack: err.stack });
+    return next(err);
+  }
+}
+
 module.exports = {
   getProjectTimesheetReport,
+  getEmployeeRoleBuMappingReport,
+  getTeamLeadEmployeeProjectHoursReport,
+  exportTeamLeadEmployeeProjectHoursReport,
+  getTeamLeadEmployeeProjectHoursFilterOptions,
   getEmployeeWorkLogHoursSummary,
   getEmployeeWorkLogHoursSummaryDetails,
   getEmployeeHourlyRate,

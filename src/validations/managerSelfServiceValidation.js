@@ -58,16 +58,10 @@ const approvalSummaryQuerySchema = Joi.object({
   log_type: Joi.string().valid('daily', 'monthly').default('daily'),
 });
 
-/**
- * GET /my-team/timesheets/approval-summary/all — the combined, server-
- * paginated "all my Employees" variant. Same date/log_type filters as the
- * single-employee schema above, plus the filters/sort the landing table
- * used to apply client-side. `employee_ids` optionally narrows (never
- * widens) the caller's own team.
- */
-const approvalSummaryAllQuerySchema = Joi.object({
-  page: Joi.number().integer().min(1).default(1),
-  limit: Joi.number().integer().min(1).max(200).default(20),
+// Filters shared by GET /my-team/timesheets/approval-summary/all and its
+// .../export — kept in one place so the export always accepts exactly what
+// the landing table itself does.
+const approvalSummaryAllFilterKeys = {
   startDate: Joi.date().iso().optional(),
   endDate: Joi.date().iso().optional(),
   log_type: Joi.string().valid('daily', 'monthly').default('daily'),
@@ -78,8 +72,31 @@ const approvalSummaryAllQuerySchema = Joi.object({
   status: Joi.string().valid('all', 'pending', 'approved', 'rejected').default('all'),
   service_po_id: Joi.number().integer().positive().optional(),
   search: Joi.string().trim().max(100).allow('').optional(),
+};
+
+/**
+ * GET /my-team/timesheets/approval-summary/all — the combined, server-
+ * paginated "all my Employees" variant. Same date/log_type filters as the
+ * single-employee schema above, plus the filters/sort the landing table
+ * used to apply client-side. `employee_ids` optionally narrows (never
+ * widens) the caller's own team.
+ */
+const approvalSummaryAllQuerySchema = Joi.object({
+  ...approvalSummaryAllFilterKeys,
+  page: Joi.number().integer().min(1).default(1),
+  limit: Joi.number().integer().min(1).max(200).default(20),
   sortBy: Joi.string().valid('employee', 'period', 'hours', 'entries', 'status').optional(),
   sortOrder: Joi.string().lowercase().valid('asc', 'desc').default('desc'),
+});
+
+/**
+ * GET /my-team/timesheets/approval-summary/all/export — same filters as
+ * the landing table, every matching row (no page/limit/sort; unknown keys
+ * are stripped by the validate() middleware).
+ */
+const approvalSummaryAllExportQuerySchema = Joi.object({
+  ...approvalSummaryAllFilterKeys,
+  format: Joi.string().lowercase().valid('excel').default('excel'),
 });
 
 const dateItem = Joi.date().iso().messages({
@@ -129,6 +146,7 @@ module.exports = {
   listMyTeamTimesheetsQuerySchema,
   approvalSummaryQuerySchema,
   approvalSummaryAllQuerySchema,
+  approvalSummaryAllExportQuerySchema,
   bulkApproveTimesheetsSchema,
   rejectWorkLogSchema,
 };

@@ -65,10 +65,28 @@ const create = async (data, options = {}) => {
  * @param {object} data
  * @returns {Promise<Company|null>}
  */
-const update = async (id, data) => {
-  const company = await Company.findByPk(id);
+const update = async (id, data, options = {}) => {
+  const company = await Company.findByPk(id, options);
   if (!company) return null;
-  return company.update(data);
+  return company.update(data, options);
+};
+
+/**
+ * Set saturday_off_rule on every non-deleted direct Sub-BU of a Parent BU —
+ * a Sub-BU always follows its Parent's Week Off Policy (see
+ * companyService.update()). Depth-1 only: Sub-BUs never have children.
+ *
+ * @param {number} parentId
+ * @param {string} saturdayOffRule
+ * @param {object} [options] - Sequelize options, e.g. { transaction }
+ * @returns {Promise<number>} Sub-BUs updated
+ */
+const updateSubBuSaturdayOffRule = async (parentId, saturdayOffRule, options = {}) => {
+  const [count] = await Company.update(
+    { saturday_off_rule: saturdayOffRule },
+    { where: { parent_business_unit_id: parentId, is_deleted: false }, ...options }
+  );
+  return count;
 };
 
 /**
@@ -286,6 +304,7 @@ module.exports = {
   findByCode,
   create,
   update,
+  updateSubBuSaturdayOffRule,
   findIdsByEntityIds,
   findByIdForEntities,
   findAllForEntities,

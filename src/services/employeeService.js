@@ -31,7 +31,25 @@ const logger = require('../utils/logger');
  * assigned a manager later via update().
  */
 
-const CAPABILITY_CAN_MANAGE_EMPLOYEES = 'manager.view_mapped_employees';
+// Primary/Secondary Manager must hold this role DIRECTLY. Deliberately not
+// capability-based: Project Manager inherits Team Lead (see
+// config/roleHierarchy.js), so a manager.view_mapped_employees check would
+// also admit PM / Project Admin / BU Admin — who route approvals via
+// Service PO (delivery_head_employee_id), not this mapping.
+const TEAM_LEAD_ROLE_NAME = 'Team Lead';
+
+async function resolveTeamLeadRoleId() {
+  const role = await Role.findOne({
+    where: { role_name: TEAM_LEAD_ROLE_NAME, is_deleted: false },
+    attributes: ['id'],
+  });
+  if (!role) {
+    const err = new Error(`The "${TEAM_LEAD_ROLE_NAME}" role is not seeded.`);
+    err.statusCode = 500;
+    throw err;
+  }
+  return role.id;
+}
 
 function notFoundError(message) {
   const err = new Error(message);
@@ -59,11 +77,10 @@ function forbiddenError(message) {
 
 /**
  * Confirm a candidate manager: exists, active, same company as the
- * Employee, and holds a role capable of managing Employees (Manager,
- * Project Manager, or Project Admin — anything with
- * 'manager.view_mapped_employees' in its effective capability set, direct
- * or inherited — see roleHierarchyService.js). Reused by both create() and
- * update() rather than duplicating the check.
+ * Employee, and holds the Team Lead role directly (see TEAM_LEAD_ROLE_NAME
+ * — Project Manager and above are NOT eligible even though they inherit
+ * Team Lead's capabilities). Reused by both create() and update() rather
+ * than duplicating the check.
  *
  * @param {number} managerEmployeeId
  * @param {number} companyId
@@ -79,14 +96,15 @@ async function assertValidManager(managerEmployeeId, companyId, label) {
     throw badRequestError(`${label} is not an active account.`);
   }
 
-  const roleIds = await employeeRoleRepository.findIdsByEmployeeId(managerEmployeeId);
+  const [roleIds, teamLeadRoleId] = await Promise.all([
+    employeeRoleRepository.findIdsByEmployeeId(managerEmployeeId),
+    resolveTeamLeadRoleId(),
+  ]);
   if (roleIds.length === 0) {
     throw badRequestError(`${label} has no role assigned.`);
   }
-
-  const capabilities = await roleHierarchyService.getEffectiveCapabilitiesForRoleIds(roleIds);
-  if (!roleHierarchyService.hasCapability(capabilities, CAPABILITY_CAN_MANAGE_EMPLOYEES)) {
-    throw badRequestError(`${label} must hold a Manager (or higher) role.`);
+  if (!roleIds.includes(teamLeadRoleId)) {
+    throw badRequestError(`${label} must hold the ${TEAM_LEAD_ROLE_NAME} role.`);
   }
 
   return manager;
@@ -529,7 +547,7 @@ const getMappings = async (id, authContext) => {
  * this always succeeds for "my own mapped BUs".
  *
  * Each entry also carries `saturday_off_rule` ('ALL'|'ALT_1_3'|'ALT_2_4'|
- * 'NONE', straight off the underlying `companies` row) — the Off-Day
+ * 'ALT_1_3_5'|'NONE', straight off the underlying `companies` row) — the Off-Day
  * Approval Gate's only Employee-reachable source for a BU's Week Off
  * Policy (GET /companies/:id has it too, but that route is Admin/BU-Admin
  * scoped and not reliably callable from a plain Employee login).
@@ -1025,10 +1043,18 @@ const update = async (id, data, userId, ipAddress = null, authContext) => {
     ? await resolveBusinessUnitIds(businessUnitIds, companyId, await resolveBUAssignmentScope(authContext, ownedScope))
     : null;
 
-  if (primaryManagerEmployeeId) {
+  // Only validate a manager that is actually CHANGING — the Edit form
+  // resends the current value on every save, and a mapping created before
+  // the Team-Lead-only rule (e.g. a Project Manager) must not block
+  // unrelated edits. A new/changed assignment is always checked.
+  const managerUnchanged = async (mappingType, managerEmployeeId) => {
+    const current = await managerEmployeeMappingRepository.findByEmployeeAndType(id, mappingType);
+    return Boolean(current && current.manager_employee_id === managerEmployeeId);
+  };
+  if (primaryManagerEmployeeId && !(await managerUnchanged('PRIMARY', primaryManagerEmployeeId))) {
     await assertValidManager(primaryManagerEmployeeId, companyId, 'Primary Manager');
   }
-  if (secondaryManagerEmployeeId) {
+  if (secondaryManagerEmployeeId && !(await managerUnchanged('SECONDARY', secondaryManagerEmployeeId))) {
     await assertValidManager(secondaryManagerEmployeeId, companyId, 'Secondary Manager');
   }
 
@@ -1218,9 +1244,8 @@ const getActiveEmployees = async (authContext, servicePOId, businessUnitId = nul
 /**
  * Return eligible candidates for Primary/Secondary Manager selection — the
  * Employee Create/Edit form's manager dropdowns. Same eligibility rule
- * assertValidManager() enforces at create()/update() time (any role whose
- * effective capability set includes manager.view_mapped_employees, direct
- * or inherited), resolved once here via a single Employee<->Role join
+ * assertValidManager() enforces at create()/update() time (holds the Team
+ * Lead role directly), resolved once here via a single Employee<->Role join
  * rather than per-candidate — so a value offered in the dropdown is always
  * one create()/update() will actually accept, and the frontend never needs
  * to N+1 a per-row mappings fetch to figure out who's eligible.
@@ -1230,8 +1255,8 @@ const getActiveEmployees = async (authContext, servicePOId, businessUnitId = nul
  */
 const getEligibleManagers = async (authContext) => {
   const accessWhere = await employeeAccessControlService.resolveEmployeeAccessWhere(authContext);
-  const eligibleRoleIds = await roleHierarchyService.getRoleIdsWithCapability(CAPABILITY_CAN_MANAGE_EMPLOYEES);
-  const employees = await employeeRepository.findEligibleManagers(authContext.companyId, eligibleRoleIds, accessWhere);
+  const teamLeadRoleId = await resolveTeamLeadRoleId();
+  const employees = await employeeRepository.findEligibleManagers(authContext.companyId, [teamLeadRoleId], accessWhere);
   return employees.map((employee) => ({
     id: employee.id,
     employee_code: employee.employee_code,

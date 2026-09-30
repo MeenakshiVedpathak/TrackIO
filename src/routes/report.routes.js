@@ -22,6 +22,13 @@ const {
   employeeWorkLogHoursSummaryDetailParamsSchema,
 } = require('../validations/employeeWorkLogHoursSummaryValidation');
 const { projectTimesheetReportQuerySchema } = require('../validations/projectTimesheetReportValidation');
+const { employeeRoleBuMappingQuerySchema } = require('../validations/employeeRoleBuMappingReportValidation');
+const {
+  teamLeadEmployeeProjectHoursQuerySchema,
+  teamLeadEmployeeProjectHoursExportQuerySchema,
+  teamLeadEmployeeProjectHoursFilterOptionsQuerySchema,
+} = require('../validations/teamLeadEmployeeProjectHoursReportValidation');
+const authorize = require('../middlewares/authorize');
 
 /**
  * @swagger
@@ -57,6 +64,156 @@ router.get(
   authenticateMultiBU,
   validate(projectTimesheetReportQuerySchema, 'query'),
   reportController.getProjectTimesheetReport
+);
+
+/**
+ * @swagger
+ * /reports/employee-role-bu-mapping:
+ *   get:
+ *     summary: Employee Role & Organization Mapping — one row per Employee with Roles, BUs and Sub BUs
+ *     description: >
+ *       Roles/BUs/Sub BUs are each comma-separated (STRING_AGG DISTINCT), one
+ *       row per Employee. Only mappings to Business Units inside the caller's
+ *       own reach are read or shown. entityIds/buIds/subBuIds are all
+ *       matched against the SAME employee_business_units row (a BU + Sub BU
+ *       selection matches only a real mapping in that branch). buIds also
+ *       match that BU's own Sub-BUs. No Entity/BU/role is hardcoded.
+ *       format=excel returns every row matching the same filters as an .xlsx.
+ *     tags: [Reports]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - { in: query, name: entityIds, schema: { type: string }, description: Comma-separated Entity ids }
+ *       - { in: query, name: buIds, schema: { type: string }, description: Comma-separated BU ids (includes their Sub-BUs) }
+ *       - { in: query, name: subBuIds, schema: { type: string }, description: Comma-separated Sub-BU ids }
+ *       - { in: query, name: roleIds, schema: { type: string }, description: Comma-separated role ids }
+ *       - { in: query, name: employeeId, schema: { type: integer } }
+ *       - { in: query, name: search, schema: { type: string }, description: Employee name or code }
+ *       - { in: query, name: page, schema: { type: integer, default: 1 } }
+ *       - { in: query, name: limit, schema: { type: integer, default: 20, maximum: 100 } }
+ *       - { in: query, name: format, schema: { type: string, enum: [json, excel], default: json } }
+ *     responses:
+ *       200:
+ *         description: Paginated rows (json) or an .xlsx download (excel)
+ */
+router.get(
+  '/employee-role-bu-mapping',
+  authenticateMultiBU,
+  validate(employeeRoleBuMappingQuerySchema, 'query'),
+  reportController.getEmployeeRoleBuMappingReport
+);
+
+/**
+ * @swagger
+ * /reports/team-lead-employee-project-hours:
+ *   get:
+ *     summary: Team Lead Employee Project Hours — work log entries of the caller's own Primary/Secondary-mapped Employees
+ *     description: >
+ *       Access is ONLY the caller's active manager_employee_mappings rows
+ *       (PRIMARY or SECONDARY). BU/company, Service PO and Project Manager
+ *       (employee_servicepo_mapping) relationships never grant visibility.
+ *       The Team Lead is always the authenticated caller — no id is accepted.
+ *       One row per employee_work_logs entry; BU/Sub-BU are the Service PO's.
+ *     tags: [Reports]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - { in: query, name: month, schema: { type: integer }, description: With year; mutually exclusive with startDate/endDate }
+ *       - { in: query, name: year, schema: { type: integer } }
+ *       - { in: query, name: startDate, schema: { type: string, format: date } }
+ *       - { in: query, name: endDate, schema: { type: string, format: date } }
+ *       - { in: query, name: employeeIds, schema: { type: string }, description: Comma-separated; only narrows the caller's own team }
+ *       - { in: query, name: clientIds, schema: { type: string } }
+ *       - { in: query, name: projectIds, schema: { type: string } }
+ *       - { in: query, name: servicePoIds, schema: { type: string } }
+ *       - { in: query, name: buIds, schema: { type: string }, description: Top-level BU (includes its Sub-BUs) }
+ *       - { in: query, name: subBuIds, schema: { type: string } }
+ *       - { in: query, name: status, schema: { type: string }, description: Comma-separated pending,approved,rejected,synced }
+ *       - { in: query, name: search, schema: { type: string }, description: Employee name/code or entry description }
+ *       - { in: query, name: sortBy, schema: { type: string, enum: [employee, client, project, spo, hours, status, date] } }
+ *       - { in: query, name: sortOrder, schema: { type: string, enum: [asc, desc], default: desc } }
+ *       - { in: query, name: page, schema: { type: integer, default: 1 } }
+ *       - { in: query, name: limit, schema: { type: integer, default: 20, maximum: 100 } }
+ *     responses:
+ *       200:
+ *         description: "{ records[], summary: { total_logged_hours, period } } plus pagination meta"
+ *       403:
+ *         description: Caller lacks the manager.view_mapped_employees capability
+ */
+/**
+ * @swagger
+ * /reports/team-lead-employee-project-hours/filter-options:
+ *   get:
+ *     summary: Dropdown options for the Team Lead Employee Project Hours report
+ *     description: >
+ *       employees = every Employee mapped to the caller as Primary/Secondary
+ *       manager; clients/projects/servicePos/businessUnits/subBusinessUnits =
+ *       only those present in those Employees' work log entries (optionally
+ *       within month+year or startDate/endDate). Same access rule as the report.
+ *     tags: [Reports]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: "{ employees, clients, projects, servicePos, businessUnits, subBusinessUnits }"
+ */
+router.get(
+  '/team-lead-employee-project-hours/filter-options',
+  authenticateBase.authenticateIdentity,
+  authorize(['manager.view_mapped_employees']),
+  validate(teamLeadEmployeeProjectHoursFilterOptionsQuerySchema, 'query'),
+  reportController.getTeamLeadEmployeeProjectHoursFilterOptions
+);
+
+router.get(
+  '/team-lead-employee-project-hours',
+  authenticateBase.authenticateIdentity,
+  authorize(['manager.view_mapped_employees']),
+  validate(teamLeadEmployeeProjectHoursQuerySchema, 'query'),
+  reportController.getTeamLeadEmployeeProjectHoursReport
+);
+
+/**
+ * @swagger
+ * /reports/team-lead-employee-project-hours/export:
+ *   get:
+ *     summary: Excel export of the Team Lead Employee Project Hours report (every matching row)
+ *     description: >
+ *       Same access rule and filters as GET /reports/team-lead-employee-project-hours
+ *       (caller's own Primary/Secondary-mapped Employees only; the Team Lead is
+ *       always the authenticated caller). No page/limit/sortBy/sortOrder —
+ *       returns every matching row, newest first. Columns: Employee (name +
+ *       code), Client, Project, SPO (name + code), Hours Name, BU, Sub-BU,
+ *       Logged Hours, Date, Description, Status.
+ *     tags: [Reports]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - { in: query, name: format, schema: { type: string, enum: [excel], default: excel } }
+ *       - { in: query, name: month, schema: { type: integer }, description: With year; mutually exclusive with startDate/endDate }
+ *       - { in: query, name: year, schema: { type: integer } }
+ *       - { in: query, name: startDate, schema: { type: string, format: date } }
+ *       - { in: query, name: endDate, schema: { type: string, format: date } }
+ *       - { in: query, name: employeeIds, schema: { type: string } }
+ *       - { in: query, name: clientIds, schema: { type: string } }
+ *       - { in: query, name: projectIds, schema: { type: string } }
+ *       - { in: query, name: servicePoIds, schema: { type: string } }
+ *       - { in: query, name: buIds, schema: { type: string } }
+ *       - { in: query, name: subBuIds, schema: { type: string } }
+ *       - { in: query, name: status, schema: { type: string }, description: Comma-separated pending,approved,rejected,synced }
+ *       - { in: query, name: search, schema: { type: string } }
+ *     responses:
+ *       200:
+ *         description: .xlsx attachment
+ *       403:
+ *         description: Caller lacks the manager.view_mapped_employees capability
+ */
+router.get(
+  '/team-lead-employee-project-hours/export',
+  authenticateBase.authenticateIdentity,
+  authorize(['manager.view_mapped_employees']),
+  validate(teamLeadEmployeeProjectHoursExportQuerySchema, 'query'),
+  reportController.exportTeamLeadEmployeeProjectHoursReport
 );
 
 router.get(

@@ -12,7 +12,7 @@ const moment = require('moment-timezone');
  * Saturday varies, by which occurrence in the month it is (1st..5th).
  */
 
-const SATURDAY_OFF_RULES = ['ALL', 'ALT_1_3', 'ALT_2_4', 'NONE'];
+const SATURDAY_OFF_RULES = ['ALL', 'ALT_1_3', 'ALT_2_4', 'ALT_1_3_5', 'NONE'];
 
 /**
  * Which occurrence of its weekday this date is within its month — e.g. the
@@ -52,6 +52,8 @@ function isOffDay(dateStr, saturdayOffRule) {
 
   const occurrence = occurrenceInMonth(m);
   if (rule === 'ALT_1_3') return occurrence === 1 || occurrence === 3;
+  // 1st, 3rd & 5th — a month with only 4 Saturdays simply has no 5th.
+  if (rule === 'ALT_1_3_5') return occurrence === 1 || occurrence === 3 || occurrence === 5;
   return occurrence === 2 || occurrence === 4; // ALT_2_4
 }
 

@@ -77,8 +77,8 @@ const createCompanySchema = Joi.object({
   // a Sub-BU (parent_business_unit_id given), companyService.create() always
   // overrides this with the PARENT's own saturday_off_rule instead — "off
   // day, it takes its parent" — so any value sent here is ignored in that case.
-  saturday_off_rule: Joi.string().valid('ALL', 'ALT_1_3', 'ALT_2_4', 'NONE').optional().default('ALL').messages({
-    'any.only': 'saturday_off_rule must be ALL, ALT_1_3, ALT_2_4, or NONE.',
+  saturday_off_rule: Joi.string().valid('ALL', 'ALT_1_3', 'ALT_2_4', 'ALT_1_3_5', 'NONE').optional().default('ALL').messages({
+    'any.only': 'saturday_off_rule must be ALL, ALT_1_3, ALT_2_4, ALT_1_3_5, or NONE.',
   }),
 });
 
@@ -91,8 +91,8 @@ const updateCompanySchema = Joi.object({
   is_original_data_visible: Joi.boolean().optional().messages({
     'boolean.base': 'is_original_data_visible must be true or false.',
   }),
-  saturday_off_rule: Joi.string().valid('ALL', 'ALT_1_3', 'ALT_2_4', 'NONE').optional().messages({
-    'any.only': 'saturday_off_rule must be ALL, ALT_1_3, ALT_2_4, or NONE.',
+  saturday_off_rule: Joi.string().valid('ALL', 'ALT_1_3', 'ALT_2_4', 'ALT_1_3_5', 'NONE').optional().messages({
+    'any.only': 'saturday_off_rule must be ALL, ALT_1_3, ALT_2_4, ALT_1_3_5, or NONE.',
   }),
   // BU Hierarchy / Sub-BU support — reassign/detach this Company's parent.
   // `null` explicitly promotes a Sub-BU back to a top-level Parent BU; a

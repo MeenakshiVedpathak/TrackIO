@@ -4,6 +4,7 @@ const managerSelfServiceService = require('../services/managerSelfServiceService
 const offDayWorkRequestService = require('../services/offDayWorkRequestService');
 const { sendSuccess, sendCreated, sendNoContent, sendNotFound, sendPaginated, sendError } = require('../utils/response');
 const { getIpAddress } = require('../middlewares/auditLog');
+const { toMultiSheetExcelBuffer } = require('../utils/reportExporter');
 const logger = require('../utils/logger');
 
 /**
@@ -129,6 +130,35 @@ const getApprovalSummaryAll = async (req, res) => {
   } catch (error) {
     if (error.statusCode === 403) return sendError(res, error.message, 403);
     logger.error('getApprovalSummaryAll error', { error: error.message, userId: req.userId });
+    return sendError(res, error.message, error.statusCode || 500);
+  }
+};
+
+/**
+ * GET /my-team/timesheets/approval-summary/all/export?format=excel — every
+ * matching bucket as one .xlsx (see managerSelfServiceService.exportApprovalSummaryAll).
+ * Same identity/BU scoping and filters as getApprovalSummaryAll above, no
+ * page/limit/sortBy/sortOrder.
+ */
+const exportApprovalSummaryAll = async (req, res) => {
+  try {
+    const { rows, columns } = await managerSelfServiceService.exportApprovalSummaryAll(
+      req.userId,
+      req.companyIds,
+      req.hierarchyRank,
+      req.explicitBusinessUnitId,
+      callerBuIds(req),
+      req.query
+    );
+    const buffer = await toMultiSheetExcelBuffer([{ name: 'Timesheet Approval Summary', columns, rows }]);
+    const periodSuffix = [req.query.startDate, req.query.endDate].filter(Boolean).join('_to_');
+    const filename = `timesheet-approval-summary${periodSuffix ? `_${periodSuffix}` : ''}.xlsx`;
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    return res.send(Buffer.from(buffer));
+  } catch (error) {
+    if (error.statusCode === 403) return sendError(res, error.message, 403);
+    logger.error('exportApprovalSummaryAll error', { error: error.message, userId: req.userId });
     return sendError(res, error.message, error.statusCode || 500);
   }
 };
@@ -310,6 +340,7 @@ module.exports = {
   approveTimesheet,
   getApprovalSummary,
   getApprovalSummaryAll,
+  exportApprovalSummaryAll,
   bulkApproveTimesheets,
   rejectWorkLogEntry,
   assignServicePO,

@@ -205,14 +205,14 @@ router.get(
  * @swagger
  * /employees/eligible-managers:
  *   get:
- *     summary: Get employees eligible for Primary/Secondary Manager selection
+ *     summary: Get employees eligible for Primary/Secondary Team Lead selection
  *     description: >
- *       Active employees in the caller's scope holding a role capable of
- *       managing Employees (Manager, Project Manager, Project Admin, or
- *       anything with manager.view_mapped_employees in its effective
- *       capability set) — the same eligibility rule enforced when the
- *       Employee Create/Edit form actually saves a Primary/Secondary
- *       Manager, so every value offered here is guaranteed acceptable.
+ *       Active employees in the caller's scope holding the Team Lead role
+ *       directly (Project Manager / Project Admin / BU Admin are excluded
+ *       even though they inherit Team Lead's capabilities) — the same
+ *       eligibility rule enforced when the Employee Create/Edit form
+ *       actually saves a Primary/Secondary Manager, so every value offered
+ *       here is guaranteed acceptable.
  *     tags: [Employees]
  *     security:
  *       - bearerAuth: []

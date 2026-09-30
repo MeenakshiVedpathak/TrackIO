@@ -374,8 +374,8 @@ const getEligibleDeliveryHeads = async (companyId, accessWhere = null) => {
 /**
  * Active, non-deleted Employees holding ANY of the given role ids — the
  * eligible candidate list for Primary/Secondary Manager selection (must
- * hold a role with the manager.view_mapped_employees capability, see
- * employeeService.js's assertValidManager()/getEligibleManagers()). One
+ * hold the Team Lead role directly, see employeeService.js's
+ * assertValidManager()/getEligibleManagers()). One
  * query via the Employee<->Role join, not N+1 per candidate.
  *
  * @param {number|number[]} companyId

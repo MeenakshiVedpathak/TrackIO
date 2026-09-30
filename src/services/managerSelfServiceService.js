@@ -1,6 +1,7 @@
 'use strict';
 
 const { Op } = require('sequelize');
+const moment = require('moment-timezone');
 const { Employee, ServicePO, Company, Entity, sequelize } = require('../models');
 const managerEmployeeMappingRepository = require('../repositories/managerEmployeeMappingRepository');
 const managerServicePOMappingRepository = require('../repositories/managerServicePOMappingRepository');
@@ -769,11 +770,15 @@ const getApprovalSummary = async (managerUserId, employeeId, ownEmployeeId, comp
  *   search, employee_ids, sortBy, sortOrder, page, limit
  * @returns {Promise<{ data: object[], meta: object }>}
  */
-const getApprovalSummaryAll = async (managerUserId, companyIds, hierarchyRank, explicitBusinessUnitId, callerBuIds, query) => {
-  const page = parseInt(query.page, 10) || 1;
-  const limit = parseInt(query.limit, 10) || 20;
-  const emptyResult = { data: [], meta: { total: 0, page, limit, totalPages: 0, hasNext: false, hasPrev: false } };
-
+/**
+ * Resolve the caller's own mapped team (narrowed by `employee_ids`, never
+ * widened) plus, for a Project Manager caller, the same poScope predicate
+ * assertOwnEmployeeForApproval() enforces per-employee — shared by
+ * getApprovalSummaryAll() and exportApprovalSummaryAll() so both read
+ * exactly the same authorized rows.
+ * @returns {Promise<{ empty: true } | { empty: false, employeeIds: number[], poScope: object|null }>}
+ */
+async function resolveApprovalSummaryTeamScope(managerUserId, companyIds, hierarchyRank, explicitBusinessUnitId, callerBuIds, query) {
   const team = await getMyEmployees(managerUserId, companyIds, hierarchyRank, explicitBusinessUnitId);
   let employeeIds = team.map((employee) => employee.id);
   const requestedIds = parseIdList(query.employee_ids);
@@ -781,12 +786,12 @@ const getApprovalSummaryAll = async (managerUserId, companyIds, hierarchyRank, e
     const requested = new Set(requestedIds);
     employeeIds = employeeIds.filter((id) => requested.has(id));
   }
-  if (employeeIds.length === 0) return emptyResult;
+  if (employeeIds.length === 0) return { empty: true };
 
   let poScope = null;
   if (hierarchyRank === PROJECT_MANAGER_RANK) {
     const ownPoIds = await employeeServicePOMappingService.getProjectManagerServicePOIds(managerUserId);
-    if (ownPoIds.length === 0) return emptyResult;
+    if (ownPoIds.length === 0) return { empty: true };
     // Only this Project Manager's OWN Admin tenant's Centralised POs — same
     // seed as assertOwnEmployeeForApproval().
     const centralisedPOs = await servicePORepository.getActiveCentralisedPOIds(
@@ -794,6 +799,18 @@ const getApprovalSummaryAll = async (managerUserId, companyIds, hierarchyRank, e
     );
     poScope = { ownPoIds, centralisedPoIds: centralisedPOs.map((po) => po.id) };
   }
+
+  return { empty: false, employeeIds, poScope };
+}
+
+const getApprovalSummaryAll = async (managerUserId, companyIds, hierarchyRank, explicitBusinessUnitId, callerBuIds, query) => {
+  const page = parseInt(query.page, 10) || 1;
+  const limit = parseInt(query.limit, 10) || 20;
+  const emptyResult = { data: [], meta: { total: 0, page, limit, totalPages: 0, hasNext: false, hasPrev: false } };
+
+  const scope = await resolveApprovalSummaryTeamScope(managerUserId, companyIds, hierarchyRank, explicitBusinessUnitId, callerBuIds, query);
+  if (scope.empty) return emptyResult;
+  const { employeeIds, poScope } = scope;
 
   const isMonthly = query.log_type === 'monthly';
   const { rows, total } = await employeeWorkLogRepository.findApprovalSummaryBucketsPage({
@@ -840,6 +857,72 @@ const getApprovalSummaryAll = async (managerUserId, companyIds, hierarchyRank, e
   return {
     data,
     meta: { total, page, limit, totalPages, hasNext: page < totalPages, hasPrev: page > 1 },
+  };
+};
+
+const APPROVAL_SUMMARY_EXPORT_COLUMNS = [
+  { key: 'employee', label: 'Employee', width: 32 },
+  { key: 'period', label: 'Date', width: 16 },
+  { key: 'service_po_name', label: 'Service PO Name', width: 36 },
+  { key: 'total_hours', label: 'Total Hours', width: 14, numFmt: '0.00' },
+  { key: 'entry_count', label: 'Entry Count', width: 12 },
+  { key: 'approval_status', label: 'Approval Status', width: 16 },
+];
+
+function toApprovalSummaryExportRow(row, isMonthly) {
+  const periodDate = typeof row.period_date === 'string'
+    ? row.period_date.slice(0, 10)
+    : new Date(row.period_date).toISOString().slice(0, 10);
+  const period = isMonthly ? moment.utc(periodDate).format('MMMM YYYY') : periodDate;
+
+  return {
+    employee: row.employee_code ? `${row.full_name} (${row.employee_code})` : row.full_name,
+    period,
+    // A bucket almost always has exactly one Service PO, but an Employee can
+    // log against more than one on the same date/month — never drop a PO
+    // silently, join every distinct name touched that period.
+    service_po_name: (row.service_po_names || []).join(', '),
+    total_hours: parseFloat(row.total_hours) || 0,
+    entry_count: row.entry_count,
+    approval_status: row.approval_status ? row.approval_status.charAt(0).toUpperCase() + row.approval_status.slice(1) : '',
+  };
+}
+
+/**
+ * Every Timesheet Approval Summary bucket matching the filters (no
+ * pagination) for the Excel export — same caller-only team/poScope
+ * resolution as getApprovalSummaryAll(), so the export can never show a
+ * row the JSON endpoint wouldn't. `entries` are never loaded (the export
+ * has no drill-down) — only the aggregated bucket fields are needed.
+ *
+ * @param {number} managerUserId
+ * @param {number[]} companyIds - req.companyIds (resolveMyTeamBusinessUnitScope)
+ * @param {number|null} hierarchyRank
+ * @param {number|null} explicitBusinessUnitId - req.explicitBusinessUnitId
+ * @param {number[]} callerBuIds
+ * @param {object} query - log_type, startDate, endDate, status, service_po_id, search, employee_ids
+ * @returns {Promise<{ rows: object[], columns: object[] }>}
+ */
+const exportApprovalSummaryAll = async (managerUserId, companyIds, hierarchyRank, explicitBusinessUnitId, callerBuIds, query) => {
+  const scope = await resolveApprovalSummaryTeamScope(managerUserId, companyIds, hierarchyRank, explicitBusinessUnitId, callerBuIds, query);
+  if (scope.empty) return { rows: [], columns: APPROVAL_SUMMARY_EXPORT_COLUMNS };
+  const { employeeIds, poScope } = scope;
+
+  const isMonthly = query.log_type === 'monthly';
+  const rows = await employeeWorkLogRepository.findApprovalSummaryBuckets({
+    employeeIds,
+    startDate: query.startDate,
+    endDate: query.endDate,
+    isMonthly,
+    poScope,
+    status: query.status && query.status !== 'all' ? query.status : null,
+    servicePoId: query.service_po_id ? parseInt(query.service_po_id, 10) : null,
+    search: query.search || null,
+  });
+
+  return {
+    rows: rows.map((row) => toApprovalSummaryExportRow(row, isMonthly)),
+    columns: APPROVAL_SUMMARY_EXPORT_COLUMNS,
   };
 };
 
@@ -1070,6 +1153,7 @@ module.exports = {
   approveTimesheet,
   getApprovalSummary,
   getApprovalSummaryAll,
+  exportApprovalSummaryAll,
   bulkApproveTimesheets,
   rejectWorkLogEntry,
   assignServicePOToEmployee,

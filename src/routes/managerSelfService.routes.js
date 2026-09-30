@@ -29,6 +29,7 @@ const {
   listMyTeamTimesheetsQuerySchema,
   approvalSummaryQuerySchema,
   approvalSummaryAllQuerySchema,
+  approvalSummaryAllExportQuerySchema,
   bulkApproveTimesheetsSchema,
   rejectWorkLogSchema,
 } = require('../validations/managerSelfServiceValidation');
@@ -229,6 +230,48 @@ router.get(
   resolveMyTeamBusinessUnitScope,
   authorize(['manager.view_mapped_employees', 'servicepo.view_mapped_employees']),
   controller.getApprovalSummaryAll
+);
+
+/**
+ * @swagger
+ * /my-team/timesheets/approval-summary/all/export:
+ *   get:
+ *     summary: Excel export of the combined Timesheet Approval Summary (every matching bucket)
+ *     description: >
+ *       Same access rule, Business Unit scoping and filters as GET
+ *       /my-team/timesheets/approval-summary/all (the caller's own mapped
+ *       team, "my team" always resolved from the login — never a param). No
+ *       page/limit/sortBy/sortOrder — returns every matching bucket, in that
+ *       endpoint's own default order (pending first, newest period, then
+ *       employee name). Columns: Employee (name + code), Date (or Month for
+ *       log_type=monthly), Service PO Name, Total Hours, Entry Count,
+ *       Approval Status.
+ *     tags: [MyTeam]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - { in: query, name: format, schema: { type: string, enum: [excel], default: excel } }
+ *       - { in: query, name: log_type, schema: { type: string, enum: [daily, monthly], default: daily } }
+ *       - { in: query, name: startDate, schema: { type: string, format: date } }
+ *       - { in: query, name: endDate, schema: { type: string, format: date } }
+ *       - { in: query, name: status, schema: { type: string, enum: [all, pending, approved, rejected], default: all } }
+ *       - { in: query, name: service_po_id, schema: { type: integer }, description: Team Lead screen only; ignored/optional for the Manager screen }
+ *       - { in: query, name: search, schema: { type: string }, description: Employee name/code OR a Service PO name on the bucket }
+ *       - { in: query, name: employee_ids, schema: { type: string }, description: Comma-separated subset of the caller's own team }
+ *       - { in: query, name: business_unit_id, schema: { type: integer } }
+ *     responses:
+ *       200:
+ *         description: .xlsx attachment
+ *       403:
+ *         description: Caller has no mapped team / lacks the manager.view_mapped_employees or servicepo.view_mapped_employees capability
+ */
+router.get(
+  '/timesheets/approval-summary/all/export',
+  authenticate.authenticateIdentity,
+  validate(approvalSummaryAllExportQuerySchema, 'query'),
+  resolveMyTeamBusinessUnitScope,
+  authorize(['manager.view_mapped_employees', 'servicepo.view_mapped_employees']),
+  controller.exportApprovalSummaryAll
 );
 
 /**
