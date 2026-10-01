@@ -156,7 +156,7 @@ test('export: the 11 requested columns, name+code combined, hours numeric, statu
   try {
     const { rows, columns, period } = await service.getExport({ month: 9, year: 2026 }, 15);
     assert.deepEqual(columns.map((c) => c.label), [
-      'Employee', 'Client', 'Project', 'SPO', 'Hours Name', 'BU', 'Sub-BU', 'Logged Hours', 'Date', 'Description', 'Status',
+      'Employee', 'Client', 'Project', 'SPO', 'Module / Task', 'BU', 'Sub-BU', 'Logged Hours', 'Date', 'Description', 'Status',
     ]);
     assert.deepEqual(rows[0], {
       employee: 'Asha Rao (E007)', client_name: 'Acme', project_name: 'Portal', spo: 'Portal Build (SPO-04)',

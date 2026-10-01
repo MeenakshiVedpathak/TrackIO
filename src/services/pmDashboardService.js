@@ -7,14 +7,14 @@ const employeeRepository = require('../repositories/employeeRepository');
 const managerEmployeeMappingRepository = require('../repositories/managerEmployeeMappingRepository');
 const employeeWorkLogComplianceService = require('./employeeWorkLogComplianceService');
 const employeeServicePOMappingService = require('./employeeServicePOMappingService');
+const managerSelfServiceService = require('./managerSelfServiceService');
 const pmDashboardRepository = require('../repositories/pmDashboardRepository');
 const { getPaginationParams, getPaginationMeta } = require('../utils/pagination');
 
-// Project Manager (hierarchy_rank 6) — see resolvePendingApprovalScope()
-// below. Deliberately does NOT touch resolveTeamEmployeeIds() (team_size,
-// Team Capacity, Monthly Hours Trend) — only the approval-specific
-// pending_approvals KPI/list is redefined for this tier; every other metric
-// on this dashboard keeps its existing, wider team scope unchanged.
+// Project Manager (hierarchy_rank 6) — scoped to the Service POs they manage
+// (resolvePmServicePoIds()): portfolio KPIs, pending approvals, and the team
+// (direct/team_mappings reports PLUS everyone mapped to those POs). Every
+// other tier keeps the existing BU-wide scope unchanged.
 const PROJECT_MANAGER_RANK = 6;
 
 /**
@@ -98,7 +98,7 @@ function resolvePeriod(query) {
  * @param {number[]} companyIds
  * @returns {Promise<number[]>}
  */
-async function resolveTeamEmployeeIds(authContext, companyIds) {
+async function resolveTeamEmployeeIds(authContext, companyIds, pmServicePoIds = null) {
   if (!companyIds || companyIds.length === 0) return [];
 
   const { employeeId } = authContext;
@@ -107,6 +107,13 @@ async function resolveTeamEmployeeIds(authContext, companyIds) {
   if (employeeId) {
     const directReports = await managerEmployeeMappingRepository.findByManager(employeeId);
     directReports.forEach((m) => employeeIds.add(m.employee_id));
+  }
+
+  // A Project Manager's team is also everyone actively mapped to a Service PO
+  // they manage (the Service-PO-based model the approval flow already uses).
+  if (pmServicePoIds && pmServicePoIds.length > 0) {
+    const poTeam = await pmDashboardRepository.getEmployeeIdsMappedToServicePOs(pmServicePoIds);
+    poTeam.forEach((id) => employeeIds.add(id));
   }
 
   const accessScopes = await Promise.all(
@@ -150,12 +157,49 @@ async function resolveTeamEmployeeIds(authContext, companyIds) {
  * @param {number[]} employeeIds - this dashboard's own resolveTeamEmployeeIds() result
  * @returns {Promise<{ employeeIds: number[]|null, servicePoIds: number[]|null }>}
  */
-async function resolvePendingApprovalScope(authContext, employeeIds) {
+async function resolvePendingApprovalScope(authContext, employeeIds, pmServicePoIds = null) {
   if (authContext.hierarchyRank === PROJECT_MANAGER_RANK) {
-    const servicePoIds = await employeeServicePOMappingService.getProjectManagerServicePOIds(authContext.employeeId);
+    const servicePoIds = pmServicePoIds
+      || await employeeServicePOMappingService.getProjectManagerServicePOIds(authContext.employeeId);
     return { employeeIds: null, servicePoIds };
   }
   return { employeeIds, servicePoIds: null };
+}
+
+/**
+ * The Service POs a Project Manager (rank 6) manages (is_project_manager = true,
+ * non-Centralised) - the scope for every portfolio KPI on this dashboard, so
+ * Active Projects/Service POs/Logged Hours/Budget/At-Risk describe THEIR
+ * projects, not the whole Business Unit. `null` for every other tier, which
+ * keeps the existing BU-wide scope unchanged.
+ *
+ * @param {object} authContext
+ * @returns {Promise<number[]|null>}
+ */
+async function resolvePmServicePoIds(authContext) {
+  if (authContext.hierarchyRank !== PROJECT_MANAGER_RANK || !authContext.employeeId) return null;
+  return employeeServicePOMappingService.getProjectManagerServicePOIds(authContext.employeeId);
+}
+
+/**
+ * The Pending Approvals KPI number. For a Project Manager this is EXACTLY the
+ * total the Timesheet Approval screen shows (daily approval buckets, scoped by
+ * the same managerSelfServiceService.getApprovalSummaryAll rules, including the
+ * PM's own team's Centralised Leave/Bench entries) - computed by that same
+ * function so the two can never disagree. Other tiers keep the raw entry count.
+ *
+ * @param {object} authContext
+ * @param {number[]} companyIds
+ * @param {number} fallbackCount - the entry-level count from getPendingApprovals()
+ * @returns {Promise<number>}
+ */
+async function resolvePendingApprovalCount(authContext, companyIds, fallbackCount) {
+  if (authContext.hierarchyRank !== PROJECT_MANAGER_RANK || !authContext.employeeId) return fallbackCount;
+  const summary = await managerSelfServiceService.getApprovalSummaryAll(
+    authContext.employeeId, companyIds, PROJECT_MANAGER_RANK, null, companyIds,
+    { status: 'pending', log_type: 'daily', page: 1, limit: 1 }
+  );
+  return summary.meta.total;
 }
 
 function resolveAsOfDate(query) {
@@ -254,8 +298,9 @@ async function getSummary(query, authContext, companyIds) {
   const varianceThresholdPct = resolveVarianceThresholdPct(query);
   const { prevMonthNum, prevYearNum, prevAsOfDate } = resolvePreviousPeriod(monthNum, yearNum);
 
-  const employeeIds = await resolveTeamEmployeeIds(authContext, companyIds);
-  const pendingApprovalScope = await resolvePendingApprovalScope(authContext, employeeIds);
+  const servicePoIds = await resolvePmServicePoIds(authContext);
+  const employeeIds = await resolveTeamEmployeeIds(authContext, companyIds, servicePoIds);
+  const pendingApprovalScope = await resolvePendingApprovalScope(authContext, employeeIds, servicePoIds);
 
   const [
     portfolio,
@@ -272,9 +317,9 @@ async function getSummary(query, authContext, companyIds) {
     prevPendingApprovals,
     prevTeamCapacity,
   ] = await Promise.all([
-    pmDashboardRepository.getPortfolioCounts({ companyIds }),
-    pmDashboardRepository.getLoggedHoursMTD({ companyIds, monthNum, yearNum }),
-    pmDashboardRepository.getBudgetVsBilled({ companyIds, monthNum, yearNum }),
+    pmDashboardRepository.getPortfolioCounts({ companyIds, servicePoIds }),
+    pmDashboardRepository.getLoggedHoursMTD({ companyIds, monthNum, yearNum, servicePoIds }),
+    pmDashboardRepository.getBudgetVsBilled({ companyIds, monthNum, yearNum, servicePoIds }),
     // Unpaginated — the full portfolio, not one page — this is both the
     // source for project_status_breakdown AND (summed) for at_risk_projects,
     // so the two numbers can never silently disagree on screen.
@@ -282,23 +327,24 @@ async function getSummary(query, authContext, companyIds) {
       monthNum, yearNum,
       asOfDate: asOfDate.toISOString().slice(0, 10),
       varianceThresholdPct,
-      limit: 100000, offset: 0, companyIds,
+      limit: 100000, offset: 0, companyIds, servicePoIds,
     }),
     employeeWorkLogComplianceService.getReport({ month: monthNum, year: yearNum, limit: 1 }, authContext, companyIds),
-    pmDashboardRepository.getPendingApprovals({ ...pendingApprovalScope, monthNum, yearNum, limit: 1, offset: 0 }),
+    // No month/year: pending approvals are a backlog, not a per-month metric.
+    pmDashboardRepository.getPendingApprovals({ ...pendingApprovalScope, limit: 1, offset: 0 }),
     pmDashboardRepository.getTeamCapacity({
       employeeIds, monthNum, yearNum,
       benchThresholdHours: DEFAULT_BENCH_THRESHOLD_HOURS,
       limit: 10000, offset: 0,
     }),
     // --- Previous period, for the KPI trend deltas ---
-    pmDashboardRepository.getLoggedHoursMTD({ companyIds, monthNum: prevMonthNum, yearNum: prevYearNum }),
-    pmDashboardRepository.getBudgetVsBilled({ companyIds, monthNum: prevMonthNum, yearNum: prevYearNum }),
+    pmDashboardRepository.getLoggedHoursMTD({ companyIds, monthNum: prevMonthNum, yearNum: prevYearNum, servicePoIds }),
+    pmDashboardRepository.getBudgetVsBilled({ companyIds, monthNum: prevMonthNum, yearNum: prevYearNum, servicePoIds }),
     pmDashboardRepository.getProjectRollup({
       monthNum: prevMonthNum, yearNum: prevYearNum,
       asOfDate: prevAsOfDate.toISOString().slice(0, 10),
       varianceThresholdPct,
-      limit: 100000, offset: 0, companyIds,
+      limit: 100000, offset: 0, companyIds, servicePoIds,
     }),
     employeeWorkLogComplianceService.getReport({ month: prevMonthNum, year: prevYearNum, limit: 1 }, authContext, companyIds),
     // Same current pendingApprovalScope (team/PO roster has no history — see
@@ -339,7 +385,7 @@ async function getSummary(query, authContext, companyIds) {
     },
     at_risk_projects: atRiskProjectCount,
     missing_work_logs: complianceReport.meta.total,
-    pending_approvals: pendingApprovals.count,
+    pending_approvals: await resolvePendingApprovalCount(authContext, companyIds, pendingApprovals.count),
     overallocated_employees: overallocatedCount,
     bench_employees: benchCount,
     // Portfolio-wide (not paginated) — see tallyProjectStatusBreakdown()'s
@@ -395,6 +441,7 @@ async function getProjects(query, authContext, companyIds) {
     sortBy: query.sortBy,
     sortOrder: query.sortOrder,
     limit, offset, companyIds,
+    servicePoIds: await resolvePmServicePoIds(authContext),
   });
 
   const data = rows.map((r) => ({ ...r, risk_flag: computeRiskFlag(r, varianceThresholdPct) }));
@@ -418,7 +465,7 @@ async function getTeam(query, authContext, companyIds) {
     ? parseFloat(query.benchThresholdHours)
     : DEFAULT_BENCH_THRESHOLD_HOURS;
 
-  const employeeIds = await resolveTeamEmployeeIds(authContext, companyIds);
+  const employeeIds = await resolveTeamEmployeeIds(authContext, companyIds, await resolvePmServicePoIds(authContext));
   const { rows, count } = await pmDashboardRepository.getTeamCapacity({
     employeeIds, monthNum, yearNum, benchThresholdHours,
     search: query.search || undefined,
@@ -458,17 +505,18 @@ async function getActionRequired(query, authContext, companyIds) {
   const asOfDate = resolveAsOfDate(query);
   const varianceThresholdPct = resolveVarianceThresholdPct(query);
 
-  const employeeIds = await resolveTeamEmployeeIds(authContext, companyIds);
-  const pendingApprovalScope = await resolvePendingApprovalScope(authContext, employeeIds);
+  const servicePoIds = await resolvePmServicePoIds(authContext);
+  const employeeIds = await resolveTeamEmployeeIds(authContext, companyIds, servicePoIds);
+  const pendingApprovalScope = await resolvePendingApprovalScope(authContext, employeeIds, servicePoIds);
 
   const [complianceReport, pendingApprovals, projectRollup, teamCapacity] = await Promise.all([
     employeeWorkLogComplianceService.getReport({ month: monthNum, year: yearNum, limit: ACTION_REQUIRED_CAP }, authContext, companyIds),
-    pmDashboardRepository.getPendingApprovals({ ...pendingApprovalScope, monthNum, yearNum, limit: ACTION_REQUIRED_CAP, offset: 0 }),
+    pmDashboardRepository.getPendingApprovals({ ...pendingApprovalScope, limit: ACTION_REQUIRED_CAP, offset: 0 }),
     pmDashboardRepository.getProjectRollup({
       monthNum, yearNum,
       asOfDate: asOfDate.toISOString().slice(0, 10),
       varianceThresholdPct,
-      limit: 200, offset: 0, companyIds,
+      limit: 200, offset: 0, companyIds, servicePoIds,
     }),
     pmDashboardRepository.getTeamCapacity({
       employeeIds, monthNum, yearNum,
@@ -526,7 +574,7 @@ async function getActionRequired(query, authContext, companyIds) {
 async function getMonthlyHoursTrend(query, authContext, companyIds) {
   const yearNum = query.year ? parseInt(query.year, 10) : new Date().getFullYear();
 
-  const employeeIds = await resolveTeamEmployeeIds(authContext, companyIds);
+  const employeeIds = await resolveTeamEmployeeIds(authContext, companyIds, await resolvePmServicePoIds(authContext));
   const rows = await pmDashboardRepository.getMonthlyHoursByEmployee({ employeeIds, yearNum });
   const loggedByMonth = new Map(rows.map((r) => [r.month, parseFloat(r.logged_hours) || 0]));
 

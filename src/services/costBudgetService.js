@@ -1,7 +1,7 @@
 'use strict';
 
 const costBudgetRepository = require('../repositories/costBudgetRepository');
-const servicePORepository = require('../repositories/servicePORepository');
+const { resolveBudgetAccess, assertServicePOAccessible, assertRecordServicePOAccessible } = require('./budgetServicePOAccess');
 const companyAccessControlService = require('./companyAccessControlService');
 const { intersectCompanyIdsWithEntity, intersectIdsWithBuHierarchy } = companyAccessControlService;
 const { createAuditLog, getIpAddress } = require('../middlewares/auditLog');
@@ -18,47 +18,8 @@ const logger = require('../utils/logger');
 
 const round2 = (value) => Math.round((parseFloat(value || 0) + Number.EPSILON) * 100) / 100;
 
-/**
- * Resolve the caller's company scope from server-verified req fields only —
- * a plain companyId for a BU-scoped actor, or the resolved array of owned
- * Company ids for a company-less Admin/Entity Admin
- * (companyAccessControlService.resolveActorCompanyScope). Same pattern as
- * resourceBudgetService.js's resolveScope() — this module has no Service PO
- * dropdown of its own, so a company-less actor's chosen Service PO may
- * legitimately belong to ANY of their owned Companies, not just one
- * pre-selected BU.
- *
- * @param {import('express').Request} req
- * @returns {Promise<number|number[]>}
- */
-function resolveScope(req) {
-  return companyAccessControlService.resolveActorCompanyScope({
-    companyId: req.companyId,
-    hierarchyRank: req.hierarchyRank,
-    employeeId: req.employeeId,
-  });
-}
-
-/**
- * Confirm a Service PO exists within the caller's scope.
- * `createdBy`, when given alongside the ARRAY form, additionally matches a
- * Centralised/BU-less Service PO (company_id NULL) created by this same
- * company-less actor — see servicePORepository.js's companyScope() doc
- * comment.
- * @param {number} servicePOId
- * @param {number|number[]} companyId
- * @param {number} [createdBy]
- * @returns {Promise<ServicePO>}
- */
-async function assertServicePOExists(servicePOId, companyId, createdBy) {
-  const po = await servicePORepository.findById(servicePOId, companyId, createdBy);
-  if (!po) {
-    const err = new Error('Service PO not found.');
-    err.statusCode = 404;
-    throw err;
-  }
-  return po;
-}
+// Company scope + Service PO access (including the Project Manager "only POs
+// mapped to me" rule) live in budgetServicePOAccess.js, shared with Resource Budget.
 
 /**
  * @param {CostBudget} record
@@ -91,7 +52,7 @@ function toResponse(record) {
  * @returns {Promise<object>}
  */
 const create = async (data, userId, req) => {
-  const scope = await resolveScope(req);
+  const access = await resolveBudgetAccess(req);
   const { service_po_id } = data;
   const { month, year } = parseMonthString(data.month);
 
@@ -100,7 +61,7 @@ const create = async (data, userId, req) => {
   // Admin/Entity Admin owning multiple Companies can't accidentally budget
   // against the wrong one just because a header happened to name a
   // different owned Company. Same pattern as resourceBudgetService.create().
-  const po = await assertServicePOExists(service_po_id, scope, req.employeeId);
+  const po = await assertServicePOAccessible(service_po_id, req, access);
   const companyId = po.company_id;
 
   const existing = await costBudgetRepository.findOne(service_po_id, month, year, companyId);
@@ -142,14 +103,15 @@ const create = async (data, userId, req) => {
  * @returns {Promise<object>}
  */
 const update = async (id, data, userId, req) => {
-  const scope = await resolveScope(req);
+  const access = await resolveBudgetAccess(req);
 
-  const existing = await costBudgetRepository.findById(id, scope);
+  const existing = await costBudgetRepository.findById(id, access.scope);
   if (!existing) {
     const err = new Error('Cost budget record not found.');
     err.statusCode = 404;
     throw err;
   }
+  assertRecordServicePOAccessible(existing.service_po_id, access, 'Cost budget record not found.');
   const companyId = existing.company_id;
 
   const oldValues = { invoice_amount: existing.invoice_amount, description: existing.description };
@@ -176,14 +138,15 @@ const update = async (id, data, userId, req) => {
  * @returns {Promise<void>}
  */
 const deactivate = async (id, userId, req) => {
-  const scope = await resolveScope(req);
+  const access = await resolveBudgetAccess(req);
 
-  const existing = await costBudgetRepository.findById(id, scope);
+  const existing = await costBudgetRepository.findById(id, access.scope);
   if (!existing) {
     const err = new Error('Cost budget record not found.');
     err.statusCode = 404;
     throw err;
   }
+  assertRecordServicePOAccessible(existing.service_po_id, access, 'Cost budget record not found.');
   const companyId = existing.company_id;
 
   await costBudgetRepository.update(id, { status: 'inactive', updated_by: userId }, companyId);
@@ -199,9 +162,9 @@ const deactivate = async (id, userId, req) => {
  * @returns {Promise<object[]>}
  */
 const listByServicePO = async (servicePOId, req) => {
-  const scope = await resolveScope(req);
-  await assertServicePOExists(servicePOId, scope, req.employeeId);
-  const records = await costBudgetRepository.findByServicePO(servicePOId, scope);
+  const access = await resolveBudgetAccess(req);
+  const po = await assertServicePOAccessible(servicePOId, req, access);
+  const records = await costBudgetRepository.findByServicePO(servicePOId, access.mappedServicePOIds ? po.company_id : access.scope);
   return records.map(toResponse);
 };
 
@@ -221,6 +184,8 @@ const list = async (query, req) => {
   scope = await intersectIdsWithBuHierarchy(scope, parseIdList(query.businessUnitIds));
 
   const filters = {};
+  const { mappedServicePOIds } = await resolveBudgetAccess(req);
+  if (mappedServicePOIds) filters.service_po_ids = mappedServicePOIds;
   if (query.service_po_id !== undefined) filters.service_po_id = query.service_po_id;
   if (query.month !== undefined) {
     const { month, year } = parseMonthString(query.month);

@@ -124,6 +124,15 @@ async function toGroupedExcelBuffer(rows, columns, title, { freezeColumns = 0, f
   sheet.getRow(1).alignment = { horizontal: 'center', vertical: 'middle' };
   sheet.getRow(2).font = { bold: true };
 
+  // Optional per-column background (RGB hex, no '#'): tints both header rows and
+  // every data cell of that column, so a month's whole block reads as one band.
+  const solidFill = (hex) => ({ type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${hex}` } });
+  columns.forEach((c, idx) => {
+    if (!c.fill) return;
+    sheet.getCell(1, idx + 1).fill = solidFill(c.fill);
+    sheet.getCell(2, idx + 1).fill = solidFill(c.fill);
+  });
+
   columns.forEach((c, idx) => {
     sheet.getColumn(idx + 1).width = c.width || 16;
   });
@@ -131,7 +140,9 @@ async function toGroupedExcelBuffer(rows, columns, title, { freezeColumns = 0, f
   rows.forEach((row) => {
     const excelRow = sheet.addRow(columns.map((c) => row[c.key] ?? null));
     columns.forEach((c, idx) => {
-      if (c.numFmt) excelRow.getCell(idx + 1).numFmt = c.numFmt;
+      const cell = excelRow.getCell(idx + 1);
+      if (c.numFmt) cell.numFmt = c.numFmt;
+      if (c.fill) cell.fill = solidFill(c.fill);
     });
   });
 

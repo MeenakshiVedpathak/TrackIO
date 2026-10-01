@@ -10,7 +10,7 @@ const employeeRepository = require('../repositories/employeeRepository');
  * True for any "BU Admin peer" role — hierarchy_rank NULL, capability/form
  * access driven entirely by role_capabilities/role_form_mapping rather than
  * a numeric rank (HR, BU Head, and any future custom role created the same
- * way via the dynamic Role CRUD — e.g. "Delivery Operation Team Members").
+ * way via the dynamic Role CRUD — e.g. "Delivery Ops").
  * These roles are meant to see the SAME Company-wide Employee Master view
  * BU Admin does, not an individually-mapped "own team" subset.
  *

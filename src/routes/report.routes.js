@@ -183,7 +183,7 @@ router.get(
  *       (caller's own Primary/Secondary-mapped Employees only; the Team Lead is
  *       always the authenticated caller). No page/limit/sortBy/sortOrder —
  *       returns every matching row, newest first. Columns: Employee (name +
- *       code), Client, Project, SPO (name + code), Hours Name, BU, Sub-BU,
+ *       code), Client, Project, SPO (name + code), Module / Task, BU, Sub-BU,
  *       Logged Hours, Date, Description, Status.
  *     tags: [Reports]
  *     security:

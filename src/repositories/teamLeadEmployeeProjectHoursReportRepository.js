@@ -203,7 +203,7 @@ function buildBaseQuery(filters) {
       sp.id                                                      AS service_po_id,
       sp.service_po_code,
       sp.service_po_name                                         AS spo_name,
-      -- "Hours Name": the Module/Task (hierarchy node) the hours were logged
+      -- "Module / Task" (hours_name): the Module/Task (hierarchy node) the hours were logged
       -- against, as "Parent > Child"; NULL when logged on the SPO directly.
       CASE
         WHEN hp.id IS NOT NULL THEN hp.node_name || ' > ' || hn.node_name

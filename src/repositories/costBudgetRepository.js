@@ -87,6 +87,12 @@ const findByServicePO = async (servicePOId, companyId) => {
 const findAll = async (filters, companyId) => {
   const where = { ...companyScope(companyId) };
   if (filters.service_po_id !== undefined) where.service_po_id = filters.service_po_id;
+  if (Array.isArray(filters.service_po_ids)) {
+    const allowed = filters.service_po_id !== undefined
+      ? filters.service_po_ids.filter((id) => id === Number(filters.service_po_id))
+      : filters.service_po_ids;
+    where.service_po_id = { [Op.in]: allowed };
+  }
   if (filters.month !== undefined) where.month = filters.month;
   if (filters.year !== undefined) where.year = filters.year;
 

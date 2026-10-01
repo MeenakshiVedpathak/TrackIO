@@ -1121,7 +1121,7 @@ const MONTH_ABBREVIATIONS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'A
 const previewPmsImport = async (month, year, userId, companyId) => {
   logger.info('Employee Work Log sync preview started', { userId, month, year, companyId });
 
-  if (await companyRepository.hasChildren(companyId)) {
+  if (await companyRepository.hasChildren(companyId, { activeOnly: true })) {
     const err = new Error('This Business Unit has Sub-BUs — select the specific Sub-BU to sync instead.');
     err.statusCode = 400;
     throw err;
@@ -1302,7 +1302,7 @@ const confirmImport = async (importId, userId, ipAddress = null, companyId) => {
   // 'pms'-source import can only exist for a childless Business Unit (that
   // flow rejects it up front), but re-check here too in case a Sub-BU got
   // configured under this BU AFTER the import was first created.
-  if (importRecord.source === 'pms' && await companyRepository.hasChildren(companyId)) {
+  if (importRecord.source === 'pms' && await companyRepository.hasChildren(companyId, { activeOnly: true })) {
     const err = new Error('This Business Unit has Sub-BUs — select the specific Sub-BU to sync instead.');
     err.statusCode = 400;
     throw err;

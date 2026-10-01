@@ -19,7 +19,7 @@ const { isReadOnlyBuAdminPeer } = require('../services/employeeAccessControlServ
 
 /**
  * Blocks a "view only" BU Admin peer role (roles.permission = 'Read' — e.g.
- * "Delivery Operation Team Members") from every Employee Master write path.
+ * "Delivery Ops") from every Employee Master write path.
  * Such a role's read SCOPE was widened to match BU Admin's own Company-wide
  * view (see employeeAccessControlService.resolveEmployeeAccessWhere /
  * isBuAdminPeerRole) precisely so it sees everyone BU Admin sees — without

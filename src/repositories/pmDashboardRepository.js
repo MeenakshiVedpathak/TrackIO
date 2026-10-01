@@ -31,6 +31,18 @@ const { buLessServicePOInTenantSql } = require('../utils/servicePOTenantSql');
 
 const HOURS_COL = 'COALESCE(t.modified_hours, t.hours_logged)';
 
+// "Logged" hours come from employee_work_logs (every non-rejected entry), NOT the
+// timesheets table: timesheets only holds rows already synced after approval, so
+// it lags the real logged effort by the whole approval backlog.
+const WORKLOG_STATUSES_SQL = "('pending', 'approved', 'synced')";
+
+// Optional Project-Manager PO scope. null/undefined = no extra scoping (BU-wide);
+// an array (possibly empty) restricts to exactly those Service POs.
+function poScopeIds(servicePoIds) {
+  if (!Array.isArray(servicePoIds)) return null;
+  return servicePoIds.length > 0 ? servicePoIds : [-1];
+}
+
 // ---------------------------------------------------------------------------
 // Project rollup — one row per Project, aggregating its Service POs.
 // ---------------------------------------------------------------------------
@@ -71,7 +83,7 @@ const PROJECT_HEALTH_STATUSES = ['on_track', 'at_risk', 'delayed', 'inactive'];
  */
 async function getProjectRollup(filters) {
   const {
-    monthNum, yearNum, asOfDate, status, search, healthStatus,
+    monthNum, yearNum, asOfDate, status, search, healthStatus, servicePoIds,
     varianceThresholdPct = 20,
     sortBy = 'project_name', sortOrder = 'ASC', limit, offset, companyIds,
   } = filters;
@@ -86,6 +98,11 @@ async function getProjectRollup(filters) {
     healthStatus: healthStatus && PROJECT_HEALTH_STATUSES.includes(healthStatus) ? healthStatus : null,
   };
   const conditions = ['p.is_deleted = false', '(p.company_id IN (:companyIds) OR p.company_id IS NULL)'];
+  const scopedPoIds = poScopeIds(servicePoIds);
+  if (scopedPoIds) {
+    replacements.servicePoIds = scopedPoIds;
+    conditions.push('p.id IN (SELECT spx.project_id FROM service_pos spx WHERE spx.id IN (:servicePoIds) AND spx.is_deleted = false)');
+  }
   if (status && status !== 'all') { conditions.push('p.status = :status'); replacements.status = status; }
   if (search) {
     conditions.push('(p.project_name ILIKE :search OR p.project_code ILIKE :search)');
@@ -103,6 +120,7 @@ async function getProjectRollup(filters) {
       SELECT sp.id AS service_po_id, sp.project_id, sp.status, sp.end_date
       FROM service_pos sp
       WHERE sp.project_id IN (SELECT id FROM in_scope_projects) AND sp.is_deleted = false
+        ${scopedPoIds ? 'AND sp.id IN (:servicePoIds)' : ''}
     ),
     team AS (
       SELECT po_scope.project_id, COUNT(DISTINCT esm.employee_id) AS team_size
@@ -120,11 +138,12 @@ async function getProjectRollup(filters) {
       GROUP BY po_scope.project_id
     ),
     actual AS (
-      SELECT po_scope.project_id, SUM(${HOURS_COL}) AS actual_hours
+      SELECT po_scope.project_id, SUM(ewl.hours) AS actual_hours
       FROM po_scope
-      INNER JOIN timesheets t ON t.service_po_id = po_scope.service_po_id
-        AND EXTRACT(MONTH FROM t.timesheet_date) = :monthNum
-        AND EXTRACT(YEAR FROM t.timesheet_date) = :yearNum
+      INNER JOIN employee_work_logs ewl ON ewl.service_po_id = po_scope.service_po_id
+        AND ewl.status IN ${WORKLOG_STATUSES_SQL}
+        AND EXTRACT(MONTH FROM ewl.work_date) = :monthNum
+        AND EXTRACT(YEAR FROM ewl.work_date) = :yearNum
       GROUP BY po_scope.project_id
     ),
     risk AS (
@@ -256,27 +275,30 @@ async function getTeamCapacity(filters) {
       GROUP BY emp_id
     ),
     actual AS (
-      SELECT t.employee_id AS emp_id, SUM(${HOURS_COL}) AS actual_hours
-      FROM timesheets t
-      WHERE EXTRACT(MONTH FROM t.timesheet_date) = :monthNum AND EXTRACT(YEAR FROM t.timesheet_date) = :yearNum
+      SELECT t.employee_id AS emp_id, SUM(t.hours) AS actual_hours
+      FROM employee_work_logs t
+      WHERE EXTRACT(MONTH FROM t.work_date) = :monthNum AND EXTRACT(YEAR FROM t.work_date) = :yearNum
+        AND t.status IN ${WORKLOG_STATUSES_SQL}
         AND t.employee_id IN (:employeeIds)
       GROUP BY t.employee_id
     ),
     leave_hrs AS (
-      SELECT t.employee_id AS emp_id, SUM(${HOURS_COL}) AS leave_hours
-      FROM timesheets t
+      SELECT t.employee_id AS emp_id, SUM(t.hours) AS leave_hours
+      FROM employee_work_logs t
       INNER JOIN service_pos sp   ON sp.id = t.service_po_id
       INNER JOIN service_types st ON st.id = sp.service_type_id
-      WHERE EXTRACT(MONTH FROM t.timesheet_date) = :monthNum AND EXTRACT(YEAR FROM t.timesheet_date) = :yearNum
+      WHERE EXTRACT(MONTH FROM t.work_date) = :monthNum AND EXTRACT(YEAR FROM t.work_date) = :yearNum
+        AND t.status IN ${WORKLOG_STATUSES_SQL}
         AND t.employee_id IN (:employeeIds)
         AND LOWER(TRIM(st.service_type_name)) IN ('leave', 'leaves')
       GROUP BY t.employee_id
     ),
     no_work AS (
-      SELECT t.employee_id AS emp_id, SUM(${HOURS_COL}) AS no_work_hours
-      FROM timesheets t
+      SELECT t.employee_id AS emp_id, SUM(t.hours) AS no_work_hours
+      FROM employee_work_logs t
       INNER JOIN service_pos sp ON sp.id = t.service_po_id
-      WHERE EXTRACT(MONTH FROM t.timesheet_date) = :monthNum AND EXTRACT(YEAR FROM t.timesheet_date) = :yearNum
+      WHERE EXTRACT(MONTH FROM t.work_date) = :monthNum AND EXTRACT(YEAR FROM t.work_date) = :yearNum
+        AND t.status IN ${WORKLOG_STATUSES_SQL}
         AND t.employee_id IN (:employeeIds)
         AND LOWER(sp.service_po_name) IN ('idle', 'on bench')
       GROUP BY t.employee_id
@@ -294,7 +316,7 @@ async function getTeamCapacity(filters) {
         ROUND(COALESCE(leave_hrs.leave_hours, 0)::numeric, 2)   AS leave_hours,
         ROUND(COALESCE(no_work.no_work_hours, 0)::numeric, 2)   AS no_work_hours,
         ROUND((COALESCE(planned.planned_hours, 0) / :monthlyCap * 100)::numeric, 2) AS capacity_used_pct,
-        (COALESCE(planned.planned_hours, 0) > :monthlyCap)      AS overallocation_flag,
+        (GREATEST(COALESCE(planned.planned_hours, 0), COALESCE(actual.actual_hours, 0)) > :monthlyCap) AS overallocation_flag,
         (COALESCE(planned.planned_hours, 0) < :benchThreshold)  AS bench_flag
       FROM employees e
       LEFT JOIN planned   ON planned.emp_id = e.id
@@ -353,12 +375,16 @@ async function getPendingApprovals(filters) {
     return { rows: [], count: 0 };
   }
 
-  const replacements = { monthNum, yearNum, limit, offset };
-  const conditions = [
-    "ewl.status = 'pending'",
-    'EXTRACT(MONTH FROM ewl.work_date) = :monthNum',
-    'EXTRACT(YEAR FROM ewl.work_date) = :yearNum',
-  ];
+  // Pending approvals are a backlog, not a monthly metric: a work log still
+  // awaiting approval counts no matter which month it was logged in. The
+  // month/year filter applies only when a caller explicitly passes both.
+  const replacements = { limit, offset };
+  const conditions = ["ewl.status = 'pending'"];
+  if (monthNum && yearNum) {
+    replacements.monthNum = monthNum;
+    replacements.yearNum = yearNum;
+    conditions.push('EXTRACT(MONTH FROM ewl.work_date) = :monthNum', 'EXTRACT(YEAR FROM ewl.work_date) = :yearNum');
+  }
   if (hasEmployeeScope) {
     conditions.push('ewl.employee_id IN (:employeeIds)');
     replacements.employeeIds = employeeIds;
@@ -397,20 +423,30 @@ async function getPendingApprovals(filters) {
  * @param {number[]} filters.companyIds
  * @returns {Promise<object>}
  */
-async function getPortfolioCounts({ companyIds }) {
+async function getPortfolioCounts({ companyIds, servicePoIds }) {
+  const scopedPoIds = poScopeIds(servicePoIds);
   const replacements = { companyIds };
+  let projectPoFilter = '';
+  let poFilter = '';
+  let clientScope = '';
+  if (scopedPoIds) {
+    replacements.servicePoIds = scopedPoIds;
+    projectPoFilter = 'AND p.id IN (SELECT spx.project_id FROM service_pos spx WHERE spx.id IN (:servicePoIds) AND spx.is_deleted = false)';
+    poFilter = 'AND sp.id IN (:servicePoIds)';
+    clientScope = 'AND c.id IN (SELECT px.client_id FROM projects px INNER JOIN service_pos spx ON spx.project_id = px.id WHERE spx.id IN (:servicePoIds))';
+  }
   const [row] = await sequelize.query(
     `SELECT
        (SELECT COUNT(*) FROM clients c
-          WHERE c.status != 'inactive' AND (c.company_id IN (:companyIds) OR c.company_id IS NULL)) AS total_clients,
+          WHERE c.status != 'inactive' AND (c.company_id IN (:companyIds) OR c.company_id IS NULL) ${clientScope}) AS total_clients,
        (SELECT COUNT(*) FROM projects p
-          WHERE p.is_deleted = false AND (p.company_id IN (:companyIds) OR p.company_id IS NULL)) AS total_projects,
+          WHERE p.is_deleted = false AND (p.company_id IN (:companyIds) OR p.company_id IS NULL) ${projectPoFilter}) AS total_projects,
        (SELECT COUNT(*) FROM projects p
-          WHERE p.is_deleted = false AND p.status = 'active' AND (p.company_id IN (:companyIds) OR p.company_id IS NULL)) AS active_projects,
+          WHERE p.is_deleted = false AND p.status = 'active' AND (p.company_id IN (:companyIds) OR p.company_id IS NULL) ${projectPoFilter}) AS active_projects,
        (SELECT COUNT(*) FROM service_pos sp
-          WHERE sp.is_deleted = false AND (sp.company_id IN (:companyIds) OR ${buLessServicePOInTenantSql('sp', 'companyIds')})) AS total_service_pos,
+          WHERE sp.is_deleted = false ${poFilter} AND (sp.company_id IN (:companyIds) OR ${buLessServicePOInTenantSql('sp', 'companyIds')})) AS total_service_pos,
        (SELECT COUNT(*) FROM service_pos sp
-          WHERE sp.is_deleted = false AND sp.status IN ('in-progress', 'pending')
+          WHERE sp.is_deleted = false AND sp.status IN ('in-progress', 'pending') ${poFilter}
             AND (sp.company_id IN (:companyIds) OR ${buLessServicePOInTenantSql('sp', 'companyIds')})) AS active_service_pos
     `,
     { replacements, type: QueryTypes.SELECT }
@@ -426,14 +462,18 @@ async function getPortfolioCounts({ companyIds }) {
  * @param {object} filters
  * @returns {Promise<number>}
  */
-async function getLoggedHoursMTD({ companyIds, monthNum, yearNum }) {
+async function getLoggedHoursMTD({ companyIds, monthNum, yearNum, servicePoIds }) {
+  const scopedPoIds = poScopeIds(servicePoIds);
   const replacements = { companyIds, monthNum, yearNum };
+  if (scopedPoIds) replacements.servicePoIds = scopedPoIds;
   const [row] = await sequelize.query(
-    `SELECT COALESCE(SUM(${HOURS_COL}), 0) AS total_hours
-     FROM timesheets t
-     INNER JOIN service_pos sp ON sp.id = t.service_po_id
+    `SELECT COALESCE(SUM(ewl.hours), 0) AS total_hours
+     FROM employee_work_logs ewl
+     INNER JOIN service_pos sp ON sp.id = ewl.service_po_id
      WHERE (sp.company_id IN (:companyIds) OR ${buLessServicePOInTenantSql('sp', 'companyIds')})
-       AND EXTRACT(MONTH FROM t.timesheet_date) = :monthNum AND EXTRACT(YEAR FROM t.timesheet_date) = :yearNum
+       ${scopedPoIds ? 'AND sp.id IN (:servicePoIds)' : ''}
+       AND ewl.status IN ${WORKLOG_STATUSES_SQL}
+       AND EXTRACT(MONTH FROM ewl.work_date) = :monthNum AND EXTRACT(YEAR FROM ewl.work_date) = :yearNum
     `,
     { replacements, type: QueryTypes.SELECT }
   );
@@ -447,8 +487,10 @@ async function getLoggedHoursMTD({ companyIds, monthNum, yearNum }) {
  * @param {object} filters
  * @returns {Promise<{ total_invoiced: number, total_billed: number }>}
  */
-async function getBudgetVsBilled({ companyIds, monthNum, yearNum }) {
+async function getBudgetVsBilled({ companyIds, monthNum, yearNum, servicePoIds }) {
+  const scopedPoIds = poScopeIds(servicePoIds);
   const replacements = { companyIds, monthNum, yearNum };
+  if (scopedPoIds) replacements.servicePoIds = scopedPoIds;
   const [row] = await sequelize.query(
     `SELECT
        COALESCE(SUM(spmb.invoice_amount), 0) AS total_invoiced,
@@ -456,6 +498,7 @@ async function getBudgetVsBilled({ companyIds, monthNum, yearNum }) {
      FROM service_po_monthly_budgets spmb
      INNER JOIN service_pos sp ON sp.id = spmb.service_po_id
      WHERE (sp.company_id IN (:companyIds) OR ${buLessServicePOInTenantSql('sp', 'companyIds')})
+       ${scopedPoIds ? 'AND sp.id IN (:servicePoIds)' : ''}
        AND spmb.month = :monthNum AND spmb.year = :yearNum
     `,
     { replacements, type: QueryTypes.SELECT }
@@ -542,18 +585,39 @@ async function getMonthlyHoursByEmployee({ employeeIds, yearNum }) {
   const replacements = { employeeIds, yearNum };
   return sequelize.query(
     `SELECT
-       EXTRACT(MONTH FROM t.timesheet_date)::int AS month,
-       ROUND(SUM(${HOURS_COL})::numeric, 2) AS logged_hours
-     FROM timesheets t
+       EXTRACT(MONTH FROM t.work_date)::int AS month,
+       ROUND(SUM(t.hours)::numeric, 2) AS logged_hours
+     FROM employee_work_logs t
      WHERE t.employee_id IN (:employeeIds)
-       AND EXTRACT(YEAR FROM t.timesheet_date) = :yearNum
+       AND t.status IN ${WORKLOG_STATUSES_SQL}
+       AND EXTRACT(YEAR FROM t.work_date) = :yearNum
      GROUP BY month
      ORDER BY month`,
     { replacements, type: QueryTypes.SELECT }
   );
 }
 
+/**
+ * Employees actively mapped to any of the given Service POs: a Project
+ * Manager's team under the Service-PO-based model.
+ *
+ * @param {number[]} servicePoIds
+ * @returns {Promise<number[]>}
+ */
+async function getEmployeeIdsMappedToServicePOs(servicePoIds) {
+  if (!servicePoIds || servicePoIds.length === 0) return [];
+  const rows = await sequelize.query(
+    `SELECT DISTINCT esm.employee_id
+     FROM employee_servicepo_mapping esm
+     INNER JOIN employees e ON e.id = esm.employee_id AND e.is_deleted = false
+     WHERE esm.status = 'active' AND esm.service_po_id IN (:servicePoIds)`,
+    { replacements: { servicePoIds }, type: QueryTypes.SELECT }
+  );
+  return rows.map((r) => r.employee_id);
+}
+
 module.exports = {
+  getEmployeeIdsMappedToServicePOs,
   PROJECT_HEALTH_STATUSES,
   getProjectRollup,
   getTeamCapacity,

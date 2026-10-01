@@ -4,6 +4,7 @@ const managementReportService = require('../services/managementReportService');
 const { sendPaginated, sendSuccess, sendError } = require('../utils/response');
 const logger = require('../utils/logger');
 const { toGroupedExcelBuffer } = require('../utils/reportExporter');
+const { monthFillHex } = require('../utils/monthColors');
 
 /**
  * Management Report Controller
@@ -144,12 +145,13 @@ async function exportResourceCostUtilization(req, res, next) {
     monthSequence.forEach(({ month, year }) => {
       const group = monthGroupLabel(month, year);
       const prefix = `m_${year}_${month}`;
+      const fill = monthFillHex(month);
       monthColumns.push(
-        { key: `${prefix}_hours`, label: 'Hours', group, width: 10, numFmt: '0.00' },
-        { key: `${prefix}_logged`, label: 'Logged Hrs', group, width: 12, numFmt: '0.00' },
-        { key: `${prefix}_projection`, label: 'Utilization % - Projection', group, width: 15, numFmt: '0.00"%"' },
-        { key: `${prefix}_actual`, label: 'Utilization % - Actual', group, width: 15, numFmt: '0.00"%"' },
-        { key: `${prefix}_contribution`, label: 'Contribution', group, width: 14, numFmt: '#,##0.00' }
+        { key: `${prefix}_hours`, label: 'Hours', group, fill, width: 10, numFmt: '0.00' },
+        { key: `${prefix}_logged`, label: 'Logged Hrs', group, fill, width: 12, numFmt: '0.00' },
+        { key: `${prefix}_projection`, label: 'Utilization % - Projection', group, fill, width: 15, numFmt: '0.00"%"' },
+        { key: `${prefix}_actual`, label: 'Utilization % - Actual', group, fill, width: 15, numFmt: '0.00"%"' },
+        { key: `${prefix}_contribution`, label: 'Contribution', group, fill, width: 14, numFmt: '#,##0.00' }
       );
     });
 

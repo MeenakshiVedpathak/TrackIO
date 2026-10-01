@@ -1049,6 +1049,7 @@ const deleteServicePO = async (id, userId, req) => {
 };
 
 module.exports = {
+  resolveIndividuallyMappedServicePOIds,
   getAll,
   getById,
   getAccessibleById,

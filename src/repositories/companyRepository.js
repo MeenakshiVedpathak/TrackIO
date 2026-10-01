@@ -194,8 +194,13 @@ const findChildIds = async (parentIds) => {
  * @param {number} companyId
  * @returns {Promise<boolean>}
  */
-const hasChildren = async (companyId) => {
-  const count = await Company.count({ where: { parent_business_unit_id: companyId, is_deleted: false } });
+const hasChildren = async (companyId, { activeOnly = false } = {}) => {
+  // Deactivating a Sub-BU only flips status to 'inactive' (is_deleted stays false), so
+  // `activeOnly` lets a caller ignore deactivated Sub-BUs - e.g. Timesheet Sync, which only
+  // needs to redirect to a Sub-BU that can actually be selected.
+  const where = { parent_business_unit_id: companyId, is_deleted: false };
+  if (activeOnly) where.status = 'active';
+  const count = await Company.count({ where });
   return count > 0;
 };
 

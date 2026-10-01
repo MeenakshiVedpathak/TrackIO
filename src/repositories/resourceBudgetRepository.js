@@ -98,6 +98,7 @@ const findByServicePO = async (servicePOId, companyId) => {
 const findAll = async (filters, companyId) => {
   const where = { ...companyScope(companyId) };
   if (filters.emp_id !== undefined) where.emp_id = filters.emp_id;
+  if (Array.isArray(filters.service_po_ids)) where.service_po_id = { [Op.in]: filters.service_po_ids };
   if (filters.month !== undefined) where.month = filters.month;
   if (filters.year !== undefined) where.year = filters.year;
 

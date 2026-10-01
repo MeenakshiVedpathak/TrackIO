@@ -51,7 +51,7 @@ const EXPORT_COLUMNS = [
   { key: 'client_name', label: 'Client', width: 26 },
   { key: 'project_name', label: 'Project', width: 28 },
   { key: 'spo', label: 'SPO', width: 36 },
-  { key: 'hours_name', label: 'Hours Name', width: 32 },
+  { key: 'hours_name', label: 'Module / Task', width: 32 },
   { key: 'bu_name', label: 'BU', width: 22 },
   { key: 'sub_bu_name', label: 'Sub-BU', width: 22 },
   { key: 'logged_hours', label: 'Logged Hours', width: 14, numFmt: '0.00' },
