@@ -98,22 +98,24 @@ function resolvePeriod(query) {
  * @param {number[]} companyIds
  * @returns {Promise<number[]>}
  */
-async function resolveTeamEmployeeIds(authContext, companyIds, pmServicePoIds = null) {
+async function resolveTeamEmployeeIds(authContext, companyIds) {
   if (!companyIds || companyIds.length === 0) return [];
 
   const { employeeId } = authContext;
+
+  // A Project Manager's team IS the My Team screen's list (active employees mapped to the
+  // Service POs they manage, excluding themselves), taken from that same function so the
+  // dashboard's Team Size, Team & Capacity and Action Required can never disagree with it.
+  if (authContext.hierarchyRank === PROJECT_MANAGER_RANK && employeeId) {
+    const myTeam = await managerSelfServiceService.getMyEmployees(employeeId, companyIds, PROJECT_MANAGER_RANK, null);
+    return myTeam.map((employee) => employee.id);
+  }
+
   const employeeIds = new Set();
 
   if (employeeId) {
     const directReports = await managerEmployeeMappingRepository.findByManager(employeeId);
     directReports.forEach((m) => employeeIds.add(m.employee_id));
-  }
-
-  // A Project Manager's team is also everyone actively mapped to a Service PO
-  // they manage (the Service-PO-based model the approval flow already uses).
-  if (pmServicePoIds && pmServicePoIds.length > 0) {
-    const poTeam = await pmDashboardRepository.getEmployeeIdsMappedToServicePOs(pmServicePoIds);
-    poTeam.forEach((id) => employeeIds.add(id));
   }
 
   const accessScopes = await Promise.all(
@@ -299,7 +301,7 @@ async function getSummary(query, authContext, companyIds) {
   const { prevMonthNum, prevYearNum, prevAsOfDate } = resolvePreviousPeriod(monthNum, yearNum);
 
   const servicePoIds = await resolvePmServicePoIds(authContext);
-  const employeeIds = await resolveTeamEmployeeIds(authContext, companyIds, servicePoIds);
+  const employeeIds = await resolveTeamEmployeeIds(authContext, companyIds);
   const pendingApprovalScope = await resolvePendingApprovalScope(authContext, employeeIds, servicePoIds);
 
   const [
@@ -465,7 +467,7 @@ async function getTeam(query, authContext, companyIds) {
     ? parseFloat(query.benchThresholdHours)
     : DEFAULT_BENCH_THRESHOLD_HOURS;
 
-  const employeeIds = await resolveTeamEmployeeIds(authContext, companyIds, await resolvePmServicePoIds(authContext));
+  const employeeIds = await resolveTeamEmployeeIds(authContext, companyIds);
   const { rows, count } = await pmDashboardRepository.getTeamCapacity({
     employeeIds, monthNum, yearNum, benchThresholdHours,
     search: query.search || undefined,
@@ -506,7 +508,7 @@ async function getActionRequired(query, authContext, companyIds) {
   const varianceThresholdPct = resolveVarianceThresholdPct(query);
 
   const servicePoIds = await resolvePmServicePoIds(authContext);
-  const employeeIds = await resolveTeamEmployeeIds(authContext, companyIds, servicePoIds);
+  const employeeIds = await resolveTeamEmployeeIds(authContext, companyIds);
   const pendingApprovalScope = await resolvePendingApprovalScope(authContext, employeeIds, servicePoIds);
 
   const [complianceReport, pendingApprovals, projectRollup, teamCapacity] = await Promise.all([
@@ -516,7 +518,7 @@ async function getActionRequired(query, authContext, companyIds) {
       monthNum, yearNum,
       asOfDate: asOfDate.toISOString().slice(0, 10),
       varianceThresholdPct,
-      limit: 200, offset: 0, companyIds, servicePoIds,
+      limit: 100000, offset: 0, companyIds, servicePoIds,
     }),
     pmDashboardRepository.getTeamCapacity({
       employeeIds, monthNum, yearNum,
@@ -525,21 +527,30 @@ async function getActionRequired(query, authContext, companyIds) {
     }),
   ]);
 
-  const atRiskProjects = projectRollup.rows
-    .map((r) => ({ ...r, risk_flag: computeRiskFlag(r, varianceThresholdPct) }))
-    .filter((r) => r.risk_flag)
-    .slice(0, ACTION_REQUIRED_CAP);
-
-  const overallocatedEmployees = teamCapacity.rows.filter((r) => r.overallocation_flag).slice(0, ACTION_REQUIRED_CAP);
-  const benchEmployees = teamCapacity.rows.filter((r) => r.bench_flag).slice(0, ACTION_REQUIRED_CAP);
+  // Same predicate as the summary KPI (at_risk + delayed health buckets), so this list, its
+  // count, and the At-Risk Projects card can never disagree.
+  const allAtRiskProjects = projectRollup.rows
+    .filter((r) => AT_RISK_HEALTH_STATUSES.includes(r.health_status))
+    .map((r) => ({ ...r, risk_flag: computeRiskFlag(r, varianceThresholdPct) }));
+  const allOverallocated = teamCapacity.rows.filter((r) => r.overallocation_flag);
+  const allBench = teamCapacity.rows.filter((r) => r.bench_flag);
 
   return {
     period: { month: monthNum, year: yearNum },
     missing_work_logs: complianceReport.data,
     pending_approvals: pendingApprovals.rows,
-    at_risk_projects: atRiskProjects,
-    overallocated_employees: overallocatedEmployees,
-    bench_employees: benchEmployees,
+    at_risk_projects: allAtRiskProjects.slice(0, ACTION_REQUIRED_CAP),
+    overallocated_employees: allOverallocated.slice(0, ACTION_REQUIRED_CAP),
+    bench_employees: allBench.slice(0, ACTION_REQUIRED_CAP),
+    // The lists above are capped at ACTION_REQUIRED_CAP rows for display; `counts` carries the
+    // TRUE totals (what Team & Capacity and the KPI cards show), for the breakdown chart/pill.
+    counts: {
+      missing_work_logs: complianceReport.meta.total,
+      pending_approvals: await resolvePendingApprovalCount(authContext, companyIds, pendingApprovals.count),
+      at_risk_projects: allAtRiskProjects.length,
+      overallocated_employees: allOverallocated.length,
+      bench_employees: allBench.length,
+    },
   };
 }
 
@@ -574,7 +585,7 @@ async function getActionRequired(query, authContext, companyIds) {
 async function getMonthlyHoursTrend(query, authContext, companyIds) {
   const yearNum = query.year ? parseInt(query.year, 10) : new Date().getFullYear();
 
-  const employeeIds = await resolveTeamEmployeeIds(authContext, companyIds, await resolvePmServicePoIds(authContext));
+  const employeeIds = await resolveTeamEmployeeIds(authContext, companyIds);
   const rows = await pmDashboardRepository.getMonthlyHoursByEmployee({ employeeIds, yearNum });
   const loggedByMonth = new Map(rows.map((r) => [r.month, parseFloat(r.logged_hours) || 0]));
 
