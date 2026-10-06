@@ -778,6 +778,14 @@ const getApprovalSummary = async (managerUserId, employeeId, ownEmployeeId, comp
  * exactly the same authorized rows.
  * @returns {Promise<{ empty: true } | { empty: false, employeeIds: number[], poScope: object|null }>}
  */
+// The BU / Sub BU filter, as a scope on the work logs' own company_id (null = no BU selected).
+// See employeeWorkLogRepository.resolveApprovalLogScope.
+async function resolveApprovalLogScope(explicitBusinessUnitId) {
+  const id = parseInt(explicitBusinessUnitId, 10);
+  if (!Number.isInteger(id) || id <= 0) return null;
+  return employeeWorkLogRepository.resolveApprovalLogScope(id);
+}
+
 async function resolveApprovalSummaryTeamScope(managerUserId, companyIds, hierarchyRank, explicitBusinessUnitId, callerBuIds, query) {
   const team = await getMyEmployees(managerUserId, companyIds, hierarchyRank, explicitBusinessUnitId);
   let employeeIds = team.map((employee) => employee.id);
@@ -811,9 +819,11 @@ const getApprovalSummaryAll = async (managerUserId, companyIds, hierarchyRank, e
   const scope = await resolveApprovalSummaryTeamScope(managerUserId, companyIds, hierarchyRank, explicitBusinessUnitId, callerBuIds, query);
   if (scope.empty) return emptyResult;
   const { employeeIds, poScope } = scope;
+  const logScope = await resolveApprovalLogScope(explicitBusinessUnitId);
 
   const isMonthly = query.log_type === 'monthly';
   const { rows, total } = await employeeWorkLogRepository.findApprovalSummaryBucketsPage({
+    logScope,
     employeeIds,
     startDate: query.startDate,
     endDate: query.endDate,
@@ -907,9 +917,11 @@ const exportApprovalSummaryAll = async (managerUserId, companyIds, hierarchyRank
   const scope = await resolveApprovalSummaryTeamScope(managerUserId, companyIds, hierarchyRank, explicitBusinessUnitId, callerBuIds, query);
   if (scope.empty) return { rows: [], columns: APPROVAL_SUMMARY_EXPORT_COLUMNS };
   const { employeeIds, poScope } = scope;
+  const logScope = await resolveApprovalLogScope(explicitBusinessUnitId);
 
   const isMonthly = query.log_type === 'monthly';
   const rows = await employeeWorkLogRepository.findApprovalSummaryBuckets({
+    logScope,
     employeeIds,
     startDate: query.startDate,
     endDate: query.endDate,

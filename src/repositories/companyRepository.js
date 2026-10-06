@@ -213,10 +213,14 @@ const hasChildren = async (companyId, { activeOnly = false } = {}) => {
  * @param {number[]} ids
  * @returns {Promise<number[]>} the subset of `ids` that have children
  */
-const findIdsWithChildren = async (ids) => {
+const findIdsWithChildren = async (ids, { activeOnly = false } = {}) => {
   if (!ids || ids.length === 0) return [];
+  // Deactivated Sub-BUs (status 'inactive', is_deleted false) can't be picked, so
+  // `activeOnly` lets the Employee mapping rule ignore them.
+  const where = { parent_business_unit_id: { [Op.in]: ids }, is_deleted: false };
+  if (activeOnly) where.status = 'active';
   const children = await Company.findAll({
-    where: { parent_business_unit_id: { [Op.in]: ids }, is_deleted: false },
+    where,
     attributes: ['parent_business_unit_id'],
   });
   return [...new Set(children.map((c) => c.parent_business_unit_id))];

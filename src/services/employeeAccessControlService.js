@@ -127,13 +127,14 @@ function isReadOnlyBuAdminPeer({ hierarchyRank, roleNames = [], rolePermission }
  *   that doesn't require it — see employeeBusinessUnits below for that case)
  * @param {number|null} authContext.hierarchyRank - req.hierarchyRank (primary role only)
  * @param {string[]} authContext.roleNames - req.userRoles (primary + active additional roles)
+ * @param {boolean} [authContext.widenToMappedBus] - BU tier only: scope to ALL mapped BUs, not just the active one (single-Employee read/update/mappings)
  * @param {number[]} [authContext.employeeBusinessUnits] - the caller's own mapped Business Unit
  *   ids, plain numbers (req.employeeBusinessUnits mapped to ids by the controller) — fallback
  *   scope for the BU Admin/Project Admin/BU-Admin-peer branch below when companyId is unset
  *   (see resolveEmployeeListCompanyScope.js's doc comment for why that happens)
  * @returns {Promise<object>} a Sequelize `where` fragment; `{}` means unrestricted
  */
-const resolveEmployeeAccessWhere = async ({ userId, employeeId, companyId, hierarchyRank, roleNames = [], employeeBusinessUnits = [] }) => {
+const resolveEmployeeAccessWhere = async ({ userId, employeeId, companyId, hierarchyRank, roleNames = [], employeeBusinessUnits = [], widenToMappedBus = false }) => {
   // Admin (rank 2) — scoped to their OWN sub-hierarchy, not the whole
   // platform: reuses entityRepository.findIdsOwnedByAdmin() (the same
   // "Entities this Admin owns, transitively via Entity Admins they
@@ -179,7 +180,11 @@ const resolveEmployeeAccessWhere = async ({ userId, employeeId, companyId, hiera
     // X-Company-Id on a route that doesn't require it (Employee Master's GET
     // / — see resolveEmployeeListCompanyScope.js) — fall back to every
     // Business Unit they're mapped to rather than denying them everything.
-    let scopeIds = companyId != null ? companyId : employeeBusinessUnits;
+    // widenToMappedBus — single-Employee read/update/mappings: a multi-BU BU Admin may act on an
+    // Employee in ANY of their mapped BUs, not only the one currently active in X-Company-Id
+    // (otherwise an Employee in another of their own BUs 404s as "not found").
+    const useAllMapped = widenToMappedBus && employeeBusinessUnits.length > 0;
+    let scopeIds = companyId != null && !useAllMapped ? companyId : employeeBusinessUnits;
     if (!scopeIds || (Array.isArray(scopeIds) && scopeIds.length === 0)) return { id: -1 };
     // BU Hierarchy / Sub-BU support — a caller mapped only to a Parent BU
     // (no individual Sub-BU mapping) still reaches its Sub-BUs' employees,

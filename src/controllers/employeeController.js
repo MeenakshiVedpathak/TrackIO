@@ -41,6 +41,9 @@ function buildEmployeeAuthContext(req) {
     hierarchyRank: req.hierarchyRank,
     roleNames: req.userRoles || [],
     employeeBusinessUnits: (req.employeeBusinessUnits || []).map((bu) => bu.id),
+    // The session's active role id(s) — role-wise BU unmapping hides a BU from a session whose
+    // active role it was excluded for (see employeeService.getBusinessUnits).
+    activeRoleIds: (req.activeRoles || []).map((role) => role.id),
   };
 }
 

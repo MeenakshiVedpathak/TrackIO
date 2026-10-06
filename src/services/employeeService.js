@@ -5,6 +5,7 @@ const { sequelize, Role, Company } = require('../models');
 const employeeRepository = require('../repositories/employeeRepository');
 const employeeRoleRepository = require('../repositories/employeeRoleRepository');
 const employeeBusinessUnitRepository = require('../repositories/employeeBusinessUnitRepository');
+const employeeBusinessUnitRoleExclusionRepository = require('../repositories/employeeBusinessUnitRoleExclusionRepository');
 const companyRepository = require('../repositories/companyRepository');
 const managerEmployeeMappingRepository = require('../repositories/managerEmployeeMappingRepository');
 const employeeServicePOMappingService = require('./employeeServicePOMappingService');
@@ -203,10 +204,15 @@ async function attachRoleAndBusinessUnitInfo(employees) {
   if (employees.length === 0) return employees;
 
   const employeeIds = employees.map((employee) => employee.id);
-  const [roleGrants, buGrants] = await Promise.all([
+  const [roleGrants, allBuGrants, exclusions] = await Promise.all([
     employeeRoleRepository.findRolesByEmployeeIds(employeeIds),
     employeeBusinessUnitRepository.findBusinessUnitsByEmployeeIds(employeeIds),
+    employeeBusinessUnitRoleExclusionRepository.findByEmployeeIds(employeeIds),
   ]);
+  // Role-wise BU unmapping: a BU unmapped for a non-BU-Admin role shows as UNMAPPED here (the
+  // mapping screen's view); the underlying row stays so the BU Admin role keeps the BU.
+  const excludedKeys = new Set(exclusions.map((row) => `${row.employee_id}:${row.business_unit_id}`));
+  const buGrants = allBuGrants.filter((grant) => !excludedKeys.has(`${grant.employee_id}:${grant.id}`));
 
   const rolesByEmployee = new Map();
   roleGrants.forEach((grant) => {
@@ -252,9 +258,13 @@ async function attachRoleAndBusinessUnitInfo(employees) {
 async function attachBusinessUnitInfo(employees) {
   if (employees.length === 0) return employees;
 
-  const grants = await employeeBusinessUnitRepository.findBusinessUnitsByEmployeeIds(
-    employees.map((employee) => employee.id)
-  );
+  const employeeIdsForList = employees.map((employee) => employee.id);
+  const [allGrants, exclusions] = await Promise.all([
+    employeeBusinessUnitRepository.findBusinessUnitsByEmployeeIds(employeeIdsForList),
+    employeeBusinessUnitRoleExclusionRepository.findByEmployeeIds(employeeIdsForList),
+  ]);
+  const excludedKeys = new Set(exclusions.map((row) => `${row.employee_id}:${row.business_unit_id}`));
+  const grants = allGrants.filter((grant) => !excludedKeys.has(`${grant.employee_id}:${grant.id}`));
   const businessUnitsByEmployee = new Map();
   grants.forEach((grant) => {
     if (!businessUnitsByEmployee.has(grant.employee_id)) businessUnitsByEmployee.set(grant.employee_id, []);
@@ -469,7 +479,7 @@ const getById = async (id, companyId) => {
  * @returns {Promise<object>}
  */
 const getByIdWithEmail = async (id, authContext) => {
-  const accessWhere = await employeeAccessControlService.resolveEmployeeAccessWhere(authContext);
+  const accessWhere = await employeeAccessControlService.resolveEmployeeAccessWhere({ ...authContext, widenToMappedBus: true });
   const employee = await employeeRepository.findByIdWithEmail(id, authContext.companyId, accessWhere);
   if (!employee) {
     throw notFoundError(`Employee with ID ${id} not found.`);
@@ -494,7 +504,7 @@ const getByIdWithEmail = async (id, authContext) => {
  * @returns {Promise<{ employee_id: number, role_ids: number[], roles: object[], business_unit_ids: number[], business_units: object[] }>}
  */
 const getMappings = async (id, authContext) => {
-  const accessWhere = await employeeAccessControlService.resolveEmployeeAccessWhere(authContext);
+  const accessWhere = await employeeAccessControlService.resolveEmployeeAccessWhere({ ...authContext, widenToMappedBus: true });
   const employee = await employeeRepository.findByIdWithEmail(id, authContext.companyId, accessWhere);
   if (!employee) {
     throw notFoundError(`Employee with ID ${id} not found.`);
@@ -571,10 +581,16 @@ const getBusinessUnits = async (id, authContext) => {
     throw notFoundError(`Employee with ID ${id} not found.`);
   }
 
-  const [explicitBUs, targetRoles] = await Promise.all([
+  const [allExplicitBUs, targetRoles] = await Promise.all([
     employeeBusinessUnitRepository.findBusinessUnitsByEmployeeId(employee.id),
     employeeRoleRepository.findRolesByEmployeeId(employee.id),
   ]);
+  // Role-wise BU unmapping — for a self lookup (the BU switcher) hide BUs unmapped for the
+  // session's active role; a BU Admin session has no exclusions and so keeps every BU.
+  const hiddenBuIds = id === authContext.employeeId
+    ? new Set(await employeeBusinessUnitRoleExclusionRepository.findExcludedBuIdsForRoles(employee.id, authContext.activeRoleIds || []))
+    : new Set();
+  const explicitBUs = allExplicitBUs.filter((bu) => !hiddenBuIds.has(bu.id));
 
   const businessUnitsById = new Map(
     explicitBUs.map((bu) => [bu.id, {
@@ -726,10 +742,13 @@ async function resolveBUAssignmentScope(authContext, ownedScope) {
   return ownedScope;
 }
 
-async function resolveBusinessUnitIds(businessUnitIds, companyId, ownedScope) {
+// alreadyMappedIds — BUs the Employee ALREADY holds (update only). A Parent they already hold is
+// not re-rejected as "bare" on an unrelated edit (e.g. one of its Sub-BUs was later deactivated);
+// only a Parent being newly added without any Sub-BU is an error.
+async function resolveBusinessUnitIds(businessUnitIds, companyId, ownedScope, alreadyMappedIds = []) {
   const ids = [...new Set(businessUnitIds && businessUnitIds.length > 0 ? businessUnitIds : [])];
   if (companyId && !ids.includes(companyId)) {
-    const homeHasChildren = await companyRepository.hasChildren(companyId);
+    const homeHasChildren = await companyRepository.hasChildren(companyId, { activeOnly: true });
     if (!homeHasChildren) {
       ids.push(companyId);
     }
@@ -752,11 +771,11 @@ async function resolveBusinessUnitIds(businessUnitIds, companyId, ownedScope) {
   // Sub-BU is part of its Parent (like a department), not a separate BU, so
   // mapping the Sub-BU must never unmap the Parent. Only a GENUINELY bare
   // parent (no child of it present at all) is an error.
-  const parentIdsWithChildren = await companyRepository.findIdsWithChildren(ids);
+  const parentIdsWithChildren = await companyRepository.findIdsWithChildren(ids, { activeOnly: true });
   const effectiveIds = ids;
   if (parentIdsWithChildren.length > 0) {
     const childRows = await Company.findAll({
-      where: { parent_business_unit_id: { [Op.in]: parentIdsWithChildren }, is_deleted: false },
+      where: { parent_business_unit_id: { [Op.in]: parentIdsWithChildren }, is_deleted: false, status: 'active' },
       attributes: ['id', 'parent_business_unit_id'],
     });
     const childIdsByParent = new Map();
@@ -767,6 +786,7 @@ async function resolveBusinessUnitIds(businessUnitIds, companyId, ownedScope) {
 
     const requestedSet = new Set(ids);
     const bareParentIds = parentIdsWithChildren.filter((parentId) => {
+      if (alreadyMappedIds.includes(parentId)) return false;
       const children = childIdsByParent.get(parentId) || [];
       return !children.some((childId) => requestedSet.has(childId));
     });
@@ -789,7 +809,25 @@ async function resolveBusinessUnitIds(businessUnitIds, companyId, ownedScope) {
     throw forbiddenError(`Business Unit(s) not one of your own: ${disallowed.join(', ')}.`);
   }
 
-  return effectiveIds;
+  // Mapping an Employee to a Sub-BU also maps them to its Parent BU — a Sub-BU is part of its
+  // Parent. The Parent is derived from a Sub-BU the caller IS allowed to assign, so it is added
+  // AFTER the ownership check above (a BU Admin mapped only to a Sub-BU can't assign the Parent
+  // on its own, but must still be able to map the Sub-BU).
+  const parentIdsToAdd = [
+    ...new Set(
+      companies
+        .map((c) => c.parent_business_unit_id)
+        .filter((pid) => pid != null && !effectiveIds.includes(pid))
+    ),
+  ];
+  if (parentIdsToAdd.length === 0) {
+    return effectiveIds;
+  }
+  const parents = await Company.findAll({
+    where: { id: { [Op.in]: parentIdsToAdd }, is_deleted: false },
+    attributes: ['id'],
+  });
+  return [...effectiveIds, ...parents.map((parent) => parent.id)];
 }
 
 /**
@@ -992,7 +1030,7 @@ const create = async (data, userId, ipAddress = null, authContext) => {
  * @returns {Promise<Employee>}
  */
 const update = async (id, data, userId, ipAddress = null, authContext) => {
-  const accessWhere = await employeeAccessControlService.resolveEmployeeAccessWhere(authContext);
+  const accessWhere = await employeeAccessControlService.resolveEmployeeAccessWhere({ ...authContext, widenToMappedBus: true });
   const existing = await employeeRepository.findByIdWithEmail(id, authContext.companyId, accessWhere);
   if (!existing) {
     throw notFoundError(`Employee with ID ${id} not found.`);
@@ -1039,9 +1077,49 @@ const update = async (id, data, userId, ipAddress = null, authContext) => {
   // legitimately attach any of their OWN Business Units, not just the one
   // this Employee already belongs to. Widened further for a multi-BU
   // BU-scoped actor via resolveBUAssignmentScope() — see its doc comment.
-  const resolvedBusinessUnitIds = businessUnitIds !== undefined
-    ? await resolveBusinessUnitIds(businessUnitIds, companyId, await resolveBUAssignmentScope(authContext, ownedScope))
-    : null;
+  // BUs this Employee already holds that are OUTSIDE the caller's own reach (e.g. a BU Admin
+  // editing an Employee who also sits in BUs the Admin isn't mapped to) can't be seen or removed by
+  // the caller, and must not make the save fail with "not one of your own" — they are set aside
+  // here, only the in-reach ids are validated/replaced, and the set-aside ids are written back
+  // unchanged. A NEW id outside the caller's reach is still rejected.
+  let resolvedBusinessUnitIds = null;
+  let buExclusionsToAdd = null; // { buIds, roleIds } — role-wise unmapping, see below
+  let buExclusionsToClear = [];
+  if (businessUnitIds !== undefined) {
+    const assignmentScope = await resolveBUAssignmentScope(authContext, ownedScope);
+    const inReach = (buId) => (Array.isArray(assignmentScope) ? assignmentScope.includes(buId) : buId === assignmentScope);
+    const existingBuIds = await employeeBusinessUnitRepository.findIdsByEmployeeId(id);
+    const outOfReachExisting = existingBuIds.filter((buId) => !inReach(buId));
+    const submittedInReachOrNew = businessUnitIds.filter((buId) => !outOfReachExisting.includes(buId));
+    const resolvedInReach = await resolveBusinessUnitIds(submittedInReachOrNew, companyId, assignmentScope, existingBuIds);
+    resolvedBusinessUnitIds = [...new Set([...resolvedInReach, ...outOfReachExisting])];
+
+    // Role-wise unmapping. Business Units belong to the Employee, not to a role. For an Employee
+    // who is a BU Admin AND holds other role(s) (e.g. Project Manager), unmapping a BU removes it
+    // from those OTHER roles only: the employee_business_units row stays (so the BU Admin role
+    // keeps the BU) and an exclusion row hides it from each other role's session. Re-mapping the
+    // BU clears its exclusions.
+    const rolesAfter = resolvedRoles ?? (await employeeRoleRepository.findRolesByEmployeeId(id));
+    const BU_ADMIN_ROLE = 'BU Admin';
+    const otherRoleIds = rolesAfter.filter((role) => role.role_name !== BU_ADMIN_ROLE).map((role) => role.id);
+    const holdsBuAdmin = rolesAfter.some((role) => role.role_name === BU_ADMIN_ROLE);
+    const resolvedSet = new Set(resolvedBusinessUnitIds);
+    const removing = existingBuIds.filter((buId) => !resolvedSet.has(buId));
+
+    if (holdsBuAdmin && otherRoleIds.length > 0) {
+      buExclusionsToAdd = { buIds: removing, roleIds: otherRoleIds };
+      buExclusionsToClear = resolvedBusinessUnitIds;
+      // Nothing is actually deleted from employee_business_units — only hidden per role.
+      resolvedBusinessUnitIds = [...new Set([...existingBuIds, ...resolvedBusinessUnitIds])];
+    } else {
+      // A BU Admin with no other role has nothing to fall back on: they can't unmap a BU from
+      // THEIR OWN record (it would strip their own access). Other Employees are unaffected.
+      const isBuAdminActor = authContext.hierarchyRank === 4 || (authContext.roleNames || []).includes(BU_ADMIN_ROLE);
+      if (isBuAdminActor && id === authContext.employeeId && removing.length > 0) {
+        throw forbiddenError('You cannot unmap Business Units from your own account — ask an Admin to do it.');
+      }
+    }
+  }
 
   // Only validate a manager that is actually CHANGING — the Edit form
   // resends the current value on every save, and a mapping created before
@@ -1086,6 +1164,12 @@ const update = async (id, data, userId, ipAddress = null, authContext) => {
     }
     if (resolvedBusinessUnitIds !== null) {
       await employeeBusinessUnitRepository.replaceForEmployee(id, resolvedBusinessUnitIds, userId, transaction);
+      await employeeBusinessUnitRoleExclusionRepository.clearForBusinessUnits(id, buExclusionsToClear, transaction);
+      if (buExclusionsToAdd && buExclusionsToAdd.buIds.length > 0) {
+        await employeeBusinessUnitRoleExclusionRepository.addExclusions(
+          id, buExclusionsToAdd.buIds, buExclusionsToAdd.roleIds, userId, transaction
+        );
+      }
     }
 
     if (primaryManagerEmployeeId) {

@@ -38,6 +38,7 @@ const Role                   = require('./Role')(sequelize);
 const Employee               = require('./Employee')(sequelize);
 const EmployeeRole           = require('./EmployeeRole')(sequelize);
 const EmployeeBusinessUnit   = require('./EmployeeBusinessUnit')(sequelize);
+const EmployeeBusinessUnitRoleExclusion = require('./EmployeeBusinessUnitRoleExclusion')(sequelize);
 const EmployeeLoginSession   = require('./EmployeeLoginSession')(sequelize);
 const User                   = require('./User')(sequelize);
 const Client                 = require('./Client')(sequelize);
@@ -480,6 +481,7 @@ module.exports = {
   Employee,
   EmployeeRole,
   EmployeeBusinessUnit,
+  EmployeeBusinessUnitRoleExclusion,
   EmployeeLoginSession,
   User,
   Client,

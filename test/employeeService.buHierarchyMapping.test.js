@@ -219,6 +219,8 @@ test('update(): a BU Admin mapped only to the Parent BU may assign Parent + its 
   let replaced;
   const employeeBusinessUnitRepository = require('../src/repositories/employeeBusinessUnitRepository');
   const originalReplace = employeeBusinessUnitRepository.replaceForEmployee;
+  const originalFindIds = employeeBusinessUnitRepository.findIdsByEmployeeId;
+  employeeBusinessUnitRepository.findIdsByEmployeeId = async () => [];
   employeeBusinessUnitRepository.replaceForEmployee = async (employeeId, businessUnitIds) => {
     replaced = businessUnitIds;
   };
@@ -232,6 +234,111 @@ test('update(): a BU Admin mapped only to the Parent BU may assign Parent + its 
   } finally {
     companyAccessControlService.expandBusinessUnitIdsWithDescendants = originalExpand;
     employeeBusinessUnitRepository.replaceForEmployee = originalReplace;
+    employeeBusinessUnitRepository.findIdsByEmployeeId = originalFindIds;
     restore();
   }
+});
+
+// ── update() BU mapping rules ────────────────────────────────────────────────────────────────
+async function runUpdate({ existingBuIds, roles, companies, parentRows = [], hasChildrenIds = [], submitted, ctx, empId = 61 }) {
+  const companyAccessControlService = require('../src/services/companyAccessControlService');
+  const employeeBusinessUnitRepository = require('../src/repositories/employeeBusinessUnitRepository');
+  const employeeRoleRepository = require('../src/repositories/employeeRoleRepository');
+  const exclusionRepository = require('../src/repositories/employeeBusinessUnitRoleExclusionRepository');
+  const orig = {
+    expand: companyAccessControlService.expandBusinessUnitIdsWithDescendants,
+    replace: employeeBusinessUnitRepository.replaceForEmployee,
+    findIds: employeeBusinessUnitRepository.findIdsByEmployeeId,
+    findRoles: employeeRoleRepository.findRolesByEmployeeId,
+    add: exclusionRepository.addExclusions,
+    clear: exclusionRepository.clearForBusinessUnits,
+  };
+  const out = { replaced: null, added: null, cleared: null };
+  companyAccessControlService.expandBusinessUnitIdsWithDescendants = async (ids) => ids;
+  employeeRepository.findByIdWithEmail = async (id) => ({
+    id, employee_code: 'EMP1', company_id: null, is_deleted: false, toJSON() { return this; },
+  });
+  Company.findAll = async ({ where }) => {
+    if (where.parent_business_unit_id) return parentRows;
+    const key = Object.getOwnPropertySymbols(where.id || {})[0];
+    const wanted = key ? where.id[key] : [];
+    return companies.filter((c) => wanted.includes(c.id));
+  };
+  companyRepository.hasChildren = async (id) => hasChildrenIds.includes(id);
+  companyRepository.findIdsWithChildren = async (ids) => ids.filter((id) => hasChildrenIds.includes(id));
+  employeeRepository.update = async (e, payload) => ({ id: e, ...payload, toJSON() { return this; } });
+  sequelize.transaction = async (fn) => fn({ __fakeTransaction: true });
+  employeeBusinessUnitRepository.findIdsByEmployeeId = async () => existingBuIds;
+  employeeRoleRepository.findRolesByEmployeeId = async () => roles;
+  employeeBusinessUnitRepository.replaceForEmployee = async (e, ids) => { out.replaced = ids; };
+  exclusionRepository.addExclusions = async (e, buIds, roleIds) => { out.added = { buIds, roleIds }; };
+  exclusionRepository.clearForBusinessUnits = async (e, buIds) => { out.cleared = buIds; };
+  try {
+    await employeeService.update(empId, { business_unit_ids: submitted }, 1, '127.0.0.1', ctx);
+  } finally {
+    companyAccessControlService.expandBusinessUnitIdsWithDescendants = orig.expand;
+    employeeBusinessUnitRepository.replaceForEmployee = orig.replace;
+    employeeBusinessUnitRepository.findIdsByEmployeeId = orig.findIds;
+    employeeRoleRepository.findRolesByEmployeeId = orig.findRoles;
+    exclusionRepository.addExclusions = orig.add;
+    exclusionRepository.clearForBusinessUnits = orig.clear;
+    restore();
+  }
+  return out;
+}
+const EMP_ROLE = [{ id: 14, role_name: 'Employee' }];
+const BU_ADMIN_ROLE_ONLY = [{ id: 2, role_name: 'BU Admin' }];
+const BU_ADMIN_AND_PM = [{ id: 2, role_name: 'BU Admin' }, { id: 12, role_name: 'Project Manager' }];
+const sortNum = (arr) => arr.slice().sort((a, b) => a - b);
+
+test('update(): BUs the Employee already holds outside the actor reach are kept, not rejected', async () => {
+  const ctx = { ...AUTH_CONTEXT, companyId: 40, employeeBusinessUnits: [40] };
+  const out = await runUpdate({
+    existingBuIds: [40, 56, 57], roles: EMP_ROLE, companies: [{ id: 40, company_name: 'DATA + AI' }],
+    submitted: [40, 56, 57], ctx,
+  });
+  assert.deepEqual(sortNum(out.replaced), [40, 56, 57]);
+  // A NEW id outside the actor reach is still refused.
+  await assert.rejects(runUpdate({
+    existingBuIds: [40, 56, 57], roles: EMP_ROLE,
+    companies: [{ id: 40, company_name: 'A' }, { id: 987654, company_name: 'Other' }],
+    submitted: [40, 987654], ctx,
+  }));
+});
+
+test('update(): mapping a Sub-BU also maps its Parent BU, even when the actor is not directly mapped to the Parent', async () => {
+  const out = await runUpdate({
+    existingBuIds: [], roles: EMP_ROLE,
+    companies: [{ id: 42, company_name: 'DAS', parent_business_unit_id: 40 }, { id: 40, company_name: 'DATA + AI', parent_business_unit_id: null }],
+    submitted: [42], ctx: { ...AUTH_CONTEXT, companyId: 42, employeeBusinessUnits: [42] },
+  });
+  assert.deepEqual(sortNum(out.replaced), [40, 42]);
+});
+
+test('update(): a Parent the Employee already holds is not rejected as bare on an unrelated edit', async () => {
+  const out = await runUpdate({
+    existingBuIds: [40], roles: EMP_ROLE, companies: [{ id: 40, company_name: 'DATA + AI' }],
+    parentRows: [{ id: 43, parent_business_unit_id: 40 }], hasChildrenIds: [40],
+    submitted: [40], ctx: { ...AUTH_CONTEXT, companyId: 40, employeeBusinessUnits: [40] },
+  });
+  assert.deepEqual(out.replaced, [40]);
+});
+
+test('update(): a BU Admin with NO other role cannot unmap a BU from their OWN record, but can for another employee', async () => {
+  const ctx = { ...AUTH_CONTEXT, companyId: 40, employeeBusinessUnits: [40, 41], roleNames: ['BU Admin'] };
+  const base = { existingBuIds: [40, 41], roles: BU_ADMIN_ROLE_ONLY, companies: [{ id: 40, company_name: 'A' }], submitted: [40], ctx };
+  await assert.rejects(runUpdate({ ...base, empId: 99 }), /cannot unmap/);
+  const out = await runUpdate({ ...base, empId: 61 });
+  assert.deepEqual(out.replaced, [40]);
+});
+
+test('update(): a BU Admin + Project Manager unmapped from a BU is unmapped for the OTHER role only (row kept, exclusion added)', async () => {
+  const ctx = { ...AUTH_CONTEXT, companyId: 40, employeeBusinessUnits: [40, 41], roleNames: ['BU Admin'] };
+  const out = await runUpdate({
+    existingBuIds: [40, 41], roles: BU_ADMIN_AND_PM, companies: [{ id: 40, company_name: 'A' }],
+    submitted: [40], ctx, empId: 99,
+  });
+  assert.deepEqual(sortNum(out.replaced), [40, 41]); // nothing deleted from employee_business_units
+  assert.deepEqual(out.added, { buIds: [41], roleIds: [12] });
+  assert.deepEqual(out.cleared, [40]);
 });

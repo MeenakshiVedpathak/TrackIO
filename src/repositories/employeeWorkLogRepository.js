@@ -1,7 +1,7 @@
 'use strict';
 
 const { Op, fn, col, literal, QueryTypes } = require('sequelize');
-const { sequelize, EmployeeWorkLog, Employee, ServicePO, SubProject, Project, ServicePOHierarchy, EmployeeWorkLogTimeEntry } = require('../models');
+const { sequelize, EmployeeWorkLog, Employee, ServicePO, SubProject, Project, ServicePOHierarchy, EmployeeWorkLogTimeEntry, Company, EmployeeBusinessUnit } = require('../models');
 
 /**
  * Employee Work Log Repository
@@ -499,9 +499,75 @@ const getHierarchyBreakdownForRange = async ({ employeeId, startDate, endDate })
  * @param {number} year
  * @returns {Promise<EmployeeWorkLog[]>}
  */
+/**
+ * Sub-BU sync scope. A Service PO that was created at the PARENT BU level (e.g. before its Sub-BUs
+ * existed) stamps its work logs with the Parent's company_id, and syncing the Parent is refused
+ * while it has Sub-BUs — so those logs could never be synced, and a Sub-BU's sync showed only the
+ * logs stamped with the Sub-BU's own id (typically just Centralised POs). For a Sub-BU this also
+ * pulls the Parent-stamped logs of the Employees assigned to THIS Sub-BU.
+ *
+ * An Employee mapped to several active Sibling Sub-BUs is assigned to exactly one of them — the
+ * lowest id — so the same log is never synced twice. A Parent/childless BU returns itself only.
+ *
+ * @param {number} companyId
+ * @returns {Promise<{ companyIds: number[], parentId: number|null, parentLogEmployeeIds: number[] }>}
+ */
+const resolveSyncScope = async (companyId) => {
+  const company = await Company.findOne({ where: { id: companyId }, attributes: ['id', 'parent_business_unit_id'] });
+  const parentId = company ? company.parent_business_unit_id : null;
+  if (parentId == null) {
+    return { companyIds: [companyId], parentId: null, parentLogEmployeeIds: [] };
+  }
+
+  const siblings = await Company.findAll({
+    where: { parent_business_unit_id: parentId, is_deleted: false, status: 'active' },
+    attributes: ['id'],
+  });
+  const siblingIds = siblings.map((c) => c.id);
+  const grants = await EmployeeBusinessUnit.findAll({
+    where: { business_unit_id: { [Op.in]: siblingIds }, status: 'active' },
+    attributes: ['employee_id', 'business_unit_id'],
+    raw: true,
+  });
+  const lowestSubBuByEmployee = new Map();
+  grants.forEach((grant) => {
+    const current = lowestSubBuByEmployee.get(grant.employee_id);
+    if (current == null || grant.business_unit_id < current) lowestSubBuByEmployee.set(grant.employee_id, grant.business_unit_id);
+  });
+  const parentLogEmployeeIds = [...lowestSubBuByEmployee.entries()]
+    .filter(([, subBuId]) => subBuId === companyId)
+    .map(([employeeId]) => employeeId);
+
+  return { companyIds: [companyId, parentId], parentId, parentLogEmployeeIds };
+};
+
+/**
+ * The Business Unit scope of the Timesheet Approval list's BU / Sub BU filter, expressed on the work
+ * log rows' OWN company_id (the BU of the Service PO the hours were logged against) — the same
+ * attribution Sync uses — rather than on which BUs the Employee happens to be mapped to. Without
+ * this an Employee mapped to many BUs showed all of their logs under every one of those BUs, while
+ * Sync (correctly) only pulled the ones belonging to the BU being synced.
+ *
+ * A Parent BU covers itself plus its Sub-BUs; a Sub-BU covers its own logs plus the Parent-stamped
+ * logs of the Employees assigned to it (see resolveSyncScope).
+ *
+ * @param {number} businessUnitId
+ * @returns {Promise<{ companyIds: number[], parentId: number|null, parentLogEmployeeIds: number[] }>}
+ */
+const resolveApprovalLogScope = async (businessUnitId) => {
+  const company = await Company.findOne({ where: { id: businessUnitId }, attributes: ['id', 'parent_business_unit_id'] });
+  if (company && company.parent_business_unit_id != null) {
+    const { parentId, parentLogEmployeeIds } = await resolveSyncScope(businessUnitId);
+    return { companyIds: [businessUnitId], parentId, parentLogEmployeeIds };
+  }
+  const children = await Company.findAll({ where: { parent_business_unit_id: businessUnitId }, attributes: ['id'], raw: true });
+  return { companyIds: [businessUnitId, ...children.map((child) => child.id)], parentId: null, parentLogEmployeeIds: [] };
+};
+
 const findForSync = async (companyId, month, year) => {
   const monthNum = parseInt(month, 10);
   const yearNum = parseInt(year, 10);
+  const { parentId, parentLogEmployeeIds } = await resolveSyncScope(companyId);
 
   return EmployeeWorkLog.findAll({
     where: {
@@ -509,7 +575,12 @@ const findForSync = async (companyId, month, year) => {
         literal(`EXTRACT(MONTH FROM work_date) = ${monthNum}`),
         literal(`EXTRACT(YEAR  FROM work_date) = ${yearNum}`),
       ],
-      company_id: companyId,
+      [Op.or]: [
+        { company_id: companyId },
+        ...(parentId != null && parentLogEmployeeIds.length > 0
+          ? [{ company_id: parentId, employee_id: { [Op.in]: parentLogEmployeeIds } }]
+          : []),
+      ],
       status: { [Op.ne]: 'pending' },
     },
     include: buildIncludes(),
@@ -539,6 +610,8 @@ const markSyncedByTuples = async (companyId, tuples, timesheetImportId, transact
     service_po_id: t.poId,
     work_date: t.date,
   }));
+  // A Sub-BU sync can also have pulled Parent-stamped logs (see resolveSyncScope) — mark those too.
+  const { companyIds } = await resolveSyncScope(companyId);
 
   const [count] = await EmployeeWorkLog.update(
     {
@@ -548,7 +621,7 @@ const markSyncedByTuples = async (companyId, tuples, timesheetImportId, transact
     },
     {
       where: {
-        company_id: companyId,
+        company_id: { [Op.in]: companyIds },
         [Op.or]: orConditions,
       },
       ...(transaction ? { transaction } : {}),
@@ -834,10 +907,21 @@ const APPROVAL_BUCKET_SORT_SQL = {
  */
 function buildApprovalSummaryBucketsBase({
   employeeIds, startDate, endDate, isMonthly = false, poScope = null,
-  status = null, servicePoId = null, search = null,
+  status = null, servicePoId = null, search = null, logScope = null,
 }) {
   const replacements = { employeeIds };
   const scopeConditions = ['wl.employee_id IN (:employeeIds)'];
+  if (logScope) {
+    // BU / Sub BU filter, on the log's own company_id — see resolveApprovalLogScope.
+    replacements.logCompanyIds = logScope.companyIds;
+    if (logScope.parentId != null && logScope.parentLogEmployeeIds.length > 0) {
+      replacements.logParentId = logScope.parentId;
+      replacements.logParentEmployeeIds = logScope.parentLogEmployeeIds;
+      scopeConditions.push('(wl.company_id IN (:logCompanyIds) OR (wl.company_id = :logParentId AND wl.employee_id IN (:logParentEmployeeIds)))');
+    } else {
+      scopeConditions.push('wl.company_id IN (:logCompanyIds)');
+    }
+  }
   if (startDate) { scopeConditions.push('wl.work_date >= :startDate'); replacements.startDate = startDate; }
   if (endDate) { scopeConditions.push('wl.work_date <= :endDate'); replacements.endDate = endDate; }
   if (poScope) {
@@ -933,12 +1017,12 @@ function buildApprovalSummaryBucketsBase({
  */
 const findApprovalSummaryBucketsPage = async ({
   employeeIds, startDate, endDate, isMonthly = false, poScope = null,
-  status = null, servicePoId = null, search = null, sortBy = null, sortOrder = 'desc', limit, offset,
+  status = null, servicePoId = null, search = null, sortBy = null, sortOrder = 'desc', limit, offset, logScope = null,
 }) => {
   if (!employeeIds || employeeIds.length === 0) return { rows: [], total: 0 };
 
   const built = buildApprovalSummaryBucketsBase({
-    employeeIds, startDate, endDate, isMonthly, poScope, status, servicePoId, search,
+    employeeIds, startDate, endDate, isMonthly, poScope, status, servicePoId, search, logScope,
   });
   if (!built) return { rows: [], total: 0 }; // poScope.ownPoIds was empty
   const { base, replacements } = built;
@@ -976,12 +1060,12 @@ const findApprovalSummaryBucketsPage = async ({
  */
 const findApprovalSummaryBuckets = async ({
   employeeIds, startDate, endDate, isMonthly = false, poScope = null,
-  status = null, servicePoId = null, search = null,
+  status = null, servicePoId = null, search = null, logScope = null,
 }) => {
   if (!employeeIds || employeeIds.length === 0) return [];
 
   const built = buildApprovalSummaryBucketsBase({
-    employeeIds, startDate, endDate, isMonthly, poScope, status, servicePoId, search,
+    employeeIds, startDate, endDate, isMonthly, poScope, status, servicePoId, search, logScope,
   });
   if (!built) return []; // poScope.ownPoIds was empty
   const { base, replacements } = built;
@@ -1614,6 +1698,8 @@ module.exports = {
   hasMonthlyEntry,
   getMonthEntryModeSummary,
   findForSync,
+  resolveSyncScope,
+  resolveApprovalLogScope,
   markSyncedByTuples,
   revertSyncStatusByImportIds,
   revertSyncStatusByTuple,

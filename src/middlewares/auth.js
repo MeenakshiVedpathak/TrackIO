@@ -6,6 +6,7 @@ const { Employee, Role, Company } = require('../models');
 const roleHierarchyService = require('../services/roleHierarchyService');
 const logger = require('../utils/logger');
 const resolveCompany = require('./resolveCompany');
+const employeeBusinessUnitRoleExclusionRepository = require('../repositories/employeeBusinessUnitRoleExclusionRepository');
 
 /**
  * Routes Platform Admin may reach despite being platform-only by default
@@ -221,8 +222,13 @@ const authenticateIdentity = async (req, res, next) => {
     }
 
     const hierarchyRank = getEffectiveHierarchyRank(activeRoles);
-    const activeBusinessUnits = getActiveBusinessUnits(employee);
     const roleIds = activeRoles.map((role) => role.id);
+    // Role-wise BU unmapping: a BU unmapped "as Project Manager" (etc.) stays mapped for the BU
+    // Admin role, but is hidden from every session whose active role it was excluded for.
+    const excludedBuIds = new Set(
+      await employeeBusinessUnitRoleExclusionRepository.findExcludedBuIdsForRoles(employee.id, roleIds)
+    );
+    const activeBusinessUnits = getActiveBusinessUnits(employee).filter((bu) => !excludedBuIds.has(bu.id));
 
     const effectiveCapabilities = await roleHierarchyService.getEffectiveCapabilitiesForRoleIds(roleIds);
 

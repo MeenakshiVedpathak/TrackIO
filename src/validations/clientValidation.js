@@ -121,6 +121,8 @@ const listClientsQuerySchema = Joi.object({
   status: Joi.string().valid('active', 'inactive', 'all').default('active'),
   search: Joi.string().trim().max(100).optional().allow(''),
   industry: Joi.string().trim().max(100).optional().allow(''),
+  // Company-less actors (Admin/Entity Admin): only their OWN BU-less clients ("My Clients").
+  no_business_unit: Joi.boolean().optional(),
   sort_by: Joi.string().valid('client_name', 'client_code', 'industry', 'created_at').default('client_name'),
   sort_order: Joi.string().valid('ASC', 'DESC', 'asc', 'desc').default('ASC'),
   // camelCase aliases the Client Master frontend actually sends

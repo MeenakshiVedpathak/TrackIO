@@ -78,11 +78,17 @@ function companyScope(companyId) {
  * @returns {Promise<{ rows: Client[], count: number }>}
  */
 const findAll = async (filters = {}, pagination = {}, sort = {}) => {
-  const { search, status, industry, companyId } = filters;
+  const { search, status, industry, companyId, buLessOnly = false } = filters;
   const { limit = 10, offset = 0 } = pagination;
   const { sortBy = 'client_name', sortOrder = 'ASC' } = sort;
 
   const where = { ...companyScope(companyId) };
+
+  // Only the actor's own BU-less clients — ANDed with companyScope()'s own OR (which already
+  // limits BU-less rows to created_by = this actor).
+  if (buLessOnly) {
+    where[Op.and] = [...(where[Op.and] || []), { company_id: null }];
+  }
 
   // Status filter — omit clause when 'all' is requested
   if (status && status !== 'all') {

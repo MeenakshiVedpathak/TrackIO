@@ -83,6 +83,9 @@ const getAll = async (query = {}, authContext) => {
     status: query.status || 'active',
     industry: query.industry || null,
     companyId,
+    // Server-side "My Clients" — only honoured for a company-less actor (companyId is the
+    // { ownedCompanyIds, createdBy } object there), never widens a BU-scoped actor's reach.
+    buLessOnly: query.no_business_unit === true && !Array.isArray(companyId) && typeof companyId === 'object',
   };
 
   // camelCase sortBy/sortOrder (what the Client Master frontend sends) win
