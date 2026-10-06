@@ -2,12 +2,16 @@
 
 const xlsx = require('xlsx');
 const { Op } = require('sequelize');
-const { Employee } = require('../models');
+const { Employee, Company, ServicePO } = require('../models');
 const managerSelfServiceService = require('./managerSelfServiceService');
 const employeeMonthlyWorkLogService = require('./employeeMonthlyWorkLogService');
 const employeeRepository = require('../repositories/employeeRepository');
 const managerEmployeeMappingRepository = require('../repositories/managerEmployeeMappingRepository');
+const employeeServicePOMappingService = require('./employeeServicePOMappingService');
+const employeeServicePOMappingRepository = require('../repositories/employeeServicePOMappingRepository');
 const employeeTimesheetService = require('./employeeTimesheetService');
+const servicePORepository = require('../repositories/servicePORepository');
+const companyAccessControlService = require('./companyAccessControlService');
 const dateHelper = require('../helpers/dateHelper');
 const { createAuditLog } = require('../middlewares/auditLog');
 const logger = require('../utils/logger');
@@ -54,9 +58,31 @@ const logger = require('../utils/logger');
  * @returns {Promise<object>} same shape as employeeMonthlyWorkLogService.getMonthlyWorkLog
  */
 const getMonthlyWorkLogForEmployee = async (managerUserId, employeeId, companyId, month, year, hierarchyRank = null, callerBuIds = []) => {
-  await managerSelfServiceService.assertOwnEmployeeForApproval(managerUserId, employeeId, companyId, hierarchyRank, callerBuIds);
+  const pmScopedPoIds = await managerSelfServiceService.assertOwnEmployeeForApproval(managerUserId, employeeId, companyId, hierarchyRank, callerBuIds);
 
-  return employeeMonthlyWorkLogService.getMonthlyWorkLog(employeeId, companyId, month, year);
+  const dto = await employeeMonthlyWorkLogService.getMonthlyWorkLog(employeeId, companyId, month, year);
+  if (!Array.isArray(pmScopedPoIds)) return dto;
+  return restrictToProjectManagerPOs(dto, await resolveProjectManagerPoIds(managerUserId, companyId, callerBuIds));
+};
+
+/**
+ * The Service PO ids a Project Manager may fill a work log against: the POs they are the
+ * explicit PM of (is_project_manager = true), plus their own Admin tenant's Centralised POs
+ * (Leaves/On Bench/etc. — no genuine PM of their own, auto-mapped to everyone). Same
+ * definition the Timesheet Approval screens use (managerSelfServiceService).
+ */
+const resolveProjectManagerPoIds = async (managerUserId, companyId, callerBuIds = []) => {
+  const ownPoIds = await employeeServicePOMappingService.getProjectManagerServicePOIds(managerUserId);
+  const tenantSeedIds = callerBuIds.length > 0 ? callerBuIds : [companyId].filter(Boolean);
+  const centralised = await servicePORepository.getActiveCentralisedPOIds(
+    await companyAccessControlService.resolveCentralisedServicePOTenant(tenantSeedIds, managerUserId)
+  );
+  return [...new Set([...ownPoIds, ...centralised.map((po) => po.id)].map(Number))];
+};
+
+const restrictToProjectManagerPOs = (dto, allowedPoIds) => {
+  const allowed = new Set(allowedPoIds.map(Number));
+  return { ...dto, service_pos: (dto.service_pos || []).filter((po) => allowed.has(Number(po.service_po_id))) };
 };
 
 /**
@@ -75,12 +101,29 @@ const getMonthlyWorkLogForEmployee = async (managerUserId, employeeId, companyId
  * @returns {Promise<object>} same shape as employeeMonthlyWorkLogService.getMonthlyWorkLog
  */
 const submitMonthlyWorkLogForEmployee = async (managerUserId, employeeId, companyId, data, actorId, ipAddress, hierarchyRank = null, callerBuIds = []) => {
-  await managerSelfServiceService.assertOwnEmployeeForApproval(managerUserId, employeeId, companyId, hierarchyRank, callerBuIds);
+  const pmScopedPoIds = await managerSelfServiceService.assertOwnEmployeeForApproval(managerUserId, employeeId, companyId, hierarchyRank, callerBuIds);
+
+  // A Project Manager may log hours only against the Service POs they themselves manage
+  // (is_project_manager = true) or the Centralised POs — never another PO the Employee
+  // happens to be mapped to. Their save also replaces ONLY those POs' rows for the month
+  // (scopeServicePOIds), so the Employee's hours on other projects are never wiped. Every
+  // other tier is unchanged.
+  let scopeServicePOIds = null;
+  if (Array.isArray(pmScopedPoIds)) {
+    scopeServicePOIds = await resolveProjectManagerPoIds(managerUserId, companyId, callerBuIds);
+    const notMine = (data.entries || []).find((line) => !scopeServicePOIds.includes(Number(line.service_po_id)));
+    if (notMine) {
+      const err = new Error('You can only fill the work log against Service POs where you are the Project Manager.');
+      err.statusCode = 403;
+      throw err;
+    }
+  }
 
   const result = await employeeMonthlyWorkLogService.submitMonthlyWorkLog(employeeId, companyId, data, {
     creatorId: actorId,
     forceApproved: true,
     allowHierarchyNode: false,
+    scopeServicePOIds,
   });
 
   await createAuditLog(
@@ -97,7 +140,7 @@ const submitMonthlyWorkLogForEmployee = async (managerUserId, employeeId, compan
     managerUserId, employeeId, month: data.month, year: data.year, actorId,
   });
 
-  return result;
+  return scopeServicePOIds ? restrictToProjectManagerPOs(result, scopeServicePOIds) : result;
 };
 
 /**
@@ -363,6 +406,8 @@ const bulkUploadMonthlyWorkLog = async (managerUserId, companyId, filePath, peri
   // are their PRIMARY Manager," so no per-row DB round trip is needed
   // either.
   let primaryEmployeeByCode = null;
+  let pmEmployeeByCode = new Map();
+  let pmPoIdSet = new Set();
   if (!isAdminTier && !isBuAdmin) {
     const primaryMappings = (await managerEmployeeMappingRepository.findByManager(managerUserId))
       .filter((mapping) => mapping.mapping_type === 'PRIMARY');
@@ -378,22 +423,58 @@ const bulkUploadMonthlyWorkLog = async (managerUserId, companyId, filePath, peri
         .filter((employee) => employee.status === 'active' && !employee.is_deleted)
         .map((employee) => [employee.employee_code.trim().toUpperCase(), employee])
     );
+
+    // Project-Manager route — independent of any Team Lead / Primary Manager mapping: an
+    // Employee actively mapped to a Service PO the caller is the explicit PM of
+    // (is_project_manager = true) is in scope for THAT PO's rows only.
+    const pmPoIds = await employeeServicePOMappingService.getProjectManagerServicePOIds(managerUserId);
+    pmPoIdSet = new Set(pmPoIds.map(Number));
+    if (pmPoIds.length > 0) {
+      const pmMappings = await employeeServicePOMappingRepository.findByServicePOs(pmPoIds, 'active');
+      const pmEmployeeIds = [...new Set(pmMappings.map((m) => m.employee_id))];
+      const pmEmployees = await Employee.findAll({
+        where: { id: { [Op.in]: pmEmployeeIds } },
+        attributes: ['id', 'employee_code', 'status', 'is_deleted'],
+      });
+      pmEmployeeByCode = new Map(
+        pmEmployees
+          .filter((employee) => employee.status === 'active' && !employee.is_deleted)
+          .map((employee) => [employee.employee_code.trim().toUpperCase(), employee])
+      );
+    }
   }
 
   const gate1Errors = [];
+  // Rows left out of the import (not an error): the caller has no authority over that
+  // Employee / Service PO. Reported back as warnings, the rest of the file still imports.
+  const skippedRows = [];
+  const skip = (row, reason) => skippedRows.push({
+    row: row.row,
+    employee_code: row.employee_code,
+    employee_name: row.employee_name,
+    service_po_name: row.service_po_name,
+    reason,
+  });
   const rowsWithEmployee = [];
 
   for (const row of shapedRows) {
     let employee;
     let isOwnedByCaller;
+    let isPrimaryOwned = true;
 
     if (isAdminTier) {
       employee = await employeeRepository.findByCode(row.employee_code, companyId);
       isOwnedByCaller = !!employee;
     } else if (isBuAdmin) {
-      employee = await employeeRepository.findByCode(row.employee_code, companyId);
+      // Any Employee inside the caller's Business Unit(s) — look the code up in each BU
+      // they administer, not only the one currently selected.
+      const scopeIds = callerBuIds.length > 0 ? callerBuIds : [companyId].filter(Boolean);
+      employee = null;
+      for (const buId of [companyId, ...scopeIds].filter((id, i, arr) => id != null && arr.indexOf(id) === i)) {
+        const found = await employeeRepository.findByCode(row.employee_code, buId);
+        if (found) { employee = found; break; }
+      }
       if (employee) {
-        const scopeIds = callerBuIds.length > 0 ? callerBuIds : [companyId].filter(Boolean);
         const scoped = await employeeRepository.findById(employee.id, scopeIds.length === 1 ? scopeIds[0] : scopeIds);
         isOwnedByCaller = !!scoped;
       } else {
@@ -401,7 +482,15 @@ const bulkUploadMonthlyWorkLog = async (managerUserId, companyId, filePath, peri
       }
     } else {
       employee = primaryEmployeeByCode.get(row.employee_code);
-      isOwnedByCaller = !!employee;
+      if (!employee) {
+        employee = pmEmployeeByCode.get(row.employee_code);
+        isPrimaryOwned = false;
+        if (!employee) {
+          skip(row, `Skipped: "${row.employee_name}" (${row.employee_code}) is not in your team and is not mapped to any Service PO you manage as Project Manager.`);
+          continue;
+        }
+      }
+      isOwnedByCaller = true;
     }
 
     // The Manager-tier map above is already pre-filtered to active,
@@ -421,7 +510,7 @@ const bulkUploadMonthlyWorkLog = async (managerUserId, companyId, filePath, peri
       continue;
     }
 
-    rowsWithEmployee.push({ ...row, employee_id: employee.id });
+    rowsWithEmployee.push({ ...row, employee_id: employee.id, is_primary_owned: isPrimaryOwned });
   }
 
   if (gate1Errors.length) {
@@ -447,10 +536,21 @@ const bulkUploadMonthlyWorkLog = async (managerUserId, companyId, filePath, peri
 
     const servicePOId = nameMap.get(row.service_po_name.trim().toLowerCase());
     if (!servicePOId) {
+      if (!row.is_primary_owned) {
+        skip(row, `Skipped: Service PO "${row.service_po_name}" is not mapped to employee "${row.employee_code}", and you are not their Primary Manager.`);
+        continue;
+      }
       gate2Errors.push({
         row: row.row,
         errors: [`Service PO "${row.service_po_name}" is not mapped to employee "${row.employee_code}".`],
       });
+      continue;
+    }
+
+    // An Employee reached only through the Project-Manager route may be logged for solely
+    // on the Service POs the caller manages — any other PO's row is skipped.
+    if (!row.is_primary_owned && !pmPoIdSet.has(Number(servicePOId))) {
+      skip(row, `Skipped: you are not the Project Manager of Service PO "${row.service_po_name}".`);
       continue;
     }
 
@@ -459,6 +559,32 @@ const bulkUploadMonthlyWorkLog = async (managerUserId, companyId, filePath, peri
 
   if (gate2Errors.length) {
     throw validationError('Some Service POs in the file could not be validated.', { phase: 'service_po', error_rows: gate2Errors });
+  }
+
+  // BU Admin: a row's Service PO must belong to one of the caller's own Business Units (or
+  // their Sub-BUs). Centralised POs and Admin-created POs (no Business Unit at all,
+  // company_id NULL) are allowed whenever the Employee is mapped to them; any other BU's PO is
+  // skipped with a warning instead of blocking the file.
+  if (isBuAdmin && resolvedRows.length > 0) {
+    const seedIds = [companyId, ...callerBuIds].filter((id) => id != null);
+    const subBus = seedIds.length
+      ? await Company.findAll({ where: { parent_business_unit_id: { [Op.in]: seedIds } }, attributes: ['id'] })
+      : [];
+    const buScope = new Set([...seedIds, ...subBus.map((bu) => bu.id)].map(Number));
+    const pos = await ServicePO.findAll({
+      where: { id: { [Op.in]: [...new Set(resolvedRows.map((r) => r.service_po_id))] } },
+      attributes: ['id', 'company_id', 'is_centralised'],
+    });
+    const poById = new Map(pos.map((po) => [Number(po.id), po]));
+    const kept = [];
+    for (const row of resolvedRows) {
+      const po = poById.get(Number(row.service_po_id));
+      const allowed = po && (po.is_centralised || po.company_id == null || buScope.has(Number(po.company_id)));
+      if (allowed) kept.push(row);
+      else skip(row, `Skipped: Service PO "${row.service_po_name}" is not from this Business Unit.`);
+    }
+    resolvedRows.length = 0;
+    resolvedRows.push(...kept);
   }
 
   // Both gates passed for every row — group by Employee and REPLACE-SAVE
@@ -489,6 +615,9 @@ const bulkUploadMonthlyWorkLog = async (managerUserId, companyId, filePath, peri
         creatorId: actorId,
         forceApproved: true,
         allowHierarchyNode: false,
+        // Project-Manager-route employees: replace ONLY the caller's own POs' rows, never
+        // the employee's other projects' hours for the month.
+        scopeServicePOIds: rows[0].is_primary_owned ? null : [...pmPoIdSet],
       });
       results.push({ employee_id: employeeId, employee_code: rows[0].employee_code, entry_count: entries.length });
     } catch (err) {
@@ -524,6 +653,8 @@ const bulkUploadMonthlyWorkLog = async (managerUserId, companyId, filePath, peri
     employees_processed: results.length,
     employees_failed: failures.length,
     total_rows: resolvedRows.length,
+    rows_skipped: skippedRows.length,
+    skipped: skippedRows,
     results,
     failures,
   };

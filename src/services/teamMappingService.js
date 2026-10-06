@@ -230,7 +230,7 @@ const grantServicePO = async (servicePOAdminUserId, managerUserId, servicePOId, 
 
   const grant = await managerServicePOMappingRepository.create({
     company_id: companyId,
-    manager_user_id: managerUserId,
+    manager_employee_id: managerUserId,
     service_po_id: servicePOId,
     status: 'active',
     created_by: actorId,
@@ -279,7 +279,7 @@ const getMyTeamServicePOGrants = async (servicePOAdminUserId, companyId) => {
   if (managerIds.length === 0) return [];
 
   const grants = await managerServicePOMappingRepository.findAllMappingsInCompany(companyId);
-  return grants.filter((g) => managerIds.includes(g.manager_user_id));
+  return grants.filter((g) => managerIds.includes(g.manager_employee_id));
 };
 
 module.exports = {

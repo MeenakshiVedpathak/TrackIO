@@ -1462,14 +1462,38 @@ const existsForHierarchyNodes = async (hierarchyNodeIds) => {
  * @param {object} transaction
  * @returns {Promise<number>} rows deleted
  */
-const deleteByEmployeeAndDateRange = async (employeeId, startDate, endDate, companyId, transaction) => {
+const deleteByEmployeeAndDateRange = async (employeeId, startDate, endDate, companyId, transaction, servicePOIds = null) => {
   return EmployeeWorkLog.destroy({
     where: {
       employee_id: employeeId,
       work_date: { [Op.gte]: startDate, [Op.lte]: endDate },
+      // Optional: a Project Manager's bulk upload may only replace the rows of the
+      // Service POs they manage — every other PO's rows for the month stay untouched.
+      ...(Array.isArray(servicePOIds) && { service_po_id: { [Op.in]: servicePOIds } }),
     },
     transaction,
   });
+};
+
+/**
+ * Total hours an employee already has in a date range on Service POs OTHER than
+ * the given ones — keeps the 176h monthly cap honest when a Project Manager's
+ * bulk upload replaces only their own POs' rows.
+ * @param {number} employeeId
+ * @param {string} startDate - "YYYY-MM-DD"
+ * @param {string} endDate - "YYYY-MM-DD"
+ * @param {number[]} excludedServicePOIds
+ * @returns {Promise<number>}
+ */
+const sumHoursInRangeExcludingPOs = async (employeeId, startDate, endDate, excludedServicePOIds) => {
+  const total = await EmployeeWorkLog.sum('hours', {
+    where: {
+      employee_id: employeeId,
+      work_date: { [Op.gte]: startDate, [Op.lte]: endDate },
+      ...(excludedServicePOIds.length > 0 && { service_po_id: { [Op.notIn]: excludedServicePOIds } }),
+    },
+  });
+  return Number(total) || 0;
 };
 
 /**
@@ -1499,7 +1523,9 @@ const hasSyncedEntriesInRange = async (employeeId, startDate, endDate, companyId
   const row = await EmployeeWorkLog.findOne({
     where: {
       employee_id: employeeId,
-      company_id: companyId,
+      // An Admin/Entity Admin carries no Business Unit of their own (companyId undefined/null
+      // here) — Sequelize rejects `company_id: undefined`, so they check across every BU.
+      ...(companyId != null && { company_id: companyId }),
       work_date: { [Op.gte]: startDate, [Op.lte]: endDate },
       status: 'synced',
     },
@@ -1687,6 +1713,7 @@ module.exports = {
   bulkCreate,
   deleteByEmployeeAndDate,
   deleteByEmployeeAndDateRange,
+  sumHoursInRangeExcludingPOs,
   hasSyncedEntriesInRange,
   update,
   deleteById,

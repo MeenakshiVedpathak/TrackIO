@@ -14,7 +14,12 @@ const employeeTimesheetService = require('../src/services/employeeTimesheetServi
 const employeeMonthlyWorkLogService = require('../src/services/employeeMonthlyWorkLogService');
 const managerMonthlyWorkLogService = require('../src/services/managerMonthlyWorkLogService');
 
+const employeeServicePOMappingService = require('../src/services/employeeServicePOMappingService');
+const employeeServicePOMappingRepository = require('../src/repositories/employeeServicePOMappingRepository');
+
 const ORIGINAL = {
+  getProjectManagerServicePOIds: employeeServicePOMappingService.getProjectManagerServicePOIds,
+  findByServicePOs: employeeServicePOMappingRepository.findByServicePOs,
   findByCode: employeeRepository.findByCode,
   findById: employeeRepository.findById,
   findByManager: managerEmployeeMappingRepository.findByManager,
@@ -24,6 +29,8 @@ const ORIGINAL = {
 };
 
 function restore() {
+  employeeServicePOMappingService.getProjectManagerServicePOIds = ORIGINAL.getProjectManagerServicePOIds;
+  employeeServicePOMappingRepository.findByServicePOs = ORIGINAL.findByServicePOs;
   employeeRepository.findByCode = ORIGINAL.findByCode;
   employeeRepository.findById = ORIGINAL.findById;
   managerEmployeeMappingRepository.findByManager = ORIGINAL.findByManager;
@@ -55,6 +62,8 @@ const PERIOD = { month: 1, year: 2025 };
 // doesn't reintroduce the BU-scoping bug already fixed in getMyEmployees), and Employee.findAll
 // resolves those mapped ids with no company/BU scoping at all.
 function stubPrimaryTeam(managerUserId, employees) {
+  // Not a Project Manager of any Service PO unless a test says otherwise (stubPmOnly).
+  employeeServicePOMappingService.getProjectManagerServicePOIds = async () => [];
   managerEmployeeMappingRepository.findByManager = async (calledManagerId) => {
     assert.equal(calledManagerId, managerUserId);
     return employees.map((e) => ({ employee_id: e.id, mapping_type: 'PRIMARY' }));
@@ -65,23 +74,57 @@ function stubPrimaryTeam(managerUserId, employees) {
   Employee.findAll = async () => employees;
 }
 
-test('Gate 1 rejects the whole file when a row\'s Employee Code is not one of the caller\'s PRIMARY-mapped Employees', async () => {
+test('a row for an Employee outside the caller\'s team and PM Service POs is SKIPPED with a warning, not a whole-file rejection', async () => {
   stubPrimaryTeam(42, [{ id: 1, employee_code: 'E999', status: 'active', is_deleted: false }]); // file uses E001, not E999
   let submitCalled = false;
   employeeMonthlyWorkLogService.submitMonthlyWorkLog = async () => { submitCalled = true; };
 
   const filePath = writeSheet([['E001', 'Alice', 'PO Alpha', 10, 'work']]);
+  const result = await managerMonthlyWorkLogService.bulkUploadMonthlyWorkLog(42, 10, filePath, PERIOD, 42, '127.0.0.1');
 
-  await assert.rejects(
-    () => managerMonthlyWorkLogService.bulkUploadMonthlyWorkLog(42, 10, filePath, PERIOD, 42, '127.0.0.1'),
-    (err) => {
-      assert.equal(err.statusCode, 422);
-      assert.equal(err.details.phase, 'ownership');
-      assert.equal(err.details.error_rows.length, 1);
-      return true;
-    }
-  );
+  assert.equal(result.employees_processed, 0);
+  assert.equal(result.rows_skipped, 1);
+  assert.equal(result.skipped[0].employee_code, 'E001');
   assert.equal(submitCalled, false);
+});
+
+// Project Manager route — no Team Lead / Primary Manager mapping at all, only
+// is_project_manager = true on specific Service POs.
+function stubPmOnly(pmPoIds, mappedEmployees) {
+  managerEmployeeMappingRepository.findByManager = async () => []; // no PRIMARY mappings
+  employeeServicePOMappingService.getProjectManagerServicePOIds = async () => pmPoIds;
+  employeeServicePOMappingRepository.findByServicePOs = async () => mappedEmployees.map((e) => ({ employee_id: e.id }));
+  Employee.findAll = async () => mappedEmployees;
+}
+
+test('Project Manager (no Team Lead mapping): rows on POs they manage import; rows on other POs are skipped as warnings', async () => {
+  stubPmOnly([501], [{ id: 1, employee_code: 'E001', status: 'active', is_deleted: false }]);
+  employeeTimesheetService.loadMappedPOsWithHierarchy = async () => ({
+    mappedPOs: [
+      { id: 501, service_po_name: 'PO Alpha' },
+      { id: 502, service_po_name: 'PO Other' }, // employee is mapped here, but the caller is not its PM
+    ],
+    hierarchyRowsByPOId: new Map(),
+  });
+  const submitted = [];
+  employeeMonthlyWorkLogService.submitMonthlyWorkLog = async (employeeId, companyId, data, options) => {
+    submitted.push({ employeeId, data, options });
+    return {};
+  };
+
+  const filePath = writeSheet([
+    ['E001', 'Alice', 'PO Alpha', 10, 'mine'],
+    ['E001', 'Alice', 'PO Other', 20, 'not mine'],
+  ]);
+  const result = await managerMonthlyWorkLogService.bulkUploadMonthlyWorkLog(42, 10, filePath, PERIOD, 42, '127.0.0.1');
+
+  assert.equal(result.employees_processed, 1);
+  assert.equal(result.total_rows, 1);
+  assert.equal(result.rows_skipped, 1);
+  assert.match(result.skipped[0].reason, /not the Project Manager of Service PO "PO Other"/);
+  assert.deepEqual(submitted[0].data.entries.map((e) => e.service_po_id), [501]);
+  // Only the PM's own POs may be replaced — never the employee's other projects' hours.
+  assert.deepEqual(submitted[0].options.scopeServicePOIds, [501]);
 });
 
 // Regression coverage for the bug this fixed: resolving a row's Employee Code must NEVER be
@@ -260,4 +303,109 @@ test('Admin-tier caller bypasses the PRIMARY-manager ownership gate entirely', a
 
   assert.equal(result.employees_processed, 1);
   assert.equal(mappingLookupCalled, false);
+});
+
+// Manual single-employee form: a Project Manager may only log against POs they manage.
+const managerSelfServiceService = require('../src/services/managerSelfServiceService');
+
+test('manual submit: Project Manager logging against a PO they do not manage is rejected (403) and nothing is written', async () => {
+  const origAssert = managerSelfServiceService.assertOwnEmployeeForApproval;
+  managerSelfServiceService.assertOwnEmployeeForApproval = async () => [501]; // PM scope
+  require('../src/services/companyAccessControlService').resolveCentralisedServicePOTenant = async () => ({});
+  require('../src/repositories/servicePORepository').getActiveCentralisedPOIds = async () => [];
+  employeeServicePOMappingService.getProjectManagerServicePOIds = async () => [501];
+  let submitCalled = false;
+  employeeMonthlyWorkLogService.submitMonthlyWorkLog = async () => { submitCalled = true; };
+  try {
+    await assert.rejects(
+      () => managerMonthlyWorkLogService.submitMonthlyWorkLogForEmployee(
+        42, 1, 10, { month: 1, year: 2025, entries: [{ service_po_id: 502, hours: 5 }] }, 42, '127.0.0.1', 6
+      ),
+      (err) => err.statusCode === 403
+    );
+    assert.equal(submitCalled, false);
+  } finally {
+    managerSelfServiceService.assertOwnEmployeeForApproval = origAssert;
+  }
+});
+
+test('manual submit: Project Manager on their own PO is allowed and only that PO is replaced', async () => {
+  const origAssert = managerSelfServiceService.assertOwnEmployeeForApproval;
+  managerSelfServiceService.assertOwnEmployeeForApproval = async () => [501];
+  require('../src/services/companyAccessControlService').resolveCentralisedServicePOTenant = async () => ({});
+  require('../src/repositories/servicePORepository').getActiveCentralisedPOIds = async () => [];
+  employeeServicePOMappingService.getProjectManagerServicePOIds = async () => [501];
+  let opts;
+  employeeMonthlyWorkLogService.submitMonthlyWorkLog = async (e, c, d, o) => { opts = o; return {}; };
+  try {
+    await managerMonthlyWorkLogService.submitMonthlyWorkLogForEmployee(
+      42, 1, 10, { month: 1, year: 2025, entries: [{ service_po_id: 501, hours: 5 }] }, 42, '127.0.0.1', 6
+    );
+    assert.deepEqual(opts.scopeServicePOIds, [501]);
+  } finally {
+    managerSelfServiceService.assertOwnEmployeeForApproval = origAssert;
+  }
+});
+
+test('Project Manager GET/submit response lists only their managed POs + Centralised POs', async () => {
+  const cas = require('../src/services/companyAccessControlService');
+  const spr = require('../src/repositories/servicePORepository');
+  const orig = { assert: managerSelfServiceService.assertOwnEmployeeForApproval, tenant: cas.resolveCentralisedServicePOTenant, cent: spr.getActiveCentralisedPOIds, get: employeeMonthlyWorkLogService.getMonthlyWorkLog };
+  managerSelfServiceService.assertOwnEmployeeForApproval = async () => [501];
+  require('../src/services/companyAccessControlService').resolveCentralisedServicePOTenant = async () => ({});
+  require('../src/repositories/servicePORepository').getActiveCentralisedPOIds = async () => [];
+  employeeServicePOMappingService.getProjectManagerServicePOIds = async () => [501];
+  cas.resolveCentralisedServicePOTenant = async () => ({});
+  spr.getActiveCentralisedPOIds = async () => [{ id: 56 }]; // Leaves
+  employeeMonthlyWorkLogService.getMonthlyWorkLog = async () => ({
+    month: 9, year: 2026,
+    service_pos: [{ service_po_id: 501 }, { service_po_id: 186 }, { service_po_id: 56 }],
+  });
+  try {
+    const dto = await managerMonthlyWorkLogService.getMonthlyWorkLogForEmployee(42, 1, 10, 9, 2026, 6);
+    assert.deepEqual(dto.service_pos.map((p) => p.service_po_id), [501, 56]);
+  } finally {
+    managerSelfServiceService.assertOwnEmployeeForApproval = orig.assert;
+    cas.resolveCentralisedServicePOTenant = orig.tenant;
+    spr.getActiveCentralisedPOIds = orig.cent;
+    employeeMonthlyWorkLogService.getMonthlyWorkLog = orig.get;
+  }
+});
+
+test('BU Admin import: PO from another BU is skipped with a warning; centralised and BU-less (Admin) POs are allowed', async () => {
+  const { Company, ServicePO } = require('../src/models');
+  const orig = { cFind: Company.findAll, pFind: ServicePO.findAll, byCode: employeeRepository.findByCode, byId: employeeRepository.findById };
+  Company.findAll = async () => []; // no Sub-BUs
+  employeeRepository.findByCode = async () => ({ id: 1, employee_code: 'E001', status: 'active', is_deleted: false });
+  employeeRepository.findById = async () => ({ id: 1 });
+  employeeTimesheetService.loadMappedPOsWithHierarchy = async () => ({
+    mappedPOs: [
+      { id: 601, service_po_name: 'My BU PO' },
+      { id: 602, service_po_name: 'Other BU PO' },
+      { id: 603, service_po_name: 'Centralised PO' },
+      { id: 604, service_po_name: 'Admin PO' },
+    ],
+    hierarchyRowsByPOId: new Map(),
+  });
+  ServicePO.findAll = async () => [
+    { id: 601, company_id: 10, is_centralised: false },
+    { id: 602, company_id: 99, is_centralised: false },
+    { id: 603, company_id: 99, is_centralised: true },
+    { id: 604, company_id: null, is_centralised: false },
+  ];
+  let submitted;
+  employeeMonthlyWorkLogService.submitMonthlyWorkLog = async (e, c, d) => { submitted = d.entries.map((x) => x.service_po_id); return {}; };
+  try {
+    const filePath = writeSheet([
+      ['E001', 'Alice', 'My BU PO', 1, ''], ['E001', 'Alice', 'Other BU PO', 2, ''],
+      ['E001', 'Alice', 'Centralised PO', 3, ''], ['E001', 'Alice', 'Admin PO', 4, ''],
+    ]);
+    const result = await managerMonthlyWorkLogService.bulkUploadMonthlyWorkLog(42, 10, filePath, PERIOD, 42, '127.0.0.1', 4, [10]);
+    assert.deepEqual(submitted.sort(), [601, 603, 604]);
+    assert.equal(result.rows_skipped, 1);
+    assert.match(result.skipped[0].reason, /"Other BU PO" is not from this Business Unit/);
+  } finally {
+    Company.findAll = orig.cFind; ServicePO.findAll = orig.pFind;
+    employeeRepository.findByCode = orig.byCode; employeeRepository.findById = orig.byId;
+  }
 });

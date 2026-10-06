@@ -225,6 +225,12 @@ const getAll = async (query = {}, authContext, headerCompanyId = null) => {
   // Project Manager/Delivery Head this has no visible effect — their
   // mappedServicePOIds override replaces companyId/centralisedOwnerIds
   // entirely regardless (see this function's own doc comment).
+  // A specific Business Unit filter (businessUnitIds / company_ids) means a STRICT
+  // company_id IN (selected) match: BU-less rows (Centralised POs, "No Business Unit" POs, the
+  // actor's own unassigned POs) belong to no Business Unit, so they must not appear under one.
+  // They stay visible in the unfiltered "All Business Units" view.
+  const hasBuFilter = (parseIdList(query.businessUnitIds) || []).length > 0
+    || (parseIdList(query.company_ids) || []).length > 0;
   if (Array.isArray(companyId)) {
     // entityIds/businessUnitIds (camelCase, matching the Report endpoints'
     // convention) and company_ids (snake_case, matching this endpoint's own
@@ -254,14 +260,15 @@ const getAll = async (query = {}, authContext, headerCompanyId = null) => {
     // PO(s) created with no Business Unit assigned yet (company_id NULL) —
     // see servicePORepository.companyScope()'s doc comment. No-op for a
     // BU-scoped actor (companyId a plain number there, never an array).
-    createdBy: authContext.employeeId,
+    createdBy: hasBuFilter ? null : authContext.employeeId,
     // Widens the list to this actor's own tenant's Centralised POs
     // (company_id NULL) — see resolveCentralisedOwnerIds()'s doc comment.
-    centralisedOwnerIds: await resolveCentralisedOwnerIds(companyId),
+    // All three BU-less widenings are skipped under a specific BU filter (see hasBuFilter).
+    centralisedOwnerIds: hasBuFilter ? null : await resolveCentralisedOwnerIds(companyId),
     // Centralised POs of this actor's OWN Admin tenant only — never every
     // Centralised PO on the platform (see companyAccessControlService.
     // resolveCentralisedServicePOTenant()).
-    centralisedTenant: await resolveCentralisedServicePOTenant(companyId, authContext.employeeId),
+    centralisedTenant: hasBuFilter ? null : await resolveCentralisedServicePOTenant(companyId, authContext.employeeId),
     // For a Project Manager/Delivery Head, REPLACES companyId/
     // centralisedOwnerIds above entirely with this actor's own individually-
     // mapped POs (see resolveIndividuallyMappedServicePOIds()'s doc

@@ -226,7 +226,9 @@ const authenticateIdentity = async (req, res, next) => {
     // Role-wise BU unmapping: a BU unmapped "as Project Manager" (etc.) stays mapped for the BU
     // Admin role, but is hidden from every session whose active role it was excluded for.
     const excludedBuIds = new Set(
-      await employeeBusinessUnitRoleExclusionRepository.findExcludedBuIdsForRoles(employee.id, roleIds)
+      // Any exclusion row hides the BU from EVERY session (BU Admin included) — it matches what the
+      // Role & BU Mapping screen shows as unmapped.
+      await employeeBusinessUnitRoleExclusionRepository.findExcludedBuIdsForEmployee(employee.id)
     );
     const activeBusinessUnits = getActiveBusinessUnits(employee).filter((bu) => !excludedBuIds.has(bu.id));
 

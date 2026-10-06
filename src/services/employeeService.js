@@ -588,7 +588,8 @@ const getBusinessUnits = async (id, authContext) => {
   // Role-wise BU unmapping — for a self lookup (the BU switcher) hide BUs unmapped for the
   // session's active role; a BU Admin session has no exclusions and so keeps every BU.
   const hiddenBuIds = id === authContext.employeeId
-    ? new Set(await employeeBusinessUnitRoleExclusionRepository.findExcludedBuIdsForRoles(employee.id, authContext.activeRoleIds || []))
+    // any exclusion row hides the BU, whichever role the session uses (BU Admin included)
+    ? new Set(await employeeBusinessUnitRoleExclusionRepository.findExcludedBuIdsForEmployee(employee.id))
     : new Set();
   const explicitBUs = allExplicitBUs.filter((bu) => !hiddenBuIds.has(bu.id));
 

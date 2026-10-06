@@ -46,7 +46,7 @@ const getMonthly = async (req, res, next) => {
 
 /**
  * POST /my-team/employees/:employeeId/monthly-worklog
- * PUT  /my-team/employees/:employeeId/monthly-worklog
+ * PUT /my-team/employees/:employeeId/monthly-worklog
  * Same handler for both — REPLACE SAVE / upsert semantics (see
  * managerMonthlyWorkLogService.submitMonthlyWorkLogForEmployee).
  */
@@ -102,10 +102,16 @@ const bulkUpload = async (req, res, next) => {
       req.hierarchyRank,
       callerBuIds(req)
     );
-    const message = result.employees_failed > 0
-      ? `Upload finished with errors. ${result.employees_processed} employee(s) updated, ${result.employees_failed} employee(s) failed — see "failures" for details.`
-      : `Upload complete. ${result.employees_processed} employee(s) updated, ${result.total_rows} entries saved and approved.`;
-    return sendSuccess(res, result, message);
+    let message;
+    if (result.employees_failed > 0) {
+      message = `Upload finished with errors. ${result.employees_processed} employee(s) updated, ${result.employees_failed} employee(s) failed — see "failures" for details.`;
+    } else if (result.rows_skipped > 0) {
+      message = `Upload complete with warnings. ${result.employees_processed} employee(s) updated, ${result.total_rows} entries saved and approved; ${result.rows_skipped} row(s) skipped — see "skipped" for details.`;
+    } else {
+      message = `Upload complete. ${result.employees_processed} employee(s) updated, ${result.total_rows} entries saved and approved.`;
+    }
+    // `warning: true` lets the client show a warning (not a success/error) toast when rows were skipped.
+    return sendSuccess(res, { ...result, warning: result.rows_skipped > 0 }, message);
   } catch (err) {
     if (err.statusCode === 422 && err.details) {
       return res.status(422).json({

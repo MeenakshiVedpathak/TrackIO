@@ -111,10 +111,14 @@ const getMonthlyWorkLog = async (employeeId, companyId, month, year) => {
  *   line carrying hierarchy_node_id ("Main PO" only — the Manager path
  *   can't yet drill into a Parent/Child hierarchy node; may be lifted
  *   later). Defaults to true (Employee self-service is unrestricted).
+ * @param {number[]|null} [options.scopeServicePOIds] - when given, only the month's rows
+ *   on THESE Service POs are replaced (rows on every other PO are kept, and count
+ *   towards the monthly cap) — a Project Manager's bulk upload covers only the POs
+ *   they manage, so it must never wipe the employee's other projects' hours.
  * @returns {Promise<object>} same shape as getMonthlyWorkLog
  */
 const submitMonthlyWorkLog = async (employeeId, companyId, data, options = {}) => {
-  const { creatorId = employeeId, forceApproved = false, allowHierarchyNode = true } = options;
+  const { creatorId = employeeId, forceApproved = false, allowHierarchyNode = true, scopeServicePOIds = null } = options;
   const month = parseInt(data.month, 10);
   const year = parseInt(data.year, 10);
   const lines = data.entries || [];
@@ -169,7 +173,10 @@ const submitMonthlyWorkLog = async (employeeId, companyId, data, options = {}) =
     seenKeys.add(key);
   }
 
-  const totalHours = lines.reduce((sum, line) => sum + parseFloat(line.hours), 0);
+  const keptHours = Array.isArray(scopeServicePOIds)
+    ? await employeeWorkLogRepository.sumHoursInRangeExcludingPOs(employeeId, startDate, endDate, scopeServicePOIds)
+    : 0;
+  const totalHours = keptHours + lines.reduce((sum, line) => sum + parseFloat(line.hours), 0);
   if (totalHours > MONTHLY_HOUR_CAP) {
     throw badRequestError(
       `Total hours for this month cannot exceed ${MONTHLY_HOUR_CAP}. This request totals ${Math.round(totalHours * 100) / 100} hours.`
@@ -195,7 +202,7 @@ const submitMonthlyWorkLog = async (employeeId, companyId, data, options = {}) =
   }
 
   const insertedRows = await sequelize.transaction(async (transaction) => {
-    await employeeWorkLogRepository.deleteByEmployeeAndDateRange(employeeId, startDate, endDate, companyId, transaction);
+    await employeeWorkLogRepository.deleteByEmployeeAndDateRange(employeeId, startDate, endDate, companyId, transaction, scopeServicePOIds);
 
     return employeeWorkLogRepository.bulkCreate(
       resolvedLines.map(({ line, po }) => ({

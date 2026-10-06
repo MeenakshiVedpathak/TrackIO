@@ -241,6 +241,24 @@ const getMyGrantedServicePOs = async (managerUserId, companyId, hierarchyRank = 
     });
   }
 
+  if (hierarchyRank === PROJECT_MANAGER_RANK) {
+    // A Project Manager's own Service POs are the ones they are the explicit PM of
+    // (employee_servicepo_mapping.is_project_manager = true) — they hold no
+    // manager_servicepo_mappings grants — plus their own Admin tenant's Centralised POs
+    // (Leaves/On Bench/etc.). Same definition Timesheet Approval and the Monthly Work Log use.
+    const ownPoIds = await employeeServicePOMappingService.getProjectManagerServicePOIds(managerUserId);
+    const tenantSeedIds = callerBuIds.length > 0 ? callerBuIds : [companyId].filter(Boolean);
+    const centralisedPOs = await servicePORepository.getActiveCentralisedPOIds(
+      await resolveCentralisedServicePOTenant(tenantSeedIds, managerUserId)
+    );
+    const poIds = [...new Set([...ownPoIds, ...centralisedPOs.map((po) => po.id)])];
+    if (poIds.length === 0) return [];
+    return ServicePO.findAll({
+      where: { id: poIds, is_deleted: false },
+      attributes: ['id', 'service_po_code', 'service_po_name', 'status'],
+    });
+  }
+
   const grants = await managerServicePOMappingRepository.findByManager(managerUserId, companyId);
   if (grants.length === 0) return [];
 
@@ -478,6 +496,16 @@ const assignServicePOToEmployee = async (managerUserId, employeeId, servicePOId,
  * @returns {Promise<EmployeeServicePOMapping[]>}
  */
 const getEmployeeServicePOs = async (managerUserId, employeeId, companyId, hierarchyRank = null, callerBuIds = []) => {
+  if (hierarchyRank === PROJECT_MANAGER_RANK) {
+    // A Project Manager's "my Employee" is Service-PO-based (the same rule GET
+    // /my-team/employees lists them by), not a manager_employee_mappings row — and they see
+    // only the Employee's POs they manage (plus Centralised), never the whole list.
+    const allowedPoIds = await assertOwnEmployeeForApproval(managerUserId, employeeId, companyId, hierarchyRank, callerBuIds);
+    const mappings = await employeeServicePOMappingRepository.findByEmployee(employeeId, companyId);
+    const allowed = new Set(allowedPoIds.map(Number));
+    return mappings.filter((m) => allowed.has(Number(m.service_po_id)));
+  }
+
   await assertOwnEmployee(managerUserId, employeeId, companyId, hierarchyRank, callerBuIds);
 
   return employeeServicePOMappingRepository.findByEmployee(employeeId, companyId);

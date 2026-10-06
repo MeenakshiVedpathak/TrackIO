@@ -44,6 +44,21 @@ const findExcludedBuIdsForRoles = async (employeeId, roleIds) => {
   return rows.map((row) => row.business_unit_id);
 };
 
+/**
+ * BU ids with ANY role exclusion for one Employee — an unmapped BU is unmapped for every role,
+ * the BU Admin role included (same rule the Role & BU Mapping screen shows). @returns {Promise<number[]>}
+ */
+const findExcludedBuIdsForEmployee = async (employeeId) => {
+  const rows = await safeRead(() =>
+    EmployeeBusinessUnitRoleExclusion.findAll({
+      where: { employee_id: employeeId },
+      attributes: ['business_unit_id'],
+      raw: true,
+    })
+  );
+  return [...new Set(rows.map((row) => row.business_unit_id))];
+};
+
 const addExclusions = async (employeeId, businessUnitIds, roleIds, actorId, transaction) => {
   const rows = businessUnitIds.flatMap((buId) =>
     roleIds.map((roleId) => ({ employee_id: employeeId, business_unit_id: buId, role_id: roleId, created_by: actorId }))
@@ -60,4 +75,4 @@ const clearForBusinessUnits = async (employeeId, businessUnitIds, transaction) =
   });
 };
 
-module.exports = { findByEmployeeIds, findExcludedBuIdsForRoles, addExclusions, clearForBusinessUnits };
+module.exports = { findByEmployeeIds, findExcludedBuIdsForRoles, findExcludedBuIdsForEmployee, addExclusions, clearForBusinessUnits };

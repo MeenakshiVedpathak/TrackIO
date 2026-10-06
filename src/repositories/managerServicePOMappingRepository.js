@@ -39,7 +39,7 @@ const findAllMappingsInCompany = async (companyId) => {
 const findByManager = async (managerUserId, companyId) => {
   const companyWhere = Array.isArray(companyId) ? { [Op.in]: companyId } : companyId;
   return ManagerServicePOMapping.findAll({
-    where: { manager_user_id: managerUserId, company_id: companyWhere, status: 'active' },
+    where: { manager_employee_id: managerUserId, company_id: companyWhere, status: 'active' },
   });
 };
 
@@ -54,7 +54,7 @@ const findByManager = async (managerUserId, companyId) => {
  */
 const findByManagerAndServicePO = async (managerUserId, servicePOId, companyId) => {
   return ManagerServicePOMapping.findOne({
-    where: { manager_user_id: managerUserId, service_po_id: servicePOId, company_id: companyId, status: 'active' },
+    where: { manager_employee_id: managerUserId, service_po_id: servicePOId, company_id: companyId, status: 'active' },
   });
 };
 
