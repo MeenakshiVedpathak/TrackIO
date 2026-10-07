@@ -241,6 +241,14 @@ const findAll = async (filters = {}, pagination = {}, sort = {}) => {
         { '$client.client_name$': { [Op.iLike]: term } },
         { '$project.project_name$': { [Op.iLike]: term } },
         { '$serviceType.service_type_name$': { [Op.iLike]: term } },
+        // "Created By" column — matched on the creator's name directly. Before this, a search by
+        // a person's name only matched POs where they were the assigned Project Manager, so a PO
+        // they created but don't manage was silently missing from the results.
+        literal(`EXISTS (
+          SELECT 1 FROM employees cb_search_e
+          WHERE cb_search_e.id = "ServicePO"."created_by"
+            AND cb_search_e.full_name ILIKE ${sequelize.escape(term)}
+        )`),
         literal(`EXISTS (
           SELECT 1 FROM employee_servicepo_mapping pm_search_m
           INNER JOIN employees pm_search_e ON pm_search_e.id = pm_search_m.employee_id AND pm_search_e.is_deleted = false
