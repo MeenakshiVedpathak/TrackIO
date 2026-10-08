@@ -310,7 +310,7 @@ function parseWorkLogFile(filePath) {
  * any DB lookup. Employee Code, Employee Name, Service PO Name, Hours are
  * required; Description is optional.
  */
-function validateRowShape(raw) {
+function validateRowShape(raw, monthlyHourCap) {
   const errors = [];
   const data = {};
 
@@ -332,8 +332,8 @@ function validateRowShape(raw) {
     const hours = parseFloat(String(raw.hours));
     if (isNaN(hours) || hours <= 0) {
       errors.push('Hours must be a positive number.');
-    } else if (hours > employeeMonthlyWorkLogService.MONTHLY_HOUR_CAP) {
-      errors.push(`Hours cannot exceed ${employeeMonthlyWorkLogService.MONTHLY_HOUR_CAP} per month.`);
+    } else if (hours > monthlyHourCap) {
+      errors.push(`Hours cannot exceed ${monthlyHourCap} per month.`);
     } else {
       data.hours = hours;
     }
@@ -380,7 +380,7 @@ const bulkUploadMonthlyWorkLog = async (managerUserId, companyId, filePath, peri
   const shapeErrors = [];
   const shapedRows = [];
   for (const raw of rawRows) {
-    const { errors, data } = validateRowShape(raw);
+    const { errors, data } = validateRowShape(raw, employeeMonthlyWorkLogService.getMonthlyHourCap(month, year));
     if (errors.length) shapeErrors.push({ row: raw._rowNum, errors });
     else shapedRows.push({ row: raw._rowNum, ...data });
   }
@@ -428,7 +428,11 @@ const bulkUploadMonthlyWorkLog = async (managerUserId, companyId, filePath, peri
     // Employee actively mapped to a Service PO the caller is the explicit PM of
     // (is_project_manager = true) is in scope for THAT PO's rows only.
     const pmPoIds = await employeeServicePOMappingService.getProjectManagerServicePOIds(managerUserId);
-    pmPoIdSet = new Set(pmPoIds.map(Number));
+    // POs a PM-route Employee may be logged against: the PM's own POs plus their Admin
+    // tenant's Centralised POs (Leaves/On Bench/etc.) — same set the single-Employee form
+    // uses (resolveProjectManagerPoIds). Centralised POs only widen WHICH POs; they never
+    // widen WHICH Employees are in scope (those still come from the PM's own POs below).
+    pmPoIdSet = new Set(await resolveProjectManagerPoIds(managerUserId, companyId, callerBuIds));
     if (pmPoIds.length > 0) {
       const pmMappings = await employeeServicePOMappingRepository.findByServicePOs(pmPoIds, 'active');
       const pmEmployeeIds = [...new Set(pmMappings.map((m) => m.employee_id))];

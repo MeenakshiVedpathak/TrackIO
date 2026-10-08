@@ -21,11 +21,11 @@ const managerMonthlyEntryLineSchema = Joi.object({
     'number.base': 'Service PO must be a number.',
   }),
   sub_project_id: Joi.number().integer().positive().optional().allow(null),
-  hours: Joi.number().positive().max(176).required().messages({
+  hours: Joi.number().positive().max(744).required().messages({
     'any.required': 'Hours is required.',
     'number.base': 'Hours must be a number.',
     'number.positive': 'Hours must be greater than 0.',
-    'number.max': 'Hours cannot exceed 176 per month.',
+    'number.max': 'Hours cannot exceed 744 per month.',
   }),
   description: Joi.string().trim().max(2000).allow('').optional().messages({
     'string.max': 'Description cannot exceed 2000 characters.',

@@ -69,7 +69,7 @@ const dailyEntryLineSchema = Joi.object({
   time_entries: Joi.array().items(timeEntrySchema).min(1).optional().messages({
     'array.min': 'time_entries must contain at least one entry.',
   }),
-  hours: Joi.number().positive().max(12).when('time_entries', {
+  hours: Joi.number().positive().max(24).when('time_entries', {
     is: Joi.array().min(1).required(),
     then: Joi.optional(),
     otherwise: Joi.required(),
@@ -77,7 +77,7 @@ const dailyEntryLineSchema = Joi.object({
     'any.required': 'Hours is required.',
     'number.base': 'Hours must be a number.',
     'number.positive': 'Hours must be greater than 0.',
-    'number.max': 'Hours cannot exceed 12 per day.',
+    'number.max': 'Hours cannot exceed 24 per day.',
   }),
   // Required for a plain HOURLY line (no time_entries) — unchanged. Fully
   // optional (including blank) for a TIME_BASED line: each segment may
@@ -100,7 +100,7 @@ const dailyEntryLineSchema = Joi.object({
  * one employee/date — the service layer deletes every existing entry for
  * that date and reinserts exactly this list, in one transaction. An empty
  * `entries` array is valid — it means "clear this date's timesheet
- * entirely." The 12-hour/day cap is validated at the service layer against
+ * entirely." The 24-hour/day cap is validated at the service layer against
  * the SUM of this array's `hours`, not per line.
  */
 const replaceDailyEntriesSchema = Joi.object({
@@ -131,9 +131,9 @@ const updateEntrySchema = Joi.object({
   time_entries: Joi.array().items(timeEntrySchema).optional().messages({
     'array.base': 'time_entries must be an array.',
   }),
-  hours: Joi.number().positive().max(12).optional().messages({
+  hours: Joi.number().positive().max(24).optional().messages({
     'number.positive': 'Hours must be greater than 0.',
-    'number.max': 'Hours cannot exceed 12 per day.',
+    'number.max': 'Hours cannot exceed 24 per day.',
   }),
   description: Joi.string().trim().max(2000).allow('').optional().messages({
     'string.max': 'Description cannot exceed 2000 characters.',

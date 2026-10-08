@@ -38,7 +38,7 @@ const frontendConfig = require('../config/frontend.config');
  * by the same logic the Excel import already uses.
  */
 
-const DAILY_HOUR_CAP = 12;
+const DAILY_HOUR_CAP = 24;
 
 function forbiddenError(message) {
   const err = new Error(message);
@@ -387,7 +387,7 @@ function resolveHoursAndTimeEntries(line) {
 }
 
 /**
- * 12-hours/day cap — sums this employee's work_logs on one date (excluding
+ * 24-hours/day cap — sums this employee's work_logs on one date (excluding
  * the row being updated, if any) and rejects if the requested hours would
  * push the day's total over DAILY_HOUR_CAP.
  */

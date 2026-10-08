@@ -117,11 +117,11 @@ module.exports = (sequelize) => {
           notNull: { msg: 'Hours is required.' },
           min: { args: [0.01], msg: 'Hours must be greater than 0.' },
           // Daily rows (log_type: 'daily', the column default) keep the
-          // original 12-hours/day ceiling exactly as before; Monthly rows
-          // (log_type: 'monthly') allow up to the 176-hour monthly cap
-          // (see employeeMonthlyWorkLogService.MONTHLY_HOUR_CAP).
+          // 24-hours/day ceiling; Monthly rows (log_type: 'monthly') allow up
+          // to 744 (31 days x 24h) here — the exact days-in-month x 24 cap is
+          // enforced in employeeMonthlyWorkLogService.getMonthlyHourCap.
           isWithinLogTypeCap(value) {
-            const cap = this.log_type === 'monthly' ? 176 : 12;
+            const cap = this.log_type === 'monthly' ? 744 : 24;
             if (parseFloat(value) > cap) {
               throw new Error(`Hours cannot exceed ${cap} for a ${this.log_type || 'daily'} entry.`);
             }

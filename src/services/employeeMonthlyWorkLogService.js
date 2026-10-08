@@ -32,7 +32,13 @@ const logger = require('../utils/logger');
  * Same rule for deleteMonthlyWorkLog.
  */
 
-const MONTHLY_HOUR_CAP = 176;
+/**
+ * Monthly cap = every calendar day of the month x 24h. Weekends and holidays
+ * count as ordinary days (an employee may log on them), so no holiday lookup.
+ */
+function getMonthlyHourCap(month, year) {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate() * 24;
+}
 
 function badRequestError(message) {
   const err = new Error(message);
@@ -177,9 +183,10 @@ const submitMonthlyWorkLog = async (employeeId, companyId, data, options = {}) =
     ? await employeeWorkLogRepository.sumHoursInRangeExcludingPOs(employeeId, startDate, endDate, scopeServicePOIds)
     : 0;
   const totalHours = keptHours + lines.reduce((sum, line) => sum + parseFloat(line.hours), 0);
-  if (totalHours > MONTHLY_HOUR_CAP) {
+  const monthlyHourCap = getMonthlyHourCap(month, year);
+  if (totalHours > monthlyHourCap) {
     throw badRequestError(
-      `Total hours for this month cannot exceed ${MONTHLY_HOUR_CAP}. This request totals ${Math.round(totalHours * 100) / 100} hours.`
+      `Total hours for this month cannot exceed ${monthlyHourCap}. This request totals ${Math.round(totalHours * 100) / 100} hours.`
     );
   }
 
@@ -285,5 +292,5 @@ module.exports = {
   getMonthlyWorkLog,
   submitMonthlyWorkLog,
   deleteMonthlyWorkLog,
-  MONTHLY_HOUR_CAP,
+  getMonthlyHourCap,
 };
