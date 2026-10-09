@@ -117,7 +117,9 @@ test('the caller\'s own record is never part of the team; empty team -> empty pa
 test('Project Manager: poScope = own Service POs + this tenant\'s Centralised POs', async () => {
   employeeServicePOMappingService.getProjectManagerServicePOIds = async () => [401, 402];
   employeeServicePOMappingRepository.findByServicePOs = async () => [{ employee_id: 21 }, { employee_id: 22 }];
-  Employee.findAll = async () => [employee(21, 'A'), employee(22, 'B')];
+  // 21 belongs to the PM's own BU 40; 22 belongs to another BU (cross-BU, only mapped to the PM's PO).
+  const inBu = (emp, buId) => ({ ...emp, businessUnits: [{ id: buId, company_name: `BU ${buId}`, entity_id: 1, entity: { entity_name: 'Ent' } }] });
+  Employee.findAll = async () => [inBu(employee(21, 'A'), 40), inBu(employee(22, 'B'), 99)];
   companyAccessControlService.resolveCentralisedServicePOTenant = async () => ({ companyIds: [40], ownerIds: [3] });
   servicePORepository.getActiveCentralisedPOIds = async () => [{ id: 52 }, { id: 56 }];
   const calls = captureBuckets([]);
@@ -125,7 +127,8 @@ test('Project Manager: poScope = own Service POs + this tenant\'s Centralised PO
   try {
     await managerSelfServiceService.getApprovalSummaryAll(99, [40], PROJECT_MANAGER_RANK, null, [40], {});
     assert.deepEqual(calls[0].employeeIds, [21, 22]);
-    assert.deepEqual(calls[0].poScope, { ownPoIds: [401, 402], centralisedPoIds: [52, 56] });
+    // Centralised hours only for the Employee who belongs to the PM's own BU (21), never the cross-BU one (22).
+    assert.deepEqual(calls[0].poScope, { ownPoIds: [401, 402], centralisedPoIds: [52, 56], centralisedMemberEmployeeIds: [21] });
   } finally {
     restore();
   }

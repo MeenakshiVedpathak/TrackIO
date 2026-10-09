@@ -1032,19 +1032,23 @@ const resubmitEntry = async (employeeId, companyId, id) => {
  * employee_id. This is how the Employee discovers which of their own
  * entries are 'rejected' (and why), and their ids for resubmit/delete.
  *
+ * Scoped to the Employee ONLY — never to the active session BU. A row's company_id mirrors
+ * its Service PO's owning BU, so a cross-BU-mapped Employee's entry on another BU's PO (and a
+ * rejected one they must fix and resubmit) carries a BU that is not their own; filtering by the
+ * session BU made such an entry vanish from this list while still showing in reports.
+ *
  * @param {number} employeeId
- * @param {number} companyId
+ * @param {number} _companyId - the caller's active BU, deliberately NOT used to filter
  * @param {object} query - startDate, endDate, status, poId, page, limit
  * @returns {Promise<{ data, meta }>}
  */
-const getEntries = async (employeeId, companyId, query) => {
+const getEntries = async (employeeId, _companyId, query) => {
   const page = parseInt(query.page, 10) || 1;
   const limit = parseInt(query.limit, 10) || 20;
 
   const { rows, count } = await employeeWorkLogRepository.findAll(
     {
       employeeId,
-      companyId,
       startDate: query.startDate,
       endDate: query.endDate,
       status: query.status,

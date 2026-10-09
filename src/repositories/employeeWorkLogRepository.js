@@ -63,9 +63,10 @@ function buildIncludes() {
  * its own Service PO's owning BU (not the caller's active session — see
  * employeeTimesheetService.js's write paths), a single date's lines can
  * legitimately span more than one BU for a cross-BU-mapped employee, and a
- * session-scoped lookup would silently miss the other BU's rows. Every OTHER
- * caller (getEntries, managerSelfServiceService.getTimesheets) still passes
- * a real companyId and keeps its existing BU-filtered behavior unchanged.
+ * session-scoped lookup would silently miss the other BU's rows. The Employee's OWN list
+ * (employeeTimesheetService.getEntries) passes no companyId for the same reason; only
+ * managerSelfServiceService.getTimesheets still passes a real companyId and keeps its existing
+ * BU-filtered behavior unchanged.
  * @param {object} filters - { employeeId, startDate, endDate, companyId?, status, poId, poIds?, subProjectId }
  * @param {object} pagination - { limit, offset }
  * @param {object} sort - { sortBy, sortOrder }
@@ -924,13 +925,33 @@ function buildApprovalSummaryBucketsBase({
   }
   if (startDate) { scopeConditions.push('wl.work_date >= :startDate'); replacements.startDate = startDate; }
   if (endDate) { scopeConditions.push('wl.work_date <= :endDate'); replacements.endDate = endDate; }
-  if (poScope) {
+  if (poScope && poScope.centralisedEmployeeIds) {
+    // BU Admin: own-BU Service PO rows always; Centralised-PO rows (Leave/Bench/...) ONLY for the
+    // Employees who belong to the admin's BU — never for a cross-BU Employee merely mapped to a PO.
+    const parts = [];
+    if (poScope.ownPoIds && poScope.ownPoIds.length > 0) {
+      replacements.ownPoIds = poScope.ownPoIds;
+      parts.push('wl.service_po_id IN (:ownPoIds)');
+    }
+    if (poScope.centralisedPoIds && poScope.centralisedPoIds.length > 0 && poScope.centralisedEmployeeIds.length > 0) {
+      replacements.centralisedPoIds = poScope.centralisedPoIds;
+      replacements.centralisedEmployeeIds = poScope.centralisedEmployeeIds;
+      parts.push('(wl.service_po_id IN (:centralisedPoIds) AND wl.employee_id IN (:centralisedEmployeeIds))');
+    }
+    if (parts.length === 0) return null;
+    scopeConditions.push(`(${parts.join(' OR ')})`);
+  } else if (poScope) {
     if (!poScope.ownPoIds || poScope.ownPoIds.length === 0) return null;
     replacements.ownPoIds = poScope.ownPoIds;
-    const centralised = poScope.centralisedPoIds && poScope.centralisedPoIds.length > 0;
+    // Project Manager: Centralised rows count only for Employees with real work on the PM's own POs
+    // AND (when given) who belong to the PM's own BUs — never a cross-BU Employee's Leave/Bench.
+    const memberIds = poScope.centralisedMemberEmployeeIds;
+    const centralised = poScope.centralisedPoIds && poScope.centralisedPoIds.length > 0
+      && (memberIds === undefined || memberIds.length > 0);
     if (centralised) replacements.centralisedPoIds = poScope.centralisedPoIds;
+    if (centralised && memberIds !== undefined) replacements.centralisedMemberEmployeeIds = memberIds;
     scopeConditions.push(centralised
-      ? `(wl.service_po_id IN (:ownPoIds) OR (wl.service_po_id IN (:centralisedPoIds) AND wl.employee_id IN (
+      ? `(wl.service_po_id IN (:ownPoIds) OR (wl.service_po_id IN (:centralisedPoIds)${memberIds !== undefined ? ' AND wl.employee_id IN (:centralisedMemberEmployeeIds)' : ''} AND wl.employee_id IN (
            SELECT own.employee_id FROM employee_work_logs own
            WHERE own.employee_id IN (:employeeIds) AND own.service_po_id IN (:ownPoIds))))`
       : 'wl.service_po_id IN (:ownPoIds)');

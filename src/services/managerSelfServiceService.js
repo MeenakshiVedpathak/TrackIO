@@ -10,7 +10,7 @@ const employeeServicePOMappingService = require('./employeeServicePOMappingServi
 const servicePORepository = require('../repositories/servicePORepository');
 const employeeWorkLogRepository = require('../repositories/employeeWorkLogRepository');
 const employeeRepository = require('../repositories/employeeRepository');
-const { resolveCentralisedServicePOTenant } = require('./companyAccessControlService');
+const { resolveCentralisedServicePOTenant, expandBusinessUnitIdsWithDescendants } = require('./companyAccessControlService');
 const { createAuditLog } = require('../middlewares/auditLog');
 const logger = require('../utils/logger');
 const { parseIdList } = require('../utils/idListParser');
@@ -56,6 +56,99 @@ function conflictError(message) {
   const err = new Error(message);
   err.statusCode = 409;
   return err;
+}
+
+/**
+ * The Service POs a BU Admin may approve hours against: every PO owned by their Business Units
+ * (and those BUs' Sub-BUs), plus their own tenant's Centralised POs (Leave/Bench/...) — which have
+ * no BU of their own, so their logs follow the Employee. `includeParents` also adds the Parent BU
+ * of a Sub-BU, because a PO created at the Parent level stamps its logs there while its Employees
+ * sit in the Sub-BU (see employeeWorkLogRepository.resolveSyncScope).
+ *
+ * `ownPoIds` is returned separately from `centralisedPoIds`: Centralised POs are auto-mapped to
+ * every employee, so they must never be used to decide which Employees are "mine".
+ *
+ * @param {number[]} buIds
+ * @param {number} managerUserId
+ * @param {{ includeParents?: boolean }} [options]
+ * @returns {Promise<{ ownPoIds: number[], centralisedPoIds: number[] }>}
+ */
+async function resolveBuAdminPoScope(buIds, managerUserId, { includeParents = false } = {}) {
+  const seed = [...new Set((buIds || []).map(Number).filter((id) => Number.isInteger(id) && id > 0))];
+  if (seed.length === 0) return { ownPoIds: [], centralisedPoIds: [] };
+
+  const children = await Company.findAll({ where: { parent_business_unit_id: { [Op.in]: seed } }, attributes: ['id'], raw: true });
+  const scope = new Set([...seed, ...children.map((child) => Number(child.id))]);
+  if (includeParents) {
+    const seeds = await Company.findAll({ where: { id: { [Op.in]: seed } }, attributes: ['parent_business_unit_id'], raw: true });
+    seeds.forEach((row) => { if (row.parent_business_unit_id != null) scope.add(Number(row.parent_business_unit_id)); });
+  }
+
+  const ownPOs = await ServicePO.findAll({ where: { company_id: { [Op.in]: [...scope] } }, attributes: ['id'], raw: true });
+  const centralisedPOs = await servicePORepository.getActiveCentralisedPOIds(
+    await resolveCentralisedServicePOTenant(seed, managerUserId)
+  );
+  return {
+    ownPoIds: ownPOs.map((po) => Number(po.id)),
+    centralisedPoIds: centralisedPOs.map((po) => Number(po.id)),
+  };
+}
+
+/**
+ * Is this Employee a member of one of the caller's own Business Units (or those BUs' Sub-BUs)?
+ * Decides whose Centralised-PO hours (Leave/Bench/...) a Project Manager may approve.
+ */
+async function isEmployeeInCallerBus(employeeId, companyId, callerBuIds = []) {
+  const scopeIds = callerBuIds.length > 0 ? callerBuIds : [companyId].filter(Boolean);
+  if (scopeIds.length === 0) return false;
+  const employee = await employeeRepository.findById(employeeId, scopeIds.length === 1 ? scopeIds[0] : scopeIds);
+  return !!employee;
+}
+
+/**
+ * What a BU Admin may approve for ONE Employee — throws 403 when the Employee is not theirs.
+ *
+ *  - Employee is a MEMBER of the admin's BU: the Service POs of the admin's BUs PLUS the tenant's
+ *    Centralised POs (Leave/Bench/Training/HR-Admin). A Centralised PO has no BU of its own, so
+ *    those hours follow the Employee's own BU.
+ *  - Employee is only MAPPED to a PO of the admin's BU (cross-BU resourcing, member of another
+ *    BU): ONLY that BU's own Service POs. Their Centralised-PO hours belong to their OWN BU's
+ *    admin (and their Project Manager) — never to the admin of the BU whose PO they happen to
+ *    work on. No cross-BU approval of Centralised hours.
+ *
+ * @returns {Promise<{ isMember: boolean, allowedPoIds: number[] }>}
+ */
+async function resolveBuAdminEmployeeScope(managerUserId, employeeId, companyId, callerBuIds = []) {
+  const scopeIds = callerBuIds.length > 0 ? callerBuIds : [companyId].filter(Boolean);
+  const { ownPoIds, centralisedPoIds } = await resolveBuAdminPoScope(scopeIds, managerUserId, { includeParents: true });
+
+  const employee = await employeeRepository.findById(employeeId, scopeIds.length === 1 ? scopeIds[0] : scopeIds);
+  const isMember = !!employee;
+  if (!isMember) {
+    // Not a member of this admin's BU — still theirs for their OWN BU's POs when actively mapped
+    // to (or having logged against) one of them.
+    const mappings = await employeeServicePOMappingRepository.findAllByEmployee(employeeId, 'active');
+    const mappedToOwnPO = mappings.some((mapping) => ownPoIds.includes(Number(mapping.service_po_id)));
+    const hasOwnPOWork = mappedToOwnPO || (ownPoIds.length > 0
+      && await employeeWorkLogRepository.existsForEmployeeAndServicePOIds(employeeId, ownPoIds));
+    if (!hasOwnPOWork) {
+      throw forbiddenError('This Employee is not one of your mapped Employees.');
+    }
+  }
+  return { isMember, allowedPoIds: isMember ? [...ownPoIds, ...centralisedPoIds] : [...ownPoIds] };
+}
+
+/**
+ * The PO-id restriction the Timesheet Approval single-employee list/bulk paths apply for a BU
+ * Admin caller (null for every other tier — Project Manager keeps getting its own list from
+ * assertOwnEmployeeForApproval).
+ */
+async function resolveBuAdminApprovalPoIds(managerUserId, companyId, hierarchyRank, callerBuIds = [], employeeId = null) {
+  if (hierarchyRank !== BU_ADMIN_RANK) return null;
+  const { allowedPoIds } = await resolveBuAdminEmployeeScope(managerUserId, employeeId, companyId, callerBuIds);
+  // The repository treats an EMPTY list as "no restriction" — nothing allowed must see nothing,
+  // so fail closed with a never-matching id.
+  return allowedPoIds.length > 0 ? allowedPoIds : [-1];
 }
 
 /**
@@ -173,7 +266,19 @@ const getMyEmployees = async (managerUserId, companyIds, hierarchyRank, explicit
     // query above had no mapping-based restriction at all) — always filter
     // by it, selected BU or not, exactly as before.
     const selectedBusinessUnits = new Set(companyIds || []);
-    return withMeta.filter((employee) => employee.business_unit_ids.some((id) => selectedBusinessUnits.has(id)));
+    // A BU Admin also approves hours on THEIR OWN BU's Service POs by Employees who belong to a
+    // different BU (cross-BU resourcing) — without this, nobody at the PO's own BU could ever see
+    // or approve those logs now that a BU Admin is limited to their own BU's POs.
+    let crossBuEmployeeIds = new Set();
+    if (hierarchyRank === BU_ADMIN_RANK) {
+      const { ownPoIds } = await resolveBuAdminPoScope(companyIds, managerUserId);
+      if (ownPoIds.length > 0) {
+        const mappedRows = await employeeServicePOMappingRepository.findByServicePOs(ownPoIds, 'active');
+        crossBuEmployeeIds = new Set(mappedRows.map((row) => row.employee_id));
+      }
+    }
+    return withMeta.filter((employee) => crossBuEmployeeIds.has(employee.id)
+      || employee.business_unit_ids.some((id) => selectedBusinessUnits.has(id)));
   }
 
   // Manager tier (Team Lead/Project Admin via manager_employee_mappings, or
@@ -383,10 +488,14 @@ async function assertOwnEmployeeForApproval(managerUserId, employeeId, companyId
   }
 
   if (hierarchyRank === BU_ADMIN_RANK) {
-    const scopeIds = callerBuIds.length > 0 ? callerBuIds : [companyId].filter(Boolean);
-    const employee = await employeeRepository.findById(employeeId, scopeIds.length === 1 ? scopeIds[0] : scopeIds);
-    if (!employee) {
-      throw forbiddenError('This Employee is not one of your mapped Employees.');
+    // A BU Admin approves hours logged against THEIR OWN Business Units' Service POs only —
+    // never another BU's — plus the Centralised-PO hours of Employees who belong to their BU (see
+    // resolveBuAdminEmployeeScope). Returns null (NOT the PO list) on purpose:
+    // managerMonthlyWorkLogService reads an array here as "this caller is a Project Manager"; the
+    // Timesheet Approval list/bulk paths get the list from resolveBuAdminApprovalPoIds() instead.
+    const { allowedPoIds } = await resolveBuAdminEmployeeScope(managerUserId, employeeId, companyId, callerBuIds);
+    if (servicePoId != null && !allowedPoIds.includes(Number(servicePoId))) {
+      throw forbiddenError('This work log entry does not belong to a Service PO your Business Unit may approve.');
     }
     return null;
   }
@@ -408,7 +517,11 @@ async function assertOwnEmployeeForApproval(managerUserId, employeeId, companyId
       // genuinely one of my own project's people, not a stranger's Leave
       // entry I happen to share a Centralised mapping with.
       const isCentralised = (await servicePORepository.findCentralisedIdsAmong([servicePoId])).length > 0;
+      // ...and ONLY when that Employee also belongs to one of the PM's OWN Business Units: a PM
+      // approves their own project's real work cross-BU, but a cross-BU Employee's Leave/Bench
+      // belongs to that Employee's own BU (their BU Admin / Project Manager) — no cross-BU approval.
       const isMyEmployee = isCentralised
+        && (await isEmployeeInCallerBus(employeeId, companyId, callerBuIds))
         && (await employeeWorkLogRepository.existsForEmployeeAndServicePOIds(employeeId, poIds));
       if (!isMyEmployee) {
         throw forbiddenError('This work log entry does not belong to a Service PO you manage.');
@@ -439,6 +552,11 @@ async function assertOwnEmployeeForApproval(managerUserId, employeeId, companyId
     // bulkApproveTimesheets) always further scopes by this SAME employeeId,
     // so this never leaks a different, unrelated employee's Centralised
     // entries.
+    // A cross-BU Employee (not a member of any of this PM's BUs) keeps their Centralised hours with
+    // their OWN BU's admin / Project Manager: the PM sees only the real POs they manage.
+    if (!(await isEmployeeInCallerBus(employeeId, companyId, callerBuIds))) {
+      return poIds;
+    }
     // Only this Project Manager's OWN Admin tenant's Centralised POs.
     const tenantSeedIds = callerBuIds.length > 0 ? callerBuIds : [companyId].filter(Boolean);
     const centralisedPOs = await servicePORepository.getActiveCentralisedPOIds(
@@ -552,7 +670,8 @@ const getTimesheets = async (managerUserId, employeeId, ownEmployeeId, companyId
   let poIds = null;
 
   if (employeeId) {
-    poIds = await assertOwnEmployeeForApproval(managerUserId, employeeId, companyId, hierarchyRank, callerBuIds);
+    poIds = await assertOwnEmployeeForApproval(managerUserId, employeeId, companyId, hierarchyRank, callerBuIds)
+      ?? await resolveBuAdminApprovalPoIds(managerUserId, companyId, hierarchyRank, callerBuIds, employeeId);
     targetEmployeeId = employeeId;
   } else {
     targetEmployeeId = ownEmployeeId;
@@ -695,7 +814,8 @@ const getApprovalSummary = async (managerUserId, employeeId, ownEmployeeId, comp
   let poIds = null;
 
   if (employeeId) {
-    poIds = await assertOwnEmployeeForApproval(managerUserId, employeeId, companyId, hierarchyRank, callerBuIds);
+    poIds = await assertOwnEmployeeForApproval(managerUserId, employeeId, companyId, hierarchyRank, callerBuIds)
+      ?? await resolveBuAdminApprovalPoIds(managerUserId, companyId, hierarchyRank, callerBuIds, employeeId);
     targetEmployeeId = employeeId;
   } else {
     targetEmployeeId = ownEmployeeId;
@@ -833,7 +953,36 @@ async function resolveApprovalSummaryTeamScope(managerUserId, companyIds, hierar
     const centralisedPOs = await servicePORepository.getActiveCentralisedPOIds(
       await resolveCentralisedServicePOTenant(callerBuIds, managerUserId)
     );
-    poScope = { ownPoIds, centralisedPoIds: centralisedPOs.map((po) => po.id) };
+    // Centralised hours (Leave/Bench/...) only for Employees who belong to the PM's own BUs — a
+    // cross-BU Employee's Centralised hours stay with their own BU (no cross-BU approval).
+    const pmReach = new Set((await expandBusinessUnitIdsWithDescendants(callerBuIds.length > 0 ? callerBuIds : companyIds)).map(Number));
+    const pmMemberEmployeeIds = team
+      .filter((employee) => (employee.business_unit_ids || []).some((id) => pmReach.has(Number(id))))
+      .map((employee) => employee.id);
+    poScope = {
+      ownPoIds,
+      centralisedPoIds: centralisedPOs.map((po) => po.id),
+      centralisedMemberEmployeeIds: employeeIds.filter((id) => pmMemberEmployeeIds.includes(id)),
+    };
+  } else if (hierarchyRank === BU_ADMIN_RANK && explicitBusinessUnitId == null) {
+    // "All Business Units": a BU Admin must see only logs on THEIR OWN BUs' Service POs, not the
+    // other-BU logs of an Employee who merely belongs to one of their BUs. With a BU explicitly
+    // selected, the existing log-company filter (resolveApprovalLogScope) already narrows to it.
+    const seedBuIds = callerBuIds.length > 0 ? callerBuIds : companyIds;
+    const { ownPoIds, centralisedPoIds } = await resolveBuAdminPoScope(seedBuIds, managerUserId, { includeParents: true });
+    if (ownPoIds.length + centralisedPoIds.length === 0) return { empty: true };
+    // Centralised-PO hours (Leave/Bench/...) are approvable only for Employees who BELONG to this
+    // admin's BU — a cross-BU Employee mapped to one of this BU's POs keeps their Centralised
+    // hours with their own BU's admin / Project Manager (no cross-BU approval).
+    const reach = new Set((await expandBusinessUnitIdsWithDescendants(seedBuIds)).map(Number));
+    const memberIds = new Set(team
+      .filter((employee) => (employee.business_unit_ids || []).some((id) => reach.has(Number(id))))
+      .map((employee) => employee.id));
+    poScope = {
+      ownPoIds,
+      centralisedPoIds,
+      centralisedEmployeeIds: employeeIds.filter((id) => memberIds.has(id)),
+    };
   }
 
   return { empty: false, employeeIds, poScope };
@@ -1000,7 +1149,8 @@ const exportApprovalSummaryAll = async (managerUserId, companyIds, hierarchyRank
 const bulkApproveTimesheets = async (managerUserId, body, companyId, actorId, ipAddress, hierarchyRank = null, callerBuIds = []) => {
   const { employee_id: employeeId, dates, months } = body;
 
-  const poIds = await assertOwnEmployeeForApproval(managerUserId, employeeId, companyId, hierarchyRank, callerBuIds);
+  const poIds = (await assertOwnEmployeeForApproval(managerUserId, employeeId, companyId, hierarchyRank, callerBuIds))
+    ?? await resolveBuAdminApprovalPoIds(managerUserId, companyId, hierarchyRank, callerBuIds, employeeId);
 
   let totalRowsApproved = 0;
   let approved;

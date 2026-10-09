@@ -14,6 +14,8 @@ const resolveReportCompanyScope = require('../middlewares/resolveReportCompanySc
 // resolveReportCompanyScope.js's doc comment.
 const authenticateMultiBU = [authenticateBase.authenticateIdentity, resolveReportCompanyScope];
 const reportController = require('../controllers/reportController');
+const utilisationReportController = require('../controllers/utilisationReportController');
+const crossBuEmployeePoHoursReportController = require('../controllers/crossBuEmployeePoHoursReportController');
 const { heavyReportLimiter } = require('../middlewares/rateLimiters');
 const { validate, validateAll } = require('../middlewares/validateRequest');
 const {
@@ -22,6 +24,7 @@ const {
   employeeWorkLogHoursSummaryDetailParamsSchema,
 } = require('../validations/employeeWorkLogHoursSummaryValidation');
 const { projectTimesheetReportQuerySchema } = require('../validations/projectTimesheetReportValidation');
+const { crossBuEmployeePoHoursReportQuerySchema } = require('../validations/crossBuEmployeePoHoursReportValidation');
 const { employeeRoleBuMappingQuerySchema } = require('../validations/employeeRoleBuMappingReportValidation');
 const {
   teamLeadEmployeeProjectHoursQuerySchema,
@@ -64,6 +67,31 @@ router.get(
   authenticateMultiBU,
   validate(projectTimesheetReportQuerySchema, 'query'),
   reportController.getProjectTimesheetReport
+);
+
+/**
+ * @swagger
+ * /reports/cross-bu-employee-po-hours:
+ *   get:
+ *     summary: Cross-BU Employee & Service PO hours (Employee BU and PO BU as independent dimensions)
+ *     description: >
+ *       Employee -> Employee BU/Sub-BU -> Client -> Project -> Service PO -> PO BU -> total hours on
+ *       that PO, one row per Employee + Service PO + month (no Activity/Task breakdown). Employee BU and PO BU are separate
+ *       filters (employee_bu_ids / employee_sub_bu_ids vs po_bu_ids) so cross-BU work shows from both
+ *       sides; work_type = own | cross | na (Centralised PO, PO/employee with no BU) | all. A BU-scoped
+ *       caller sees rows where the Employee OR the PO belongs to their BUs. Returns summary cards
+ *       (totals), the Employee BU <-> PO BU hours flow (bu_flow) and the paged records.
+ *       Period: month+year, or start_date+end_date (max 366 days); default current month.
+ *       format=json | excel (Details + BU Flow sheets) | csv (details).
+ *     tags: [Reports]
+ *     security:
+ *       - bearerAuth: []
+ */
+router.get(
+  '/cross-bu-employee-po-hours',
+  authenticateMultiBU,
+  validate(crossBuEmployeePoHoursReportQuerySchema, 'query'),
+  crossBuEmployeePoHoursReportController.getCrossBuEmployeePoHoursReport
 );
 
 /**
@@ -1938,6 +1966,100 @@ router.get(
   '/service-po-hours-budget',
   authenticateMultiBU,
   reportController.getServicePOHoursBudget
+);
+
+/**
+ * @swagger
+ * /reports/bu-wise-utilisation:
+ *   get:
+ *     summary: BU-wise Utilisation — one row per Business Unit
+ *     description: >
+ *       BU name, total employees in the BU, Expected Hrs (employees x 176),
+ *       Billable, Non-Billable (Leave / On Bench / Idle excluded), Customer
+ *       Non-Billable, Total Logged (the sum of those three) and Utilisation %
+ *       (Total Logged / Expected x 100). Admin sees every BU; a BU Admin sees
+ *       only the BUs they are mapped to. Rows are the BUs inside the caller's
+ *       reach, so a BU with no logged hours still appears with zeros.
+ *     tags: [Reports]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - { in: query, name: month, schema: { type: integer, minimum: 1, maximum: 12 }, description: "Default = current month. Ignored when startDate/endDate are given." }
+ *       - { in: query, name: year, schema: { type: integer } }
+ *       - { in: query, name: startDate, schema: { type: string, format: date }, description: "Use with endDate instead of month/year. Capacity (176) scales by the months spanned." }
+ *       - { in: query, name: endDate, schema: { type: string, format: date } }
+ *       - { in: query, name: entityIds, schema: { type: string }, description: "Comma-separated. Narrows (never widens) the caller's BU reach." }
+ *       - { in: query, name: businessUnitIds, schema: { type: string }, description: "Comma-separated. Also matches Sub-BUs." }
+ *       - { in: query, name: employeeIds, schema: { type: string }, description: "Comma-separated (alias employeeId)." }
+ *       - { in: query, name: clientIds, schema: { type: string }, description: "Comma-separated (alias clientId)." }
+ *       - { in: query, name: projectIds, schema: { type: string }, description: "Comma-separated Service PO ids (aliases poId, projectId)." }
+ *       - { in: query, name: serviceTypeIds, schema: { type: string }, description: "Comma-separated (alias serviceTypeId)." }
+ *       - { in: query, name: hoursSource, schema: { type: string, enum: [O] }, description: "O = original logged hours; default = adjusted (after sync) hours." }
+ *       - { in: query, name: page, schema: { type: integer } }
+ *       - { in: query, name: limit, schema: { type: integer } }
+ *       - { in: query, name: sortOrder, schema: { type: string, enum: [ASC, DESC] } }
+ *       - { in: query, name: search, schema: { type: string }, description: "BU name" }
+ *       - { in: query, name: sortBy, schema: { type: string, enum: [buName, employeeCount, expectedHours, billableHours, nonBillableHours, customerNonBillableHours, totalLoggedHours, utilizationPercentage] } }
+ *     responses:
+ *       200:
+ *         description: Paginated BU rows plus a full-dataset summary
+ *       401:
+ *         description: Unauthorized
+ *       422:
+ *         description: Invalid period
+ */
+router.get(
+  '/bu-wise-utilisation',
+  authenticateMultiBU,
+  utilisationReportController.getBuWiseUtilisation
+);
+
+/**
+ * @swagger
+ * /reports/employee-project-utilisation:
+ *   get:
+ *     summary: Employee x Project Utilisation — original vs after-sync hours
+ *     description: >
+ *       One row per Employee and Project (Service PO): Logged Hrs (original),
+ *       Adjusted Hrs (after sync), Original Utilisation % (the Employee's
+ *       total logged hours / 176 x 100) and Total Utilisation % after sync
+ *       (the Employee's total adjusted hours / 176 x 100). The two % values are
+ *       the Employee's whole-period totals, so they repeat on each of their
+ *       project rows and are not changed by the project/client/service-type
+ *       filters.
+ *     tags: [Reports]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - { in: query, name: month, schema: { type: integer, minimum: 1, maximum: 12 }, description: "Default = current month. Ignored when startDate/endDate are given." }
+ *       - { in: query, name: year, schema: { type: integer } }
+ *       - { in: query, name: startDate, schema: { type: string, format: date }, description: "Use with endDate instead of month/year. Capacity (176) scales by the months spanned." }
+ *       - { in: query, name: endDate, schema: { type: string, format: date } }
+ *       - { in: query, name: entityIds, schema: { type: string }, description: "Comma-separated. Narrows (never widens) the caller's BU reach." }
+ *       - { in: query, name: businessUnitIds, schema: { type: string }, description: "Comma-separated. Also matches Sub-BUs." }
+ *       - { in: query, name: employeeIds, schema: { type: string }, description: "Comma-separated (alias employeeId)." }
+ *       - { in: query, name: clientIds, schema: { type: string }, description: "Comma-separated (alias clientId)." }
+ *       - { in: query, name: projectIds, schema: { type: string }, description: "Comma-separated Service PO ids (aliases poId, projectId)." }
+ *       - { in: query, name: serviceTypeIds, schema: { type: string }, description: "Comma-separated (alias serviceTypeId)." }
+ *       - { in: query, name: hoursSource, schema: { type: string, enum: [O] }, description: "O = original logged hours; default = adjusted (after sync) hours." }
+ *       - { in: query, name: page, schema: { type: integer } }
+ *       - { in: query, name: limit, schema: { type: integer } }
+ *       - { in: query, name: sortOrder, schema: { type: string, enum: [ASC, DESC] } }
+ *       - { in: query, name: categoryIds, schema: { type: string }, description: "Comma-separated service category ids (alias categoryId)." }
+ *       - { in: query, name: search, schema: { type: string }, description: "Employee name / code / project name" }
+ *       - { in: query, name: sortBy, schema: { type: string, enum: [employeeName, employeeCode, projectName, loggedHours, adjustedHours, originalUtilizationPercentage, totalUtilizationPercentage] } }
+ *     responses:
+ *       200:
+ *         description: Paginated Employee x Project rows plus a full-dataset summary
+ *       401:
+ *         description: Unauthorized
+ *       422:
+ *         description: Invalid period
+ */
+router.get(
+  '/employee-project-utilisation',
+  authenticateMultiBU,
+  utilisationReportController.getEmployeeProjectUtilisation
 );
 
 module.exports = router;

@@ -21,7 +21,14 @@ const servicePOHierarchyController = require('../controllers/servicePOHierarchyC
 // no mandatory X-Company-Id for a multi-BU actor. Access to the Service PO
 // itself is enforced in servicePOHierarchyService via getAccessibleById().
 const authenticateReadMultiBU = require('../middlewares/authenticateReadMultiBU');
+const authorize = require('../middlewares/authorize');
 const { validate } = require('../middlewares/validateRequest');
+
+// Hierarchy writes need the same grant as creating/updating the Service PO
+// itself (servicePO.routes.js) — reading the tree stays open to anyone who can
+// open the PO, but adding/renaming/deleting nodes must not be open to every
+// BU member who merely reaches the PO.
+const canManageServicePOs = authorize(['project.manage_servicepos']);
 const {
   createHierarchyNodeSchema,
   renameHierarchyNodeSchema,
@@ -84,6 +91,7 @@ router.get(
 router.post(
   '/:servicePoId/hierarchy/parent',
   authenticateReadMultiBU,
+  canManageServicePOs,
   validate(createHierarchyNodeSchema),
   servicePOHierarchyController.createParent
 );
@@ -126,6 +134,7 @@ router.post(
 router.post(
   '/:servicePoId/hierarchy/:parentId/child',
   authenticateReadMultiBU,
+  canManageServicePOs,
   validate(createHierarchyNodeSchema),
   servicePOHierarchyController.createChild
 );
@@ -160,6 +169,7 @@ router.post(
 router.put(
   '/hierarchy/:hierarchyId',
   authenticateReadMultiBU,
+  canManageServicePOs,
   validate(renameHierarchyNodeSchema),
   servicePOHierarchyController.renameNode
 );
@@ -186,6 +196,7 @@ router.put(
 router.delete(
   '/hierarchy/:hierarchyId',
   authenticateReadMultiBU,
+  canManageServicePOs,
   servicePOHierarchyController.deleteNode
 );
 

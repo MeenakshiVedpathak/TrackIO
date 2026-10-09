@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { Employee, sequelize } = require('../src/models');
+const { Employee, Company, ServicePO, sequelize } = require('../src/models');
 const managerEmployeeMappingRepository = require('../src/repositories/managerEmployeeMappingRepository');
 const employeeServicePOMappingRepository = require('../src/repositories/employeeServicePOMappingRepository');
 const servicePORepository = require('../src/repositories/servicePORepository');
@@ -38,6 +38,8 @@ const ORIGINAL = {
   approveByEmployeeAndMonths: employeeWorkLogRepository.approveByEmployeeAndMonths,
   employeeFindById: employeeRepository.findById,
   employeeFindAll: Employee.findAll,
+  companyFindAll: Company.findAll,
+  servicePOFindAll: ServicePO.findAll,
   transaction: sequelize.transaction,
 };
 
@@ -56,6 +58,8 @@ function restore() {
   employeeWorkLogRepository.approveByEmployeeAndMonths = ORIGINAL.approveByEmployeeAndMonths;
   employeeRepository.findById = ORIGINAL.employeeFindById;
   Employee.findAll = ORIGINAL.employeeFindAll;
+  Company.findAll = ORIGINAL.companyFindAll;
+  ServicePO.findAll = ORIGINAL.servicePOFindAll;
   sequelize.transaction = ORIGINAL.transaction;
 }
 
@@ -274,6 +278,7 @@ test('approveTimesheet (Project Manager): CAN approve a Centralised PO entry (e.
     // single fixed-input assertion.
     const CENTRALISED = new Set([999]);
     servicePORepository.findCentralisedIdsAmong = async (ids) => ids.filter((id) => CENTRALISED.has(id));
+    employeeRepository.findById = async (employeeId) => ({ id: employeeId }); // belongs to the PM's own BU
     // entry.service_po_id = 999 (Leaves), employee_id = 101 (genuinely on PO 201)
     employeeWorkLogRepository.findById = async (id) => ({ id, employee_id: 101, service_po_id: 999, status: 'pending' });
     employeeWorkLogRepository.approveById = async (id) => ({ id, status: 'approved' });
@@ -353,6 +358,7 @@ test('bulkApproveTimesheets (Project Manager): scope is widened to include every
     stubPMMapping(501, [201]);
     stubWorkLogQueries(); // employee 101 genuinely has work logged against PO 201
     servicePORepository.getActiveCentralisedPOIds = async () => [{ id: 56 }, { id: 52 }]; // Leaves, On Bench
+    employeeRepository.findById = async (employeeId) => ({ id: employeeId }); // belongs to the PM's own BU
     sequelize.transaction = async (fn) => fn({ __fakeTransaction: true });
 
     let capturedPoIds;
@@ -491,23 +497,264 @@ test('Admin (rank <= 3) approval bypasses BOTH the manager_employee_mappings AND
   }
 });
 
-test('BU Admin (rank 4) approval keeps using employeeRepository.findById(employeeId, buIds) — unchanged', async () => {
+// BU Admin approval is limited to Service POs of THEIR OWN Business Units (plus Centralised POs).
+// BU 7 (caller's own) owns PO 301; BU 99 (someone else's) owns PO 999.
+function stubBuAdminScope({ ownPoIds = [301], centralisedPoIds = [] } = {}) {
+  Company.findAll = async () => [];
+  ServicePO.findAll = async () => ownPoIds.map((id) => ({ id }));
+  servicePORepository.getActiveCentralisedPOIds = async () => centralisedPoIds.map((id) => ({ id }));
+}
+
+test('BU Admin (rank 4) approves an Employee of their BU on a Service PO of their OWN BU', async () => {
   try {
-    employeeServicePOMappingRepository.findAllByEmployee = async () => {
-      throw new Error('BU Admin must not query employee_servicepo_mapping');
-    };
+    stubBuAdminScope();
     let buLookupArgs = null;
     employeeRepository.findById = async (employeeId, scopeIds) => {
       buLookupArgs = { employeeId, scopeIds };
       return { id: employeeId };
     };
-    employeeWorkLogRepository.findById = async (id) => ({ id, employee_id: 101, service_po_id: 999, status: 'pending' });
+    employeeWorkLogRepository.findById = async (id) => ({ id, employee_id: 101, service_po_id: 301, status: 'pending' });
     employeeWorkLogRepository.approveById = async (id) => ({ id, status: 'approved' });
 
     const result = await managerSelfServiceService.approveTimesheet(1, 55, 10, 1, '127.0.0.1', 4, [7, 8]);
 
     assert.equal(result.status, 'approved');
     assert.deepEqual(buLookupArgs, { employeeId: 101, scopeIds: [7, 8] });
+  } finally {
+    restore();
+  }
+});
+
+test("BU Admin (rank 4) can NOT approve their own BU Employee's log on ANOTHER BU's Service PO", async () => {
+  try {
+    stubBuAdminScope();
+    employeeRepository.findById = async (employeeId) => ({ id: employeeId });
+    employeeWorkLogRepository.findById = async (id) => ({ id, employee_id: 101, service_po_id: 999, status: 'pending' });
+    employeeWorkLogRepository.approveById = async () => {
+      throw new Error('must not approve an out-of-BU Service PO log');
+    };
+
+    await assert.rejects(
+      managerSelfServiceService.approveTimesheet(1, 55, 10, 1, '127.0.0.1', 4, [7, 8]),
+      (err) => err.statusCode === 403
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("BU Admin (rank 4) CAN approve a cross-BU Employee (not in their BU) on a Service PO of their own BU", async () => {
+  try {
+    stubBuAdminScope();
+    employeeRepository.findById = async () => null; // Employee belongs to a different BU
+    employeeServicePOMappingRepository.findAllByEmployee = async () => [{ service_po_id: 301 }];
+    employeeWorkLogRepository.findById = async (id) => ({ id, employee_id: 101, service_po_id: 301, status: 'pending' });
+    employeeWorkLogRepository.approveById = async (id) => ({ id, status: 'approved' });
+
+    const result = await managerSelfServiceService.approveTimesheet(1, 55, 10, 1, '127.0.0.1', 4, [7]);
+
+    assert.equal(result.status, 'approved');
+  } finally {
+    restore();
+  }
+});
+
+test('BU Admin (rank 4) bulk approve is restricted to their own BU Service POs (never an unrestricted list)', async () => {
+  try {
+    stubBuAdminScope({ ownPoIds: [301], centralisedPoIds: [401] });
+    employeeRepository.findById = async (employeeId) => ({ id: employeeId });
+    sequelize.transaction = async (fn) => fn({});
+    let seenPoIds = null;
+    employeeWorkLogRepository.approveByEmployeeAndDates = async (employeeId, dates, transaction, poIds) => {
+      seenPoIds = poIds;
+      return { total_rows_approved: 0, buckets: [] };
+    };
+
+    await managerSelfServiceService.bulkApproveTimesheets(1, { employee_id: 101, dates: ['2026-10-01'] }, 10, 1, '127.0.0.1', 4, [7]);
+
+    assert.deepEqual(seenPoIds, [301, 401]);
+  } finally {
+    restore();
+  }
+});
+
+test('BU Admin (rank 4) bulk approve with a BU that owns NO Service POs fails closed ([-1], not unrestricted)', async () => {
+  try {
+    stubBuAdminScope({ ownPoIds: [], centralisedPoIds: [] });
+    employeeRepository.findById = async (employeeId) => ({ id: employeeId });
+    sequelize.transaction = async (fn) => fn({});
+    let seenPoIds = null;
+    employeeWorkLogRepository.approveByEmployeeAndDates = async (employeeId, dates, transaction, poIds) => {
+      seenPoIds = poIds;
+      return { total_rows_approved: 0, buckets: [] };
+    };
+
+    await managerSelfServiceService.bulkApproveTimesheets(1, { employee_id: 101, dates: ['2026-10-01'] }, 10, 1, '127.0.0.1', 4, [7]);
+
+    assert.deepEqual(seenPoIds, [-1]);
+  } finally {
+    restore();
+  }
+});
+
+test("BU Admin (rank 4) My Employees also lists a cross-BU Employee mapped to a Service PO of THEIR BU, but not an unmapped outsider", async () => {
+  try {
+    stubBuAdminScope({ ownPoIds: [301] });
+    const emp = (id, buId) => ({
+      id, employee_code: `E${id}`, full_name: `Emp ${id}`, designation: null, status: 'active',
+      businessUnits: [{ id: buId, company_name: `BU ${buId}`, entity_id: 1, entity: { entity_name: 'Ent' } }],
+    });
+    Employee.findAll = async () => [emp(101, 7), emp(102, 99), emp(103, 99)];
+    employeeServicePOMappingRepository.findByServicePOs = async () => [{ employee_id: 102, service_po_id: 301 }];
+
+    const result = await managerSelfServiceService.getMyEmployees(1, [7], 4, null);
+
+    assert.deepEqual(result.map((e) => e.id).sort(), [101, 102]);
+  } finally {
+    restore();
+  }
+});
+
+// ── Centralised POs (Leave/Bench/...) — approval stays with the Employee's OWN BU (and PM) ──
+// PO 301 belongs to the caller's BU 7; PO 401 is a Centralised PO.
+
+test('BU Admin (rank 4) can approve a Centralised-PO (Leave) entry of an Employee who BELONGS to their BU', async () => {
+  try {
+    stubBuAdminScope({ ownPoIds: [301], centralisedPoIds: [401] });
+    employeeRepository.findById = async (employeeId) => ({ id: employeeId }); // member of the BU
+    employeeWorkLogRepository.findById = async (id) => ({ id, employee_id: 101, service_po_id: 401, status: 'pending' });
+    employeeWorkLogRepository.approveById = async (id) => ({ id, status: 'approved' });
+
+    const result = await managerSelfServiceService.approveTimesheet(1, 55, 10, 1, '127.0.0.1', 4, [7]);
+
+    assert.equal(result.status, 'approved');
+  } finally {
+    restore();
+  }
+});
+
+test("BU Admin (rank 4) can NOT approve a cross-BU Employee's Centralised-PO (Leave) entry (not a member, only mapped to a PO of this BU)", async () => {
+  try {
+    stubBuAdminScope({ ownPoIds: [301], centralisedPoIds: [401] });
+    employeeRepository.findById = async () => null; // belongs to another BU
+    employeeServicePOMappingRepository.findAllByEmployee = async () => [{ service_po_id: 301 }];
+    employeeWorkLogRepository.findById = async (id) => ({ id, employee_id: 101, service_po_id: 401, status: 'pending' });
+    employeeWorkLogRepository.approveById = async () => {
+      throw new Error('a cross-BU Employee\'s Centralised hours must not be approvable by this BU Admin');
+    };
+
+    await assert.rejects(
+      managerSelfServiceService.approveTimesheet(1, 55, 10, 1, '127.0.0.1', 4, [7]),
+      (err) => err.statusCode === 403
+    );
+  } finally {
+    restore();
+  }
+});
+
+test('BU Admin (rank 4) bulk approve for a cross-BU Employee is limited to this BU\'s own POs (no Centralised ids)', async () => {
+  try {
+    stubBuAdminScope({ ownPoIds: [301], centralisedPoIds: [401] });
+    employeeRepository.findById = async () => null;
+    employeeServicePOMappingRepository.findAllByEmployee = async () => [{ service_po_id: 301 }];
+    sequelize.transaction = async (fn) => fn({});
+    let seenPoIds = null;
+    employeeWorkLogRepository.approveByEmployeeAndDates = async (employeeId, dates, transaction, poIds) => {
+      seenPoIds = poIds;
+      return { total_rows_approved: 0, buckets: [] };
+    };
+
+    await managerSelfServiceService.bulkApproveTimesheets(1, { employee_id: 101, dates: ['2026-10-01'] }, 10, 1, '127.0.0.1', 4, [7]);
+
+    assert.deepEqual(seenPoIds, [301]);
+  } finally {
+    restore();
+  }
+});
+
+test('BU Admin (rank 4) combined approval list: Centralised POs apply only to Employees of their BU', async () => {
+  try {
+    stubBuAdminScope({ ownPoIds: [301], centralisedPoIds: [401] });
+    const emp = (id, buId) => ({
+      id, employee_code: `E${id}`, full_name: `Emp ${id}`, designation: null, status: 'active',
+      businessUnits: [{ id: buId, company_name: `BU ${buId}`, entity_id: 1, entity: { entity_name: 'Ent' } }],
+    });
+    // 101 belongs to BU 7 (member); 102 belongs to BU 99 but is mapped to PO 301 of BU 7 (cross-BU).
+    Employee.findAll = async () => [emp(101, 7), emp(102, 99)];
+    employeeServicePOMappingRepository.findByServicePOs = async () => [{ employee_id: 102, service_po_id: 301 }];
+    let seen = null;
+    const originalPage = employeeWorkLogRepository.findApprovalSummaryBucketsPage;
+    const originalByIds = employeeWorkLogRepository.findByIdsWithIncludes;
+    employeeWorkLogRepository.findApprovalSummaryBucketsPage = async (args) => { seen = args; return { rows: [], total: 0 }; };
+    employeeWorkLogRepository.findByIdsWithIncludes = async () => [];
+    try {
+      await managerSelfServiceService.getApprovalSummaryAll(1, [7], 4, null, [7], {});
+    } finally {
+      employeeWorkLogRepository.findApprovalSummaryBucketsPage = originalPage;
+      employeeWorkLogRepository.findByIdsWithIncludes = originalByIds;
+    }
+
+    assert.deepEqual(seen.employeeIds.sort(), [101, 102]);
+    assert.deepEqual(seen.poScope.ownPoIds, [301]);
+    assert.deepEqual(seen.poScope.centralisedPoIds, [401]);
+    assert.deepEqual(seen.poScope.centralisedEmployeeIds, [101]);
+  } finally {
+    restore();
+  }
+});
+
+test("approveTimesheet (Project Manager): can NOT approve a cross-BU Employee's Centralised (Leave) entry even though they work on this PM's PO", async () => {
+  try {
+    stubPMMapping(501, [201]);
+    stubWorkLogQueries(); // employee 101 has real work on the PM's PO 201
+    servicePORepository.findCentralisedIdsAmong = async (ids) => ids.filter((id) => id === 999);
+    employeeRepository.findById = async () => null; // NOT a member of any BU of this PM
+    employeeWorkLogRepository.findById = async (id) => ({ id, employee_id: 101, service_po_id: 999, status: 'pending' });
+    employeeWorkLogRepository.approveById = async () => {
+      throw new Error('a cross-BU Employee\'s Leave must not be approvable by this PM');
+    };
+
+    await assert.rejects(
+      managerSelfServiceService.approveTimesheet(501, 55, 10, 501, '127.0.0.1', PROJECT_MANAGER_RANK, [7]),
+      (err) => err.statusCode === 403
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("approveTimesheet (Project Manager): CAN still approve a cross-BU Employee's REAL entry on this PM's own PO", async () => {
+  try {
+    stubPMMapping(501, [201]);
+    stubWorkLogQueries();
+    employeeRepository.findById = async () => null; // cross-BU Employee
+    employeeWorkLogRepository.findById = async (id) => ({ id, employee_id: 101, service_po_id: 201, status: 'pending' });
+    employeeWorkLogRepository.approveById = async (id) => ({ id, status: 'approved' });
+
+    const result = await managerSelfServiceService.approveTimesheet(501, 55, 10, 501, '127.0.0.1', PROJECT_MANAGER_RANK, [7]);
+
+    assert.equal(result.status, 'approved');
+  } finally {
+    restore();
+  }
+});
+
+test('bulkApproveTimesheets (Project Manager): a cross-BU Employee\'s scope stays the PM\'s own POs only (no Centralised ids)', async () => {
+  try {
+    stubPMMapping(501, [201]);
+    stubWorkLogQueries();
+    servicePORepository.getActiveCentralisedPOIds = async () => [{ id: 56 }, { id: 52 }];
+    employeeRepository.findById = async () => null; // cross-BU Employee
+    sequelize.transaction = async (fn) => fn({ __fakeTransaction: true });
+    let capturedPoIds;
+    employeeWorkLogRepository.approveByEmployeeAndDates = async (employeeId, dates, transaction, servicePoIds) => {
+      capturedPoIds = servicePoIds;
+      return { total_rows_approved: 0, buckets: [] };
+    };
+
+    await managerSelfServiceService.bulkApproveTimesheets(501, { employee_id: 101, dates: ['2026-08-01'] }, 10, 501, '127.0.0.1', PROJECT_MANAGER_RANK, [7]);
+
+    assert.deepEqual(capturedPoIds, [201]);
   } finally {
     restore();
   }

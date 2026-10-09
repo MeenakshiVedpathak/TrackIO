@@ -6,6 +6,7 @@ const logger = require('../utils/logger');
 const dateHelper = require('../helpers/dateHelper');
 const { getPaginationParams, getPaginationMeta } = require('../utils/pagination');
 const publishVisibilityService = require('./publishVisibilityService');
+const utilisationReportService = require('./utilisationReportService');
 const { intersectCompanyIdsWithEntity, intersectIdsWithBuHierarchy } = require('./companyAccessControlService');
 const { parseIdList } = require('../utils/idListParser');
 
@@ -1487,7 +1488,7 @@ async function buildTopClientsByCost(pagination, hoursSource, companyId) {
  *   budget_vs_billed: { monthly: object[], by_service_po: object[], summary: object, over_budget_service_pos: object[], under_budget_service_pos: object[] }
  * }>}
  */
-async function getMonthlyResourceUtilization(query = {}, companyId) {
+async function getMonthlyResourceUtilization(query = {}, companyId, options = {}) {
   companyId = await applyEntityBuFilters(companyId, query);
   const fiscalYear = resolveFiscalYear(query);
   const period = resolveAnalyticsPeriod(query, fiscalYear);
@@ -1597,6 +1598,54 @@ async function getMonthlyResourceUtilization(query = {}, companyId) {
     project_wise_analytics: projectWiseAnalytics,
     // NEW — additive field, see buildBudgetVsBilledAnalytics().
     budget_vs_billed: buildBudgetVsBilledAnalytics(budgetVsBilledRows),
+    // Admin-tier only (the caller decides — see dashboardController): the same BU-wise
+    // utilisation GET /reports/bu-wise-utilisation returns, over this dashboard's own period,
+    // every BU in the caller's reach, no pagination. Omitted entirely for everyone else.
+    ...(options.includeBuWise && { bu_wise_utilization: await buildBuWiseUtilization(query, period, companyId) }),
+  };
+}
+
+async function buildBuWiseUtilization(query, period, companyId) {
+  const { data, summary } = await utilisationReportService.getBuWiseUtilisationReport(
+    {
+      startDate: period.start,
+      endDate: period.end,
+      hoursSource: query.hoursSource,
+      employeeId: query.employeeId,
+      clientId: query.clientId,
+      poId: query.poId,
+      serviceTypeId: query.serviceTypeId,
+      roleId: query.roleId,
+      sortBy: 'utilizationPercentage',
+      sortOrder: 'DESC',
+    },
+    companyId,
+    { exportAll: true }
+  );
+  return {
+    period: { start_date: period.start, end_date: period.end },
+    summary: {
+      bu_count: summary.buCount,
+      total_employees: summary.totalEmployees,
+      expected_hours: summary.expectedHours,
+      billable_hours: summary.billableHours,
+      non_billable_hours: summary.nonBillableHours,
+      customer_non_billable_hours: summary.customerNonBillableHours,
+      total_logged_hours: summary.totalLoggedHours,
+      utilization_percentage: summary.utilizationPercentage,
+    },
+    records: data.map((row) => ({
+      bu_id: row.buId,
+      bu_name: row.buName,
+      sub_bu_name: row.subBuName,
+      total_employees: row.totalEmployees,
+      expected_hours: row.expectedHours,
+      billable_hours: row.billableHours,
+      non_billable_hours: row.nonBillableHours,
+      customer_non_billable_hours: row.customerNonBillableHours,
+      total_logged_hours: row.totalLoggedHours,
+      utilization_percentage: row.utilizationPercentage,
+    })),
   };
 }
 

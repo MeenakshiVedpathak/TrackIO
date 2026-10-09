@@ -137,7 +137,9 @@ async function getMonthlyResourceUtilization(req, res, next) {
     const filters = { ...req.body, ...req.query };
     // req.companyIds (always an array) — see getAnalyticsDashboard()'s
     // comment above / dashboard.routes.js's authenticateAnalyticsMultiBU.
-    const result = await dashboardService.getMonthlyResourceUtilization(filters, req.companyIds);
+    // BU-wise utilisation is Admin-tier only (Platform Admin / Admin / Entity Admin).
+    const includeBuWise = Number.isInteger(req.hierarchyRank) && req.hierarchyRank <= 3;
+    const result = await dashboardService.getMonthlyResourceUtilization(filters, req.companyIds, { includeBuWise });
     return sendSuccess(res, result, 'Monthly resource utilization report fetched successfully.');
   } catch (err) {
     logger.error('Dashboard getMonthlyResourceUtilization error', { error: err.message, stack: err.stack, userId: req.userId });
