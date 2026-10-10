@@ -15,6 +15,7 @@ const { getPaginationParams, getPaginationMeta } = require('../utils/pagination'
 const dateHelper = require('../helpers/dateHelper');
 const { applyHoursVisibility } = require('../utils/hoursVisibility');
 const employeeWorkLogRepository = require('../repositories/employeeWorkLogRepository');
+const monthlyCapService = require('./monthlyCapService');
 const timesheetPublishPolicy = require('../utils/timesheetPublishPolicy');
 const { intersectCompanyIdsWithEntity, intersectIdsWithBuHierarchy } = require('./companyAccessControlService');
 const { parseIdList } = require('../utils/idListParser');
@@ -23,7 +24,7 @@ const { parseIdList } = require('../utils/idListParser');
  * Map EmployeeWorkLog rows (Employee Self Timesheet module — ALL rows for
  * the month, regardless of status; see employeeWorkLogRepository.findForSync)
  * into the exact row shape parseFile() produces for an Excel row, so they
- * flow untouched through the existing validateRows()/adjustHoursTo176()
+ * flow untouched through the existing validateRows()/adjustHoursToCap()
  * import pipeline. This is the ONLY place the "Sync Employee Work Logs"
  * flow reads source data from — never from `timesheets`.
  *
@@ -576,7 +577,10 @@ const parseFile = async (filePath, fileName, mimetype) => {
   return { rows: parsed, sheetName };
 };
 
-const MONTHLY_TARGET_HOURS = 176;
+// The monthly cap (formerly a hard-coded 176) is the admin-editable
+// `monthly_cap_hours` system setting — see monthlyCapService.js. Every import
+// reads the LATEST value and stamps it on timesheet_import_history.cap_hours;
+// the manual-edit limits below use that import's stamped cap.
 
 // Returns true for rows that must NOT be scaled (kept as original Excel value):
 //   - zero hours (00:00)
@@ -599,33 +603,45 @@ function isExcludedFromAdjustment(row) {
 
 /**
  * Proportionally scale each employee's adjustable hours so their monthly
- * total is exactly 176 — but only when it currently exceeds 176.
+ * total is exactly the monthly cap (`capHours`, the admin-editable
+ * monthly_cap_hours setting; 176 by default) — but only when it currently
+ * exceeds the cap.
  *
  * Algorithm (employee-wise, applied after all of an employee's rows for the
  * import are known):
  *   totalHours            = sum of every row's hours
- *   -> if totalHours <= 176: no change at all.
+ *   -> if totalHours <= capHours: no change at all.
  *   leaveHours            = sum of hours on rows excluded from adjustment —
  *                           Leave / Vacation / Holiday / Bench / Idle / any
  *                           row that already has 0 hours (isExcludedFromAdjustment).
  *                           These NEVER change, and a 0-hour row never becomes non-zero.
  *   workingHours          = totalHours - leaveHours   (== sum of adjustable rows)
- *   allowedWorkingHours   = 176 - leaveHours
+ *   allowedWorkingHours   = capHours - leaveHours
  *   ratio                 = allowedWorkingHours / workingHours
  *   each adjustable (non-Leave, hours > 0) row's hours = row.hours * ratio
  *
  * A largest-remainder distribution at hundredths-of-an-hour precision is
  * used instead of independent per-row rounding, so the adjusted rows sum to
  * EXACTLY allowedWorkingHours — meaning the employee's grand total lands on
- * exactly 176, not "176 plus or minus a rounding cent".
+ * exactly the cap, not "the cap plus or minus a rounding cent".
  *
  * @param {object[]} validRows
+ * @param {number} capHours - the monthly cap to adjust to (see monthlyCapService.getCurrentCap)
  * @returns {object[]}
  */
-function adjustHoursTo176(validRows) {
+function adjustHoursToCap(validRows, capHours) {
+  const cap = Number(capHours);
+  if (!Number.isFinite(cap) || cap <= 0) {
+    throw new Error('adjustHoursToCap requires a positive monthly cap (capHours).');
+  }
+
+  // Remember what each row logged BEFORE any scaling — saved as timesheets.original_hours so
+  // "original" reports show what the employee really logged, not the cap-adjusted figure.
+  const rowsWithOriginal = validRows.map((r) => ({ ...r, originalHours: r.originalHours ?? r.hours }));
+
   // Group rows by employee
   const empGroups = new Map();
-  for (const row of validRows) {
+  for (const row of rowsWithOriginal) {
     if (!empGroups.has(row.employeeId)) empGroups.set(row.employeeId, []);
     empGroups.get(row.employeeId).push(row);
   }
@@ -634,7 +650,7 @@ function adjustHoursTo176(validRows) {
 
   for (const [, rows] of empGroups) {
     // If any row for this employee is marked "Is Working = false", keep all
-    // their hours exactly as uploaded — do not adjust to 176.
+    // their hours exactly as uploaded — do not adjust to the cap.
     if (rows.some(r => r.isWorking === false)) {
       result.push(...rows);
       continue;
@@ -643,7 +659,7 @@ function adjustHoursTo176(validRows) {
     const totalHours = rows.reduce((sum, r) => sum + r.hours, 0);
 
     // Requirement: totals at or under the monthly target are never touched.
-    if (totalHours <= MONTHLY_TARGET_HOURS) {
+    if (totalHours <= cap) {
       result.push(...rows);
       continue;
     }
@@ -655,9 +671,9 @@ function adjustHoursTo176(validRows) {
 
     const leaveHours          = excluded.reduce((sum, r) => sum + r.hours, 0);
     const workingHours        = totalHours - leaveHours; // == sum of adjustable hours
-    const allowedWorkingHours = MONTHLY_TARGET_HOURS - leaveHours;
+    const allowedWorkingHours = cap - leaveHours;
 
-    // Nothing adjustable, or Leave alone already meets/exceeds the 176 cap —
+    // Nothing adjustable, or Leave alone already meets/exceeds the cap —
     // the ratio would be undefined or negative, so leave hours untouched.
     if (adjustable.length === 0 || workingHours <= 0 || allowedWorkingHours <= 0) {
       result.push(...rows);
@@ -737,7 +753,7 @@ function detectDuplicateRows(validRows) {
  * (sub_project_id, etc.) are taken from the first row encountered for that
  * key.
  *
- * @param {object[]} validRows - Output from adjustHoursTo176()
+ * @param {object[]} validRows - Output from adjustHoursToCap()
  * @returns {object[]} rows with one entry per employee+PO+date
  */
 function mergeDuplicateRows(validRows) {
@@ -748,8 +764,9 @@ function mergeDuplicateRows(validRows) {
     const existing = byKey.get(key);
     if (existing) {
       existing.hours += row.hours;
+      existing.originalHours += row.originalHours ?? row.hours;
     } else {
-      byKey.set(key, { ...row });
+      byKey.set(key, { ...row, originalHours: row.originalHours ?? row.hours });
     }
   }
 
@@ -1096,7 +1113,7 @@ const MONTH_ABBREVIATIONS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'A
  * `employee_work_logs` (Employee Self Timesheet module) for the selected
  * company/month/year instead of parsing an uploaded file, maps them into
  * parseFile()'s row shape, then runs through the EXACT SAME validate ->
- * 176h-adjust -> duplicate-detect -> import-history pipeline
+ * monthly-cap-adjust -> duplicate-detect -> import-history pipeline
  * runImportPreview() already applies to Excel uploads — only the row
  * source changes, per the "reuse the complete existing Import Timesheet
  * business logic, do not duplicate" requirement. Never reads `timesheets`.
@@ -1152,7 +1169,7 @@ const previewPmsImport = async (month, year, userId, companyId) => {
 };
 
 /**
- * Shared body of the import preview flow: validate -> adjust hours to 176
+ * Shared body of the import preview flow: validate -> adjust hours to the monthly cap
  * -> detect duplicates -> create/update import history (status = pending)
  * -> persist error rows -> build the preview response. Extracted from
  * previewImport() so previewPmsImport() (Sync Employee Work Logs) can reuse
@@ -1177,8 +1194,11 @@ const runImportPreview = async (parsedRows, meta) => {
   const { validRows: rawValidRows, errorRows } = await validateRows(parsedRows, companyId);
   logErrorRowBreakdown(errorRows, { fileName, stage: 'preview' });
 
-  // 3. Adjust each employee's adjustable hours to sum to 176
-  const validRows = adjustHoursTo176(rawValidRows);
+  // 3. Adjust each employee's adjustable hours to sum to the monthly cap —
+  //    always the LATEST admin-set cap (monthlyCapService), also stamped on
+  //    the import history below so reports know what this month was synced at.
+  const capHours = await monthlyCapService.getCurrentCap();
+  const validRows = adjustHoursToCap(rawValidRows, capHours);
 
   // 3b. Detect (not block) rows sharing the same employee + PO + date
   const duplicates = detectDuplicateRows(validRows);
@@ -1206,6 +1226,7 @@ const runImportPreview = async (parsedRows, meta) => {
       status:       'pending',
       import_month: importMonth,
       import_year:  importYear,
+      cap_hours:    capHours,
     }, null, companyId);
   } else {
     importRecord = await timesheetImportRepository.createImportHistory({
@@ -1220,6 +1241,7 @@ const runImportPreview = async (parsedRows, meta) => {
       import_year:  importYear,
       company_id:   companyId,
       source,
+      cap_hours:    capHours,
     });
   }
 
@@ -1335,7 +1357,10 @@ const confirmImport = async (importId, userId, ipAddress = null, companyId) => {
 
   const { validRows: rawValidRows, errorRows } = await validateRows(parsedRows, companyId);
   logErrorRowBreakdown(errorRows, { fileName: importRecord.file_name, importId, stage: 'confirm' });
-  const validRows = adjustHoursTo176(rawValidRows);
+  // Confirm is the actual sync: always the latest cap (it may have been
+  // changed since preview), stamped on the import in the final update below.
+  const capHours = await monthlyCapService.getCurrentCap();
+  const validRows = adjustHoursToCap(rawValidRows, capHours);
 
   // Detect rows sharing the same employee + PO + date, for logging/audit
   // visibility. This combination is also the timesheets table's own unique
@@ -1389,6 +1414,8 @@ const confirmImport = async (importId, userId, ipAddress = null, companyId) => {
       sub_project_id:      row.subProjectId || null,
       timesheet_date:      row.date,
       hours_logged:        row.hours,
+      // What the employee actually logged, before the monthly-cap adjustment above.
+      original_hours:      row.originalHours ?? row.hours,
       // modified_hours always starts out equal to hours_logged on creation
       // — set here in application code, never left null.
       modified_hours:      row.hours,
@@ -1453,6 +1480,7 @@ const confirmImport = async (importId, userId, ipAddress = null, companyId) => {
       import_month: importMonth,
       import_year:  importYear,
       is_publish:   historyIsPublish,
+      cap_hours:    capHours,
     }, null, companyId);
 
     // Persist any new error rows found on re-validation
@@ -1487,7 +1515,15 @@ const confirmImport = async (importId, userId, ipAddress = null, companyId) => {
       'timesheets',
       importId,
       null,
-      { importId, insertedRows: inserted.length },
+      {
+        importId,
+        insertedRows: inserted.length,
+        month: importMonth,
+        year: importYear,
+        source: importRecord.source,
+        file_name: importRecord.file_name,
+        company_id: companyId,
+      },
       ipAddress
     );
 
@@ -1599,21 +1635,22 @@ function extractYearMonth(date) {
 }
 
 /**
- * Shared core behind every "employee hours cannot exceed 176" rule: adds the
- * requested hours to whatever's already been logged, and throws a 400 with a
- * caller-supplied message if that total exceeds MONTHLY_TARGET_HOURS.
+ * Shared core behind every "employee hours cannot exceed the monthly cap" rule:
+ * adds the requested hours to whatever's already been logged, and throws a 400
+ * with a caller-supplied message if that total exceeds `capHours`.
  * Extracted so validateMonthlyHoursLimit() (month/year-scoped) and
  * validateImportHoursLimit() (timesheet_import_id-scoped) share the exact
  * same arithmetic/threshold/error-shape instead of each reimplementing it.
  *
  * @param {number} existingHours
  * @param {number} hoursRequested
+ * @param {number} capHours - the monthly cap that applies (the month's stamped cap)
  * @param {(total: number) => string} buildMessage - given the rounded would-be total, returns the error message
- * @throws {Error} statusCode 400 if existingHours + hoursRequested > MONTHLY_TARGET_HOURS
+ * @throws {Error} statusCode 400 if existingHours + hoursRequested > capHours
  */
-function assertHoursWithinCap(existingHours, hoursRequested, buildMessage) {
+function assertHoursWithinCap(existingHours, hoursRequested, capHours, buildMessage) {
   const totalHours = existingHours + parseFloat(hoursRequested);
-  if (totalHours > MONTHLY_TARGET_HOURS) {
+  if (totalHours > parseFloat(capHours)) {
     const err = new Error(buildMessage(Math.round(totalHours * 100) / 100));
     err.statusCode = 400;
     throw err;
@@ -1621,9 +1658,10 @@ function assertHoursWithinCap(existingHours, hoursRequested, buildMessage) {
 }
 
 /**
- * Enforce the employee's 176-hour monthly cap (MONTHLY_TARGET_HOURS, the
- * same constant adjustHoursTo176() targets for Excel imports). Shared by the
- * manual create and update APIs so both apply the identical rule:
+ * Enforce the employee's monthly cap — the cap that BU's month was synced with
+ * (monthlyCapService.getCapForCompanyMonth; the latest setting if the month has
+ * never been synced), the same value adjustHoursToCap() targets for imports.
+ * Shared by the manual create and update APIs so both apply the identical rule:
  *
  *   Total Monthly Hours = Existing Monthly Hours
  *                          (- Current Entry Hours, Update only)
@@ -1649,10 +1687,11 @@ function assertHoursWithinCap(existingHours, hoursRequested, buildMessage) {
  * @param {number} params.hoursRequested         - the hours this create/update would add
  * @param {number} [params.excludeTimesheetId]   - Update only: the record being edited, excluded
  *   from "Existing Monthly Hours" so its old hours aren't counted alongside the new value
- * @throws {Error} statusCode 400 if the resulting monthly total would exceed MONTHLY_TARGET_HOURS
+ * @throws {Error} statusCode 400 if the resulting monthly total would exceed the month's cap
  */
 const validateMonthlyHoursLimit = async ({ employeeId, date, hoursRequested, excludeTimesheetId = null, companyId }) => {
   const { year, month } = extractYearMonth(date);
+  const capHours = await monthlyCapService.getCapForCompanyMonth(companyId, month, year);
 
   const existingHours = await timesheetRepository.getMonthlyHours(
     month,
@@ -1662,21 +1701,21 @@ const validateMonthlyHoursLimit = async ({ employeeId, date, hoursRequested, exc
     companyId
   );
 
-  assertHoursWithinCap(existingHours, hoursRequested, (total) =>
-    `Employee total monthly hours cannot exceed ${MONTHLY_TARGET_HOURS}. ` +
+  assertHoursWithinCap(existingHours, hoursRequested, capHours, (total) =>
+    `Employee total monthly hours cannot exceed ${capHours}. ` +
     `Current total after this request would be ${total} hours.`
   );
 };
 
 /**
- * Enforce the employee's 176-hour cap scoped to one specific monthly sheet
+ * Enforce the employee's monthly cap scoped to one specific monthly sheet
  * (timesheet_import_id), for the manual create API: when an Admin backfills
  * an entry that belongs to an already-uploaded monthly sheet, the entry is
  * tagged with that same timesheet_import_id, and the employee's hours WITHIN
- * that one import must not exceed 176 — mirroring the same 176-hour rule
- * the Excel upload itself enforces per employee per import
- * (adjustHoursTo176), just checked against the one import being patched
- * instead of the calendar month.
+ * that one import must not exceed that import's stamped cap (cap_hours) —
+ * mirroring the same rule the Excel upload itself enforces per employee per
+ * import (adjustHoursToCap), just checked against the one import being
+ * patched instead of the calendar month.
  *
  * Reuses the same assertHoursWithinCap() core as validateMonthlyHoursLimit()
  * — only the existing-hours query and error wording differ.
@@ -1686,7 +1725,7 @@ const validateMonthlyHoursLimit = async ({ employeeId, date, hoursRequested, exc
  * @param {number} params.timesheetImportId
  * @param {number} params.hoursRequested - the hours this create would add
  * @throws {Error} statusCode 422 if timesheetImportId doesn't exist
- * @throws {Error} statusCode 400 if the resulting total for this import would exceed MONTHLY_TARGET_HOURS
+ * @throws {Error} statusCode 400 if the resulting total for this import would exceed the import's cap
  */
 const validateImportHoursLimit = async ({ employeeId, timesheetImportId, hoursRequested, companyId }) => {
   const importRecord = await timesheetImportRepository.findImportById(timesheetImportId, companyId);
@@ -1697,9 +1736,10 @@ const validateImportHoursLimit = async ({ employeeId, timesheetImportId, hoursRe
   }
 
   const existingHours = await timesheetRepository.getImportHours(employeeId, timesheetImportId, companyId);
+  const capHours = parseFloat(importRecord.cap_hours);
 
-  assertHoursWithinCap(existingHours, hoursRequested, (total) =>
-    `Employee total logged hours for the selected timesheet cannot exceed ${MONTHLY_TARGET_HOURS}. ` +
+  assertHoursWithinCap(existingHours, hoursRequested, capHours, (total) =>
+    `Employee total logged hours for the selected timesheet cannot exceed ${capHours}. ` +
     `Current total after this request would be ${total} hours.`
   );
 };
@@ -1812,8 +1852,8 @@ const resolveManualEntryReferences = async (data, companyId, options = {}) => {
  * final source of truth, checked here first for a friendly 409 instead of a
  * raw constraint-violation error.
  *
- * Note: the Excel import's 176-hour proportional adjustment
- * (adjustHoursTo176) is a whole-batch calculation across every row an
+ * Note: the Excel import's monthly-cap proportional adjustment
+ * (adjustHoursToCap) is a whole-batch calculation across every row an
  * employee has in that import — it has no meaning for a single standalone
  * entry, so it is intentionally NOT applied here. The admin enters the exact
  * hours for the missing entry, same as what would have been in the original
@@ -1866,6 +1906,8 @@ const createTimesheet = async (data, companyId) => {
   // is_publish is resolved from the employee's own approval-required flag
   // — see timesheetPublishPolicy.js — not left at its DB default.
   insertData.modified_hours = insertData.hours_logged;
+  // A manual entry is never cap-adjusted, so what was entered is also the original.
+  insertData.original_hours = insertData.hours_logged;
   insertData.is_publish = await timesheetPublishPolicy.resolveInitialIsPublishForEmployee(insertData.employee_id, companyId);
   insertData.company_id = companyId;
   return timesheetRepository.create(insertData);
@@ -1976,7 +2018,7 @@ const updateModifiedHours = async (id, modifiedHours, companyId) => {
  *  1. The import must exist.
  *  2. Every `id` in `timesheets` must belong to THIS import — an id from a
  *     different import (or a nonexistent id) fails the whole request.
- *  3. The 176-hour cap (MONTHLY_TARGET_HOURS), enforced per employee, scoped
+ *  3. The monthly cap (this import's stamped cap_hours), enforced per employee, scoped
  *     to this one import — same rule/threshold as validateImportHoursLimit(),
  *     reusing the exact same assertHoursWithinCap() core, but computed
  *     differently since this is a bulk edit of EXISTING rows rather than one
@@ -1995,7 +2037,7 @@ const updateModifiedHours = async (id, modifiedHours, companyId) => {
  * @param {{ id: number, hours: number }[]} timesheets
  * @returns {Promise<number>} count of rows updated
  * @throws {Error} statusCode 422 if the import doesn't exist or any id isn't part of it
- * @throws {Error} statusCode 400 if any affected employee's total would exceed MONTHLY_TARGET_HOURS
+ * @throws {Error} statusCode 400 if any affected employee's total would exceed the import's cap
  */
 const bulkUpdateImportModifiedHours = async (timesheetImportId, timesheets, companyId) => {
   const importRecord = await timesheetImportRepository.findImportById(timesheetImportId, companyId);
@@ -2031,14 +2073,16 @@ const bulkUpdateImportModifiedHours = async (timesheetImportId, timesheets, comp
     bucket.set(row.employee_id, (bucket.get(row.employee_id) || 0) + parseFloat(amount));
   }
 
+  const capHours = parseFloat(importRecord.cap_hours);
   const touchedEmployeeIds = new Set(timesheets.map((ts) => rowById.get(ts.id).employee_id));
   for (const employeeId of touchedEmployeeIds) {
     assertHoursWithinCap(
       existingByEmployee.get(employeeId) || 0,
       requestedByEmployee.get(employeeId) || 0,
+      capHours,
       (total) =>
         `Employee #${employeeId}'s total modified hours for import #${timesheetImportId} cannot exceed ` +
-        `${MONTHLY_TARGET_HOURS}. Current total after this request would be ${total} hours.`
+        `${capHours}. Current total after this request would be ${total} hours.`
     );
   }
 
@@ -2140,6 +2184,23 @@ const deleteTimesheet = async (id, companyId) => {
     await t.rollback();
     throw err;
   }
+
+  // What was just removed — the audit log records WHICH timesheet (who, PO, date, hours, BU).
+  const plain = typeof timesheet.get === 'function' ? timesheet.get({ plain: true }) : timesheet;
+  return {
+    id: plain.id,
+    employee_id: plain.employee_id,
+    employee_name: plain.employee ? plain.employee.full_name : null,
+    employee_code: plain.employee ? plain.employee.employee_code : null,
+    service_po_id: plain.service_po_id,
+    service_po_name: plain.servicePO ? plain.servicePO.service_po_name : null,
+    client_name: plain.servicePO && plain.servicePO.client ? plain.servicePO.client.client_name : null,
+    timesheet_date: plain.timesheet_date,
+    hours_logged: plain.hours_logged != null ? Number(plain.hours_logged) : null,
+    modified_hours: plain.modified_hours != null ? Number(plain.modified_hours) : null,
+    timesheet_import_id: plain.timesheet_import_id ?? null,
+    company_id: plain.company_id ?? null,
+  };
 };
 
 /**
@@ -2248,7 +2309,22 @@ const deleteImports = async (ids, companyId) => {
     }
   }
 
-  return { deletedImportCount, deletedTimesheetRows, deletedErrorRows, revertedWorkLogs, removedFiles, failedFiles };
+  // Which monthly sheets were removed (month, year, BU, source, file, rows) — for the audit log.
+  const deletedImports = records.map((record) => ({
+    import_id: record.id,
+    file_name: record.file_name,
+    source: record.source,
+    month: record.import_month,
+    year: record.import_year,
+    status: record.status,
+    total_rows: record.total_rows,
+    timesheet_rows: record.valid_rows,
+    error_rows: record.error_rows,
+    is_publish: record.is_publish,
+    company_id: record.company_id ?? null,
+  }));
+
+  return { deletedImportCount, deletedTimesheetRows, deletedErrorRows, revertedWorkLogs, removedFiles, failedFiles, deletedImports };
 };
 
 /**
@@ -2334,7 +2410,8 @@ module.exports = {
   getTimesheetById: getTimesheetById,
 
   // Exported for unit testing only — not part of the public service API.
-  adjustHoursTo176,
+  adjustHoursToCap,
+  mergeDuplicateRows,
   isExcludedFromAdjustment,
   resolveManualEntryReferences,
   validateMonthlyHoursLimit,

@@ -125,7 +125,12 @@ function verifyRefreshToken(token) {
  */
 function generateTokens(employee, options = {}) {
   const activeRoleId = employee.activeRoleId ?? null;
+  const jti = crypto.randomUUID();
+  const familyId = options.familyId || crypto.randomUUID();
   const payload = {
+    // Login session id — lets every audit row be traced to the session (login time, IP, browser) it was
+    // done in. Shared by every token of one login lineage (see familyId below).
+    sid: familyId,
     id: employee.id,
     email: employee.email,
     roleIds: employee.roleIds || [],
@@ -134,9 +139,6 @@ function generateTokens(employee, options = {}) {
     activeRoleId,
     employeeId: employee.id,
   };
-
-  const jti = crypto.randomUUID();
-  const familyId = options.familyId || crypto.randomUUID();
 
   const accessToken = signToken(payload);
   const refreshToken = signRefreshToken({ id: employee.id, jti, familyId, activeRoleId });

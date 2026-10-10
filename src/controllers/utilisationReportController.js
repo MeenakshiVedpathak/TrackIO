@@ -18,6 +18,12 @@ const BU_COLUMNS = [
   { key: 'customerNonBillableHours', label: 'Customer Non-Billable Hrs', width: 26, numFmt: HRS_FMT },
   { key: 'totalLoggedHours', label: 'Total Logged Hrs', width: 18, numFmt: HRS_FMT },
   { key: 'utilizationPercentage', label: 'Utilisation %', width: 14, numFmt: PCT_FMT },
+  { key: 'notLoggedHours', label: 'Not Logged Hrs', width: 16, numFmt: HRS_FMT },
+  { key: 'originalBillableHours', label: 'Original Billable Hrs', width: 20, numFmt: HRS_FMT },
+  { key: 'originalNonBillableHours', label: 'Original Non-Billable Hrs', width: 24, numFmt: HRS_FMT },
+  { key: 'originalCustomerNonBillableHours', label: 'Original Customer Non-Billable Hrs', width: 32, numFmt: HRS_FMT },
+  { key: 'originalTotalLoggedHours', label: 'Original Total Logged Hrs', width: 24, numFmt: HRS_FMT },
+  { key: 'originalUtilizationPercentage', label: 'Original Utilisation %', width: 20, numFmt: PCT_FMT },
 ];
 
 const EMP_PROJECT_COLUMNS = [
@@ -78,6 +84,12 @@ const getBuWiseUtilisation = handle({
     customerNonBillableHours: s.customerNonBillableHours,
     totalLoggedHours: s.totalLoggedHours,
     utilizationPercentage: s.utilizationPercentage,
+    notLoggedHours: s.notLoggedHours,
+    originalBillableHours: s.originalBillableHours,
+    originalNonBillableHours: s.originalNonBillableHours,
+    originalCustomerNonBillableHours: s.originalCustomerNonBillableHours,
+    originalTotalLoggedHours: s.originalTotalLoggedHours,
+    originalUtilizationPercentage: s.originalUtilizationPercentage,
   }),
 });
 

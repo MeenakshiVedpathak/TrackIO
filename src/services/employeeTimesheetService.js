@@ -1106,6 +1106,7 @@ const deleteEntry = async (employeeId, companyId, id) => {
 
   await employeeWorkLogRepository.deleteById(id, companyId);
   logger.info('Employee work log entry deleted', { workLogId: id, employeeId, companyId });
+
 };
 
 /**

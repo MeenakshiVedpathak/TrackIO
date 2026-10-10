@@ -8,12 +8,12 @@ module.exports = (sequelize) => {
   Company.init({
     id: { type: DataTypes.INTEGER, autoIncrement: true, primaryKey: true },
     company_code: {
-      type: DataTypes.STRING(20),
+      type: DataTypes.STRING(30),
       allowNull: false,
       unique: { name: 'uq_companies_company_code', msg: 'Company code must be unique.' },
       validate: {
         notEmpty: { msg: 'Company code cannot be empty.' },
-        len: { args: [1, 20], msg: 'Company code must be between 1 and 20 characters.' },
+        len: { args: [1, 30], msg: 'Company code must be between 1 and 30 characters.' },
       },
     },
     company_name: {

@@ -99,6 +99,18 @@ module.exports = (sequelize) => {
           max: { args: [999.99], msg: 'Hours logged cannot exceed 999.99.' },
         },
       },
+      // The hours exactly as the employee logged them / as uploaded, BEFORE the monthly-cap
+      // adjustment (see database/migrations/20261009_add_timesheets_original_hours.sql). hours_logged
+      // and modified_hours hold the cap-adjusted value, so the true original lives only here.
+      // NULL = not recoverable (older Excel import) — readers use COALESCE(original_hours, hours_logged).
+      original_hours: {
+        type: DataTypes.DECIMAL(5, 2),
+        allowNull: true,
+        validate: {
+          min: { args: [0], msg: 'Original hours must be greater than or equal to 0.' },
+          max: { args: [999.99], msg: 'Original hours cannot exceed 999.99.' },
+        },
+      },
       // Admin-adjustable "effective" hours (see database/migrations/
       // 20260722_add_modified_hours_and_is_publish.sql). Set equal to
       // hours_logged at insert time in application code (createTimesheet(),

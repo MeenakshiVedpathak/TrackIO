@@ -3,12 +3,19 @@
 const { sequelize } = require('../models');
 const { QueryTypes } = require('sequelize');
 const { buLessServicePOInTenantSql } = require('../utils/servicePOTenantSql');
+const { capForMonthStartSql } = require('../utils/monthlyCapSql');
+const monthlyCapService = require('../services/monthlyCapService');
 
 /**
  * Report Repository
  * All queries use raw SQL via sequelize.query for complex aggregations
  * and JOINs that are cumbersome to express cleanly through the ORM.
  */
+
+// ORIGINAL (pre-cap-scaling) hours the employee actually logged. Always this
+// expression, independent of hoursSource (which only drives the synced/adjusted
+// figures). NULL original_hours on legacy rows falls back to hours_logged.
+const ORIGINAL_HOURS_SQL = 'COALESCE(t.original_hours, t.hours_logged)';
 
 const formatMonthYear = (month, year) => (
   `${parseInt(year, 10)}-${String(parseInt(month, 10)).padStart(2, '0')}`
@@ -76,7 +83,7 @@ const EMPLOYEE_COMPANY_SCOPE_SQL_MULTI = `(
 /**
  * Get employee hourly rate by joining employees with monthly_costs.
  * per_hour_rate = total_cost / (standard working hours in the month)
- * We use 176 hrs/month (22 working days × 8 hrs) as the standard divisor.
+ * The divisor is the Monthly Cap Hours that month was synced with (176 by default; admin-editable — see monthlyCapService).
  *
  * @param {object} filters
  * @param {number} filters.month
@@ -101,7 +108,7 @@ async function getEmployeeHourlyRate(filters) {
     offset,
   } = filters;
 
-  const STANDARD_HOURS = 176;
+  const STANDARD_HOURS = await monthlyCapService.getCapForMonth(month, year, filters.companyIds);
   const allowedSortColumns = [
     'e.full_name', 'e.employee_code', 'e.designation',
     'mc.salary_cost', 'mc.total_cost', 'per_hour_rate',
@@ -332,7 +339,7 @@ async function getTimesheetSummary(filters) {
   // (including no roleId, or roleId != 5) -> modified_hours. roleId plays no
   // part in this selection — only hoursSource does.
   const hoursCol = (hoursSource === 'O')
-    ? 't.hours_logged'
+    ? 'COALESCE(t.original_hours, t.hours_logged)'
     : 'COALESCE(t.modified_hours, t.hours_logged)';
 
   const allowedSortColumns = [
@@ -382,6 +389,7 @@ async function getTimesheetSummary(filters) {
       t.id                              AS timesheet_id,
       t.timesheet_date,
       ${hoursCol} AS hours_logged,
+      ${ORIGINAL_HOURS_SQL} AS original_hours_logged,
       e.id                              AS employee_id,
       e.employee_code,
       e.full_name,
@@ -461,7 +469,7 @@ async function getServicePOUtilisation(filters) {
   // (including no roleId, or roleId != 5) -> modified_hours. roleId plays no
   // part in this selection — only hoursSource does.
   const hoursCol = (hoursSource === 'O')
-    ? 't.hours_logged'
+    ? 'COALESCE(t.original_hours, t.hours_logged)'
     : 'COALESCE(t.modified_hours, t.hours_logged)';
 
   const allowedSortColumns = [
@@ -525,6 +533,7 @@ async function getServicePOUtilisation(filters) {
       c.client_name,
       st.service_type_name,
       COALESCE(SUM(CASE WHEN t.id IS NOT NULL ${tsDateCondition} THEN ${hoursCol} ELSE 0 END), 0) AS actual_hours,
+      COALESCE(SUM(CASE WHEN t.id IS NOT NULL ${tsDateCondition} THEN ${ORIGINAL_HOURS_SQL} ELSE 0 END), 0) AS original_actual_hours,
       COUNT(DISTINCT t.employee_id)                             AS distinct_resources
     FROM service_pos sp
     INNER JOIN clients c       ON c.id  = sp.client_id
@@ -587,7 +596,7 @@ async function getSubProjectHours(filters) {
   // (including no roleId, or roleId != 5) -> modified_hours. roleId plays no
   // part in this selection — only hoursSource does.
   const hoursCol = (hoursSource === 'O')
-    ? 't.hours_logged'
+    ? 'COALESCE(t.original_hours, t.hours_logged)'
     : 'COALESCE(t.modified_hours, t.hours_logged)';
 
   const allowedSortColumns = [
@@ -648,6 +657,7 @@ async function getSubProjectHours(filters) {
       sp.service_po_name,
       c.client_name,
       COALESCE(SUM(CASE WHEN t.id IS NOT NULL ${tsWhere} THEN ${hoursCol} ELSE 0 END), 0) AS total_hours,
+      COALESCE(SUM(CASE WHEN t.id IS NOT NULL ${tsWhere} THEN ${ORIGINAL_HOURS_SQL} ELSE 0 END), 0) AS original_total_hours,
       COUNT(CASE WHEN t.id IS NOT NULL ${tsWhere} THEN 1 END) AS entry_count,
       COUNT(DISTINCT CASE WHEN t.id IS NOT NULL ${tsWhere} THEN t.employee_id END) AS distinct_resources
     FROM sub_projects subp
@@ -726,7 +736,7 @@ async function getResourceAllocation(filters) {
   // (including no roleId, or roleId != 5) -> modified_hours. roleId plays no
   // part in this selection — only hoursSource does.
   const hoursCol = (hoursSource === 'O')
-    ? 't.hours_logged'
+    ? 'COALESCE(t.original_hours, t.hours_logged)'
     : 'COALESCE(t.modified_hours, t.hours_logged)';
 
   const allowedSortColumns = [
@@ -814,7 +824,8 @@ async function getResourceAllocation(filters) {
       sc.name                                  AS service_category_name,
       st.id                                    AS service_type_id,
       st.service_type_name,
-      COALESCE(SUM(${hoursCol}), 0) AS total_hours_logged
+      COALESCE(SUM(${hoursCol}), 0) AS total_hours_logged,
+      COALESCE(SUM(${ORIGINAL_HOURS_SQL}), 0) AS original_total_hours_logged
     FROM timesheets t
     INNER JOIN employees e      ON e.id  = t.employee_id
     INNER JOIN service_pos sp   ON sp.id = t.service_po_id
@@ -1032,6 +1043,8 @@ async function getEmployeeUtilizationSummary(filters) {
       summary: {
         billable_total: 0, non_billable_total: 0, internal_support_hours: 0,
         team_management_hours: 0, leaves_hours: 0, lnd_hours: 0, others_hours: 0,
+        original_billable_total: 0, original_non_billable_total: 0, original_internal_support_hours: 0,
+        original_team_management_hours: 0, original_leaves_hours: 0, original_lnd_hours: 0, original_others_hours: 0,
       },
     };
   }
@@ -1052,10 +1065,10 @@ async function getEmployeeUtilizationSummary(filters) {
   // (including no roleId, or roleId != 5) -> modified_hours. roleId plays no
   // part in this selection — only hoursSource does.
   const hoursCol = (hoursSource === 'O')
-    ? 't.hours_logged'
+    ? 'COALESCE(t.original_hours, t.hours_logged)'
     : 'COALESCE(t.modified_hours, t.hours_logged)';
 
-  const MONTHLY_CAPACITY = 176;
+  const MONTHLY_CAPACITY = await monthlyCapService.getCapForMonth(month, year, filters.companyIds);
 
   const allowedSortColumns = [
     'full_name', 'designation', 'total_experience', 'company_experience',
@@ -1105,6 +1118,7 @@ async function getEmployeeUtilizationSummary(filters) {
         e.total_experience,
         e.company_experience,
         ${hoursCol} AS hours_logged,
+        ${ORIGINAL_HOURS_SQL} AS original_hours,
         sp.is_billable,
         c.client_name,
         CASE
@@ -1164,7 +1178,17 @@ async function getEmployeeUtilizationSummary(filters) {
       COALESCE(SUM(CASE WHEN is_billable = false              THEN hours_logged END), 0) AS non_billable_total,
       COALESCE(SUM(CASE WHEN is_billable = true               THEN hours_logged END), 0)
         + COALESCE(SUM(CASE WHEN is_billable = false          THEN hours_logged END), 0)
-        - COALESCE(SUM(CASE WHEN nb_category = 'leaves'       THEN hours_logged END), 0) AS total_utilization_excl_leaves_pct
+        - COALESCE(SUM(CASE WHEN nb_category = 'leaves'       THEN hours_logged END), 0) AS total_utilization_excl_leaves_pct,
+      COALESCE(SUM(CASE WHEN nb_category = 'internal_support' THEN original_hours END), 0) AS original_internal_support_hours,
+      COALESCE(SUM(CASE WHEN nb_category = 'team_management' THEN original_hours END), 0) AS original_team_management_hours,
+      COALESCE(SUM(CASE WHEN nb_category = 'leaves' THEN original_hours END), 0) AS original_leaves_hours,
+      COALESCE(SUM(CASE WHEN nb_category = 'lnd' THEN original_hours END), 0) AS original_lnd_hours,
+      COALESCE(SUM(CASE WHEN nb_category = 'others' THEN original_hours END), 0) AS original_others_hours,
+      COALESCE(SUM(CASE WHEN is_billable = true THEN original_hours END), 0) AS original_billable_total,
+      COALESCE(SUM(CASE WHEN is_billable = false THEN original_hours END), 0) AS original_non_billable_total,
+      COALESCE(SUM(CASE WHEN is_billable = true THEN original_hours END), 0)
+        + COALESCE(SUM(CASE WHEN is_billable = false THEN original_hours END), 0)
+        - COALESCE(SUM(CASE WHEN nb_category = 'leaves' THEN original_hours END), 0) AS original_total_utilization_excl_leaves_pct
     FROM categorized
     GROUP BY employee_id, full_name, designation, total_experience, company_experience
     ORDER BY ${safeSort} ${safeOrder}
@@ -1191,7 +1215,14 @@ async function getEmployeeUtilizationSummary(filters) {
       COALESCE(SUM(CASE WHEN nb_category = 'lnd'              THEN hours_logged END), 0) AS lnd_hours,
       COALESCE(SUM(CASE WHEN nb_category = 'others'           THEN hours_logged END), 0) AS others_hours,
       COALESCE(SUM(CASE WHEN is_billable = true               THEN hours_logged END), 0) AS billable_total,
-      COALESCE(SUM(CASE WHEN is_billable = false              THEN hours_logged END), 0) AS non_billable_total
+      COALESCE(SUM(CASE WHEN is_billable = false              THEN hours_logged END), 0) AS non_billable_total,
+      COALESCE(SUM(CASE WHEN nb_category = 'internal_support' THEN original_hours END), 0) AS original_internal_support_hours,
+      COALESCE(SUM(CASE WHEN nb_category = 'team_management' THEN original_hours END), 0) AS original_team_management_hours,
+      COALESCE(SUM(CASE WHEN nb_category = 'leaves' THEN original_hours END), 0) AS original_leaves_hours,
+      COALESCE(SUM(CASE WHEN nb_category = 'lnd' THEN original_hours END), 0) AS original_lnd_hours,
+      COALESCE(SUM(CASE WHEN nb_category = 'others' THEN original_hours END), 0) AS original_others_hours,
+      COALESCE(SUM(CASE WHEN is_billable = true THEN original_hours END), 0) AS original_billable_total,
+      COALESCE(SUM(CASE WHEN is_billable = false THEN original_hours END), 0) AS original_non_billable_total
     FROM categorized
   `;
 
@@ -1210,6 +1241,13 @@ async function getEmployeeUtilizationSummary(filters) {
     leaves_hours: parseFloat(summaryRow.leaves_hours) || 0,
     lnd_hours: parseFloat(summaryRow.lnd_hours) || 0,
     others_hours: parseFloat(summaryRow.others_hours) || 0,
+    original_internal_support_hours: parseFloat(summaryRow.original_internal_support_hours) || 0,
+    original_team_management_hours: parseFloat(summaryRow.original_team_management_hours) || 0,
+    original_leaves_hours: parseFloat(summaryRow.original_leaves_hours) || 0,
+    original_lnd_hours: parseFloat(summaryRow.original_lnd_hours) || 0,
+    original_others_hours: parseFloat(summaryRow.original_others_hours) || 0,
+    original_billable_total: parseFloat(summaryRow.original_billable_total) || 0,
+    original_non_billable_total: parseFloat(summaryRow.original_non_billable_total) || 0,
   };
 
   return { rows, count: parseInt(countResult[0].total, 10), summary };
@@ -1262,10 +1300,10 @@ async function getServicePOSummary(filters) {
   // (including no roleId, or roleId != 5) -> modified_hours. roleId plays no
   // part in this selection — only hoursSource does.
   const hoursCol = (hoursSource === 'O')
-    ? 't.hours_logged'
+    ? 'COALESCE(t.original_hours, t.hours_logged)'
     : 'COALESCE(t.modified_hours, t.hours_logged)';
 
-  const STANDARD_HOURS = 176;
+  const STANDARD_HOURS = await monthlyCapService.getCapForMonth(month, year, filters.companyIds);
 
   const allowedSortColumns = [
     'c.client_name', 'sp.service_po_name', 'sp.start_date', 'sp.end_date',
@@ -1362,6 +1400,7 @@ async function getServicePOSummary(filters) {
       st.id                                                              AS service_type_id,
       st.service_type_name                                               AS service_type,
       COALESCE(prev.hours_delivered, 0)                                  AS hours_delivered_before_month,
+      COALESCE(prev.original_hours_delivered, 0)                         AS original_hours_delivered_before_month,
       COALESCE(rb.budgeted_hours, 0)                                     AS exp_hours,
       CASE
         WHEN sp.is_billable = true
@@ -1373,7 +1412,8 @@ async function getServicePOSummary(filters) {
     INNER JOIN service_types st ON st.id = sp.service_type_id
     INNER JOIN service_categories sc ON sc.id = st.service_category_id
     LEFT JOIN (
-      SELECT service_po_id, SUM(${hoursCol}) AS hours_delivered
+      SELECT service_po_id, SUM(${hoursCol}) AS hours_delivered,
+             SUM(${ORIGINAL_HOURS_SQL}) AS original_hours_delivered
       FROM timesheets t
       WHERE timesheet_date < MAKE_DATE(:yearNum, :monthNum, 1)
         ${publishGuard}
@@ -1483,7 +1523,7 @@ async function getInvoicePOSummary(filters) {
   // (including no roleId, or roleId != 5) -> modified_hours. roleId plays no
   // part in this selection — only hoursSource does.
   const hoursCol = (hoursSource === 'O')
-    ? 't.hours_logged'
+    ? 'COALESCE(t.original_hours, t.hours_logged)'
     : 'COALESCE(t.modified_hours, t.hours_logged)';
 
   const allowedSortColumns = [
@@ -1581,7 +1621,9 @@ async function getInvoicePOSummary(filters) {
       st.id                                                              AS service_type_id,
       st.service_type_name                                               AS service_type,
       COALESCE(prev.hours_delivered, 0)                                  AS hours_delivered_before_month,
+      COALESCE(prev.original_hours_delivered, 0)                         AS original_hours_delivered_before_month,
       COALESCE(curr.hours_delivered_current_month, 0)                    AS hours_delivered_current_month,
+      COALESCE(curr.original_hours_delivered_current_month, 0)           AS original_hours_delivered_current_month,
       COALESCE(rb.budgeted_hours, 0)                                     AS exp_hours,
       CASE
         WHEN sp.is_billable = true
@@ -1617,7 +1659,8 @@ async function getInvoicePOSummary(filters) {
           AND spmb.month = :monthNum
           AND spmb.year  = :yearNum
     LEFT JOIN (
-      SELECT service_po_id, SUM(${hoursCol}) AS hours_delivered
+      SELECT service_po_id, SUM(${hoursCol}) AS hours_delivered,
+             SUM(${ORIGINAL_HOURS_SQL}) AS original_hours_delivered
       FROM timesheets t
       WHERE timesheet_date < MAKE_DATE(:yearNum, :monthNum, 1)
         ${publishGuard}
@@ -1627,7 +1670,8 @@ async function getInvoicePOSummary(filters) {
       SELECT
         t.service_po_id,
         SUM(${hoursCol} * COALESCE(mc.total_cost, 0)) AS billable_amount,
-        SUM(${hoursCol})                              AS hours_delivered_current_month
+        SUM(${hoursCol})                              AS hours_delivered_current_month,
+        SUM(${ORIGINAL_HOURS_SQL})                    AS original_hours_delivered_current_month
       FROM timesheets t
       LEFT JOIN monthly_costs mc
              ON mc.employee_id = t.employee_id
@@ -1690,7 +1734,7 @@ async function getResourceUtilization(filters) {
   // (including no roleId, or roleId != 5) -> modified_hours. roleId plays no
   // part in this selection — only hoursSource does.
   const hoursCol = (hoursSource === 'O')
-    ? 't.hours_logged'
+    ? 'COALESCE(t.original_hours, t.hours_logged)'
     : 'COALESCE(t.modified_hours, t.hours_logged)';
 
   const replacements = {
@@ -1778,7 +1822,8 @@ async function getResourceUtilization(filters) {
       st.service_type_name,
       sc.id            AS category_id,
       sc.name          AS category_name,
-      ROUND(SUM(${hoursCol})::NUMERIC, 4) AS hours
+      ROUND(SUM(${hoursCol})::NUMERIC, 4) AS hours,
+      ROUND(SUM(${ORIGINAL_HOURS_SQL})::NUMERIC, 4) AS original_hours
     FROM timesheets t
     JOIN employees e           ON e.id  = t.employee_id  AND e.is_deleted = false
     JOIN service_pos sp        ON sp.id = t.service_po_id AND sp.is_deleted = false
@@ -1827,7 +1872,7 @@ async function getMonthlyResourceUtilization(filters) {
       columns: [],
       rows: [],
       count: 0,
-      summary: { billable_total: 0, non_billable_total: 0, total_hours: 0, leaves_hours: 0, total_utilization: 0, employee_count: 0 },
+      summary: { billable_total: 0, non_billable_total: 0, total_hours: 0, leaves_hours: 0, total_utilization: 0, original_billable_total: 0, original_non_billable_total: 0, original_total_hours: 0, original_leaves_hours: 0, original_total_utilization: 0, employee_count: 0 },
     };
   }
 
@@ -1836,7 +1881,7 @@ async function getMonthlyResourceUtilization(filters) {
   // (including no roleId, or roleId != 5) -> modified_hours. roleId plays no
   // part in this selection — only hoursSource does.
   const hoursCol = (hoursSource === 'O')
-    ? 't.hours_logged'
+    ? 'COALESCE(t.original_hours, t.hours_logged)'
     : 'COALESCE(t.modified_hours, t.hours_logged)';
 
   const replacements = {
@@ -1845,6 +1890,7 @@ async function getMonthlyResourceUtilization(filters) {
     limit,
     offset,
     companyIds: filters.companyIds,
+    monthlyCap: await monthlyCapService.getCapForMonth(month, year, filters.companyIds),
   };
 
   const conditions = [
@@ -1907,9 +1953,13 @@ async function getMonthlyResourceUtilization(filters) {
   const summaryQuery = `
     SELECT
       COUNT(DISTINCT t.employee_id) AS employee_count,
+      :monthlyCap AS monthly_capacity_per_employee,
       ROUND(SUM(CASE WHEN sc.name ILIKE '%billable%' AND sc.name NOT ILIKE '%non%' THEN ${hoursCol} ELSE 0 END)::numeric, 4) AS billable_total,
       ROUND(SUM(CASE WHEN NOT (sc.name ILIKE '%billable%' AND sc.name NOT ILIKE '%non%') THEN ${hoursCol} ELSE 0 END)::numeric, 4) AS non_billable_total,
-      ROUND(SUM(CASE WHEN st.service_type_name ILIKE '%leave%' OR st.service_type_name ILIKE '%vacation%' OR st.service_type_name ILIKE '%holiday%' THEN ${hoursCol} ELSE 0 END)::numeric, 4) AS leaves_hours
+      ROUND(SUM(CASE WHEN st.service_type_name ILIKE '%leave%' OR st.service_type_name ILIKE '%vacation%' OR st.service_type_name ILIKE '%holiday%' THEN ${hoursCol} ELSE 0 END)::numeric, 4) AS leaves_hours,
+      ROUND(SUM(CASE WHEN sc.name ILIKE '%billable%' AND sc.name NOT ILIKE '%non%' THEN ${ORIGINAL_HOURS_SQL} ELSE 0 END)::numeric, 4) AS original_billable_total,
+      ROUND(SUM(CASE WHEN NOT (sc.name ILIKE '%billable%' AND sc.name NOT ILIKE '%non%') THEN ${ORIGINAL_HOURS_SQL} ELSE 0 END)::numeric, 4) AS original_non_billable_total,
+      ROUND(SUM(CASE WHEN st.service_type_name ILIKE '%leave%' OR st.service_type_name ILIKE '%vacation%' OR st.service_type_name ILIKE '%holiday%' THEN ${ORIGINAL_HOURS_SQL} ELSE 0 END)::numeric, 4) AS original_leaves_hours
     ${baseFrom}
     ${whereClause}
   `;
@@ -1947,14 +1997,15 @@ async function getMonthlyResourceUtilization(filters) {
       e.total_experience,
       e.company_experience,
       e.resource_description,
-      176                       AS monthly_capacity,
-      176                       AS monthly_billing_capacity,
+      :monthlyCap               AS monthly_capacity,
+      :monthlyCap               AS monthly_billing_capacity,
       COALESCE(ec.clients, '')  AS clients,
       st.id                     AS service_type_id,
       st.service_type_name,
       sc.id                     AS category_id,
       sc.name                   AS category_name,
-      ROUND(SUM(${hoursCol})::NUMERIC, 4) AS hours
+      ROUND(SUM(${hoursCol})::NUMERIC, 4) AS hours,
+      ROUND(SUM(${ORIGINAL_HOURS_SQL})::NUMERIC, 4) AS original_hours
     ${baseFrom}
     JOIN emp_page ep  ON ep.employee_id = e.id
     LEFT JOIN emp_clients ec ON ec.employee_id = e.id
@@ -1978,6 +2029,10 @@ async function getMonthlyResourceUtilization(filters) {
   const non_billable_total = parseFloat(summaryRow.non_billable_total) || 0;
   const leaves_hours = parseFloat(summaryRow.leaves_hours) || 0;
   const employee_count = parseInt(summaryRow.employee_count, 10) || 0;
+  const original_billable_total = parseFloat(summaryRow.original_billable_total) || 0;
+  const original_non_billable_total = parseFloat(summaryRow.original_non_billable_total) || 0;
+  const original_leaves_hours = parseFloat(summaryRow.original_leaves_hours) || 0;
+  const original_total_hours = original_billable_total + original_non_billable_total;
   const total_hours = billable_total + non_billable_total;
 
   return {
@@ -1990,6 +2045,11 @@ async function getMonthlyResourceUtilization(filters) {
       total_hours,
       leaves_hours,
       total_utilization: total_hours - leaves_hours,
+      original_billable_total,
+      original_non_billable_total,
+      original_total_hours,
+      original_leaves_hours,
+      original_total_utilization: original_total_hours - original_leaves_hours,
       employee_count,
     },
   };
@@ -2007,7 +2067,7 @@ async function getMonthlyResourceUtilization(filters) {
  * The employee × service-type pivot shape (columns/rows) returned here is
  * identical to getMonthlyResourceUtilization's, so it feeds the SAME
  * buildPivotResponse() aggregation in reportService.js — billable/
- * non-billable classification, leave detection, and the 176-hr
+ * non-billable classification, leave detection, and the monthly-cap
  * total_utilization/monthly_capacity formula are reused as-is, not
  * reimplemented.
  *
@@ -2029,7 +2089,7 @@ async function getResourceMonthlyUtilization(filters) {
       columns: [],
       rows: [],
       count: 0,
-      summary: { billable_total: 0, non_billable_total: 0, total_hours: 0, leaves_hours: 0, total_utilization: 0, employee_count: 0 },
+      summary: { billable_total: 0, non_billable_total: 0, total_hours: 0, leaves_hours: 0, total_utilization: 0, original_billable_total: 0, original_non_billable_total: 0, original_total_hours: 0, original_leaves_hours: 0, original_total_utilization: 0, employee_count: 0 },
     };
   }
 
@@ -2041,7 +2101,7 @@ async function getResourceMonthlyUtilization(filters) {
   // (including no roleId, or roleId != 5) -> modified_hours. roleId plays no
   // part in this selection — only hoursSource does.
   const hoursCol = (hoursSource === 'O')
-    ? 't.hours_logged'
+    ? 'COALESCE(t.original_hours, t.hours_logged)'
     : 'COALESCE(t.modified_hours, t.hours_logged)';
 
   const replacements = {
@@ -2050,6 +2110,7 @@ async function getResourceMonthlyUtilization(filters) {
     limit,
     offset,
     companyIds: filters.companyIds,
+    monthlyCap: await monthlyCapService.getCapForMonth(month, year, filters.companyIds),
   };
 
   const conditions = [
@@ -2130,16 +2191,20 @@ async function getResourceMonthlyUtilization(filters) {
   const summaryQuery = `
     SELECT
       COUNT(DISTINCT t.employee_id) AS employee_count,
+      :monthlyCap AS monthly_capacity_per_employee,
       ROUND(SUM(CASE WHEN sc.name ILIKE '%billable%' AND sc.name NOT ILIKE '%non%' THEN ${hoursCol} ELSE 0 END)::numeric, 4) AS billable_total,
       ROUND(SUM(CASE WHEN NOT (sc.name ILIKE '%billable%' AND sc.name NOT ILIKE '%non%') THEN ${hoursCol} ELSE 0 END)::numeric, 4) AS non_billable_total,
-      ROUND(SUM(CASE WHEN st.service_type_name ILIKE '%leave%' OR st.service_type_name ILIKE '%vacation%' OR st.service_type_name ILIKE '%holiday%' THEN ${hoursCol} ELSE 0 END)::numeric, 4) AS leaves_hours
+      ROUND(SUM(CASE WHEN st.service_type_name ILIKE '%leave%' OR st.service_type_name ILIKE '%vacation%' OR st.service_type_name ILIKE '%holiday%' THEN ${hoursCol} ELSE 0 END)::numeric, 4) AS leaves_hours,
+      ROUND(SUM(CASE WHEN sc.name ILIKE '%billable%' AND sc.name NOT ILIKE '%non%' THEN ${ORIGINAL_HOURS_SQL} ELSE 0 END)::numeric, 4) AS original_billable_total,
+      ROUND(SUM(CASE WHEN NOT (sc.name ILIKE '%billable%' AND sc.name NOT ILIKE '%non%') THEN ${ORIGINAL_HOURS_SQL} ELSE 0 END)::numeric, 4) AS original_non_billable_total,
+      ROUND(SUM(CASE WHEN st.service_type_name ILIKE '%leave%' OR st.service_type_name ILIKE '%vacation%' OR st.service_type_name ILIKE '%holiday%' THEN ${ORIGINAL_HOURS_SQL} ELSE 0 END)::numeric, 4) AS original_leaves_hours
     ${baseFrom}
     ${whereClause}
   `;
 
   // CTE: paged employee list. Main SELECT: employee × service_type hours,
-  // with the fixed 176-hr monthly_capacity the utilization % is computed
-  // against (same literal getMonthlyResourceUtilization uses).
+  // with the monthly_capacity (that month's Monthly Cap Hours) the utilization %
+  // is computed against (same value getMonthlyResourceUtilization uses).
   const dataQuery = `
     WITH emp_page AS (
       SELECT DISTINCT e.id AS employee_id, e.full_name
@@ -2152,12 +2217,13 @@ async function getResourceMonthlyUtilization(filters) {
       e.id                      AS employee_id,
       e.employee_code,
       e.full_name,
-      176                       AS monthly_capacity,
+      :monthlyCap               AS monthly_capacity,
       st.id                     AS service_type_id,
       st.service_type_name,
       sc.id                     AS category_id,
       sc.name                   AS category_name,
-      ROUND(SUM(${hoursCol})::NUMERIC, 4) AS hours
+      ROUND(SUM(${hoursCol})::NUMERIC, 4) AS hours,
+      ROUND(SUM(${ORIGINAL_HOURS_SQL})::NUMERIC, 4) AS original_hours
     ${baseFrom}
     JOIN emp_page ep  ON ep.employee_id = e.id
     ${whereClause}
@@ -2178,6 +2244,10 @@ async function getResourceMonthlyUtilization(filters) {
   const non_billable_total = parseFloat(summaryRow.non_billable_total) || 0;
   const leaves_hours = parseFloat(summaryRow.leaves_hours) || 0;
   const employee_count = parseInt(summaryRow.employee_count, 10) || 0;
+  const original_billable_total = parseFloat(summaryRow.original_billable_total) || 0;
+  const original_non_billable_total = parseFloat(summaryRow.original_non_billable_total) || 0;
+  const original_leaves_hours = parseFloat(summaryRow.original_leaves_hours) || 0;
+  const original_total_hours = original_billable_total + original_non_billable_total;
   const total_hours = billable_total + non_billable_total;
 
   return {
@@ -2190,6 +2260,11 @@ async function getResourceMonthlyUtilization(filters) {
       total_hours,
       leaves_hours,
       total_utilization: total_hours - leaves_hours,
+      original_billable_total,
+      original_non_billable_total,
+      original_total_hours,
+      original_leaves_hours,
+      original_total_utilization: original_total_hours - original_leaves_hours,
       employee_count,
     },
   };
@@ -2222,7 +2297,7 @@ async function getResourseProjectUtilizationReport(filters) {
   // (including no roleId, or roleId != 5) -> modified_hours. roleId plays no
   // part in this selection — only hoursSource does.
   const hoursCol = (hoursSource === 'O')
-    ? 't.hours_logged'
+    ? 'COALESCE(t.original_hours, t.hours_logged)'
     : 'COALESCE(t.modified_hours, t.hours_logged)';
 
   const monthYear = `${year}-${String(month).padStart(2, '0')}`;
@@ -2373,7 +2448,8 @@ async function getResourseProjectUtilizationReport(filters) {
       subp.sub_project_name AS project_sub_type,
       sc.name AS category,
       c.client_name AS client,
-      ROUND(SUM(${hoursCol})::numeric, 2) AS project_hours
+      ROUND(SUM(${hoursCol})::numeric, 2) AS project_hours,
+      ROUND(SUM(${ORIGINAL_HOURS_SQL})::numeric, 2) AS original_project_hours
     FROM timesheets t
     INNER JOIN emp_page ep
       ON ep.employee_id = t.employee_id
@@ -2483,7 +2559,7 @@ async function getClientServicePOHours(filters) {
   // (including no roleId, or roleId != 5) -> modified_hours falling back to
   // hours_logged. Same convention used throughout this file.
   const hoursCol = (hoursSource === 'O')
-    ? 't.hours_logged'
+    ? 'COALESCE(t.original_hours, t.hours_logged)'
     : 'COALESCE(t.modified_hours, t.hours_logged)';
 
   const replacements = { companyIds, startDate, endDate };
@@ -2530,7 +2606,8 @@ async function getClientServicePOHours(filters) {
       sp.id                               AS service_po_id,
       sp.service_po_code,
       sp.service_po_name,
-      ROUND(SUM(${hoursCol})::NUMERIC, 2) AS hours
+      ROUND(SUM(${hoursCol})::NUMERIC, 2) AS hours,
+      ROUND(SUM(${ORIGINAL_HOURS_SQL})::NUMERIC, 2) AS original_hours
     FROM timesheets t
     INNER JOIN service_pos sp   ON sp.id = t.service_po_id
     INNER JOIN clients c        ON c.id  = sp.client_id
@@ -2628,20 +2705,37 @@ function buildTrendFilters(filters, replacements) {
  * @returns {Promise<object[]>} rows: { client_id, client_name, total_hours }
  */
 async function getClientCostAnalyticsHours(filters) {
-  const { companyIds, hoursSource } = filters;
-  const hoursCol = (hoursSource === 'O') ? 't.hours_logged' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const { companyIds, hoursSource, startDate, endDate, clientIds, roleId } = filters;
+  const hoursCol = (hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  if (isEmptyCompanyScope(companyIds)) return [];
+
+  // Scoped by the Service PO's BU — the SAME rule the cost half (getClientCostAnalyticsCost) uses — so a
+  // client's hours and cost always describe the same set of POs (before, hours used the timesheet's
+  // own company_id while cost used the PO's, so a BU / Sub-BU filter could split them apart).
+  const replacements = { companyIds };
+  const conditions = ['(sp.company_id IN (:companyIds) OR ' + buLessServicePOInTenantSql('sp', 'companyIds') + ')'];
+  if (startDate && endDate) {
+    conditions.push('t.timesheet_date >= :startDate AND t.timesheet_date <= :endDate');
+    replacements.startDate = startDate;
+    replacements.endDate = endDate;
+  }
+  if (clientIds && clientIds.length) { conditions.push('c.id IN (:clientIds)'); replacements.clientIds = clientIds; }
+  if (Number(roleId) === 5) {
+    conditions.push('EXISTS (SELECT 1 FROM timesheet_import_history h WHERE h.id = t.timesheet_import_id AND h.is_publish = true)');
+  }
 
   return sequelize.query(
     `SELECT
        c.id AS client_id,
        c.client_name,
-       ROUND(SUM(${hoursCol})::NUMERIC, 2) AS total_hours
+       ROUND(SUM(${hoursCol})::NUMERIC, 2) AS total_hours,
+       ROUND(SUM(${ORIGINAL_HOURS_SQL})::NUMERIC, 2) AS original_total_hours
      FROM timesheets t
      INNER JOIN service_pos sp ON sp.id = t.service_po_id
      INNER JOIN clients c      ON c.id  = sp.client_id
-     WHERE t.company_id IN (:companyIds)
+     WHERE ${conditions.join(' AND ')}
      GROUP BY c.id, c.client_name`,
-    { replacements: { companyIds }, type: QueryTypes.SELECT }
+    { replacements, type: QueryTypes.SELECT }
   );
 }
 
@@ -2655,6 +2749,8 @@ async function getClientCostAnalyticsHours(filters) {
  */
 async function getClientCostAnalyticsCost(filters) {
   const { companyIds } = filters;
+  if (isEmptyCompanyScope(companyIds)) return [];
+  const { conditions, replacements } = clientCostBudgetFilters(filters);
 
   return sequelize.query(
     `SELECT
@@ -2664,10 +2760,27 @@ async function getClientCostAnalyticsCost(filters) {
      FROM service_po_monthly_budgets spmb
      INNER JOIN service_pos sp ON sp.id = spmb.service_po_id
      INNER JOIN clients c      ON c.id  = sp.client_id
-     WHERE (sp.company_id IN (:companyIds) OR ${buLessServicePOInTenantSql('sp', 'companyIds')})
+     WHERE ${conditions.join(' AND ')}
      GROUP BY c.id, c.client_name`,
-    { replacements: { companyIds }, type: QueryTypes.SELECT }
+    { replacements, type: QueryTypes.SELECT }
   );
+}
+
+/**
+ * Shared WHERE for the Client Cost Analytics cost/matrix queries: the PO's BU scope, an optional
+ * month window on the Invoice Master (service_po_monthly_budgets.month/year) and an optional client list.
+ */
+function clientCostBudgetFilters(filters) {
+  const { companyIds, startDate, endDate, clientIds } = filters;
+  const replacements = { companyIds };
+  const conditions = ['(sp.company_id IN (:companyIds) OR ' + buLessServicePOInTenantSql('sp', 'companyIds') + ')'];
+  if (startDate && endDate) {
+    conditions.push('make_date(spmb.year, spmb.month, 1) >= date_trunc(\'month\', :startDate::date)::date AND make_date(spmb.year, spmb.month, 1) <= :endDate::date');
+    replacements.startDate = startDate;
+    replacements.endDate = endDate;
+  }
+  if (clientIds && clientIds.length) { conditions.push('c.id IN (:clientIds)'); replacements.clientIds = clientIds; }
+  return { conditions, replacements };
 }
 
 /**
@@ -2681,6 +2794,8 @@ async function getClientCostAnalyticsCost(filters) {
  */
 async function getClientCategoryCostMatrixReport(filters) {
   const { companyIds } = filters;
+  if (isEmptyCompanyScope(companyIds)) return [];
+  const { conditions, replacements } = clientCostBudgetFilters(filters);
 
   return sequelize.query(
     `SELECT
@@ -2693,10 +2808,10 @@ async function getClientCategoryCostMatrixReport(filters) {
      INNER JOIN clients c             ON c.id  = sp.client_id
      INNER JOIN service_types st      ON st.id = sp.service_type_id
      LEFT  JOIN service_categories sc ON sc.id = st.service_category_id
-     WHERE (sp.company_id IN (:companyIds) OR ${buLessServicePOInTenantSql('sp', 'companyIds')})
+     WHERE ${conditions.join(' AND ')}
      GROUP BY c.id, c.client_name, category_name
      ORDER BY c.client_name, category_name`,
-    { replacements: { companyIds }, type: QueryTypes.SELECT }
+    { replacements, type: QueryTypes.SELECT }
   );
 }
 
@@ -2712,13 +2827,14 @@ async function getClientCategoryCostMatrixReport(filters) {
 async function getClientWiseAnalyticsHours(filters) {
   const replacements = {};
   const whereClause = buildTrendFilters(filters, replacements);
-  const hoursCol = (filters.hoursSource === 'O') ? 't.hours_logged' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const hoursCol = (filters.hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
 
   return sequelize.query(
     `SELECT
        c.id AS client_id,
        c.client_name,
        ROUND(SUM(${hoursCol})::NUMERIC, 2) AS total_hours,
+       ROUND(SUM(${ORIGINAL_HOURS_SQL})::NUMERIC, 2) AS original_total_hours,
        COUNT(DISTINCT sp.id) AS total_projects
      FROM timesheets t
      INNER JOIN service_pos sp   ON sp.id = t.service_po_id
@@ -2847,7 +2963,7 @@ async function getMonthlyCostByCategory(filters) {
 async function getMonthlyHoursByCategory(filters) {
   const replacements = {};
   const whereClause = buildTrendFilters(filters, replacements);
-  const hoursCol = (filters.hoursSource === 'O') ? 't.hours_logged' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const hoursCol = (filters.hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
 
   return sequelize.query(
     `SELECT
@@ -2855,7 +2971,8 @@ async function getMonthlyHoursByCategory(filters) {
        EXTRACT(MONTH FROM t.timesheet_date)::int AS month,
        COALESCE(sc.name, 'Uncategorized')         AS category_name,
        sc.report_bucket_key,
-       ROUND(SUM(${hoursCol})::NUMERIC, 2)     AS hours
+       ROUND(SUM(${hoursCol})::NUMERIC, 2)     AS hours,
+       ROUND(SUM(${ORIGINAL_HOURS_SQL})::NUMERIC, 2)     AS original_hours
      FROM timesheets t
      INNER JOIN service_pos sp   ON sp.id = t.service_po_id
      INNER JOIN service_types st ON st.id = sp.service_type_id
@@ -2879,21 +2996,30 @@ async function getMonthlyHoursByCategory(filters) {
 async function getMonthlyUtilizationTrend(filters) {
   const replacements = {};
   const whereClause = buildTrendFilters(filters, replacements);
-  const hoursCol = (filters.hoursSource === 'O') ? 't.hours_logged' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const hoursCol = (filters.hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
 
+  // employee_count x cap_hours is the month's CAPACITY: the people who logged anything that month times
+  // the Monthly Cap Hours that month was synced with (same convention as the Month-wise Bench report).
   return sequelize.query(
-    `SELECT
-       EXTRACT(YEAR  FROM t.timesheet_date)::int AS year,
-       EXTRACT(MONTH FROM t.timesheet_date)::int AS month,
-       ROUND(SUM(${hoursCol})::NUMERIC, 2) AS total_hours,
-       ROUND(COALESCE(SUM(CASE WHEN sc.report_bucket_key = 'billable' THEN ${hoursCol} END), 0)::NUMERIC, 2) AS billable_hours
-     FROM timesheets t
-     INNER JOIN service_pos sp   ON sp.id = t.service_po_id
-     INNER JOIN service_types st ON st.id = sp.service_type_id
-     LEFT JOIN service_categories sc ON sc.id = st.service_category_id
-     WHERE ${whereClause}
-     GROUP BY year, month
-     ORDER BY year, month`,
+    `WITH monthly AS (
+       SELECT
+         EXTRACT(YEAR  FROM t.timesheet_date)::int AS year,
+         EXTRACT(MONTH FROM t.timesheet_date)::int AS month,
+         ROUND(SUM(${hoursCol})::NUMERIC, 2) AS total_hours,
+         ROUND(COALESCE(SUM(CASE WHEN sc.report_bucket_key = 'billable' THEN ${hoursCol} END), 0)::NUMERIC, 2) AS billable_hours,
+         ROUND(SUM(${ORIGINAL_HOURS_SQL})::NUMERIC, 2) AS original_total_hours,
+         ROUND(COALESCE(SUM(CASE WHEN sc.report_bucket_key = 'billable' THEN ${ORIGINAL_HOURS_SQL} END), 0)::NUMERIC, 2) AS original_billable_hours,
+         COUNT(DISTINCT t.employee_id)::int AS employee_count
+       FROM timesheets t
+       INNER JOIN service_pos sp   ON sp.id = t.service_po_id
+       INNER JOIN service_types st ON st.id = sp.service_type_id
+       LEFT JOIN service_categories sc ON sc.id = st.service_category_id
+       WHERE ${whereClause}
+       GROUP BY year, month
+     )
+     SELECT m.*, ${capForMonthStartSql('make_date(m.year, m.month, 1)', 'companyIds')} AS cap_hours
+     FROM monthly m
+     ORDER BY m.year, m.month`,
     { replacements, type: QueryTypes.SELECT }
   );
 }
@@ -2909,13 +3035,14 @@ async function getMonthlyUtilizationTrend(filters) {
 async function getLeaveHoursTrendReport(filters) {
   const replacements = {};
   const whereClause = buildTrendFilters(filters, replacements);
-  const hoursCol = (filters.hoursSource === 'O') ? 't.hours_logged' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const hoursCol = (filters.hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
 
   return sequelize.query(
     `SELECT
        EXTRACT(YEAR  FROM t.timesheet_date)::int AS year,
        EXTRACT(MONTH FROM t.timesheet_date)::int AS month,
-       ROUND(SUM(${hoursCol})::NUMERIC, 2) AS leave_hours
+       ROUND(SUM(${hoursCol})::NUMERIC, 2) AS leave_hours,
+       ROUND(SUM(${ORIGINAL_HOURS_SQL})::NUMERIC, 2) AS original_leave_hours
      FROM timesheets t
      INNER JOIN service_pos sp   ON sp.id = t.service_po_id
      INNER JOIN service_types st ON st.id = sp.service_type_id
@@ -2938,13 +3065,14 @@ async function getLeaveHoursTrendReport(filters) {
 async function getNoWorkTrendReport(filters) {
   const replacements = {};
   const whereClause = buildTrendFilters(filters, replacements);
-  const hoursCol = (filters.hoursSource === 'O') ? 't.hours_logged' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const hoursCol = (filters.hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
 
   return sequelize.query(
     `SELECT
        EXTRACT(YEAR  FROM t.timesheet_date)::int AS year,
        EXTRACT(MONTH FROM t.timesheet_date)::int AS month,
-       ROUND(SUM(${hoursCol})::NUMERIC, 2) AS no_work_hours
+       ROUND(SUM(${hoursCol})::NUMERIC, 2) AS no_work_hours,
+       ROUND(SUM(${ORIGINAL_HOURS_SQL})::NUMERIC, 2) AS original_no_work_hours
      FROM timesheets t
      INNER JOIN service_pos sp ON sp.id = t.service_po_id
      WHERE ${whereClause}
@@ -2970,7 +3098,7 @@ async function getNoWorkTrendReport(filters) {
 async function getResourceUtilizationTrend(filters) {
   const replacements = {};
   const whereClause = buildTrendFilters(filters, replacements);
-  const hoursCol = (filters.hoursSource === 'O') ? 't.hours_logged' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const hoursCol = (filters.hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
 
   return sequelize.query(
     `SELECT
@@ -2980,7 +3108,9 @@ async function getResourceUtilizationTrend(filters) {
        e.employee_code,
        e.full_name,
        ROUND(SUM(${hoursCol})::NUMERIC, 2) AS total_hours,
-       ROUND(COALESCE(SUM(CASE WHEN sc.report_bucket_key = 'billable' THEN ${hoursCol} END), 0)::NUMERIC, 2) AS billable_hours
+       ROUND(COALESCE(SUM(CASE WHEN sc.report_bucket_key = 'billable' THEN ${hoursCol} END), 0)::NUMERIC, 2) AS billable_hours,
+       ROUND(SUM(${ORIGINAL_HOURS_SQL})::NUMERIC, 2) AS original_total_hours,
+       ROUND(COALESCE(SUM(CASE WHEN sc.report_bucket_key = 'billable' THEN ${ORIGINAL_HOURS_SQL} END), 0)::NUMERIC, 2) AS original_billable_hours
      FROM timesheets t
      INNER JOIN employees e      ON e.id  = t.employee_id
      INNER JOIN service_pos sp   ON sp.id = t.service_po_id
@@ -3007,7 +3137,7 @@ async function getResourceUtilizationTrend(filters) {
 async function getServicePOHoursTrend(filters) {
   const replacements = {};
   const whereClause = buildTrendFilters(filters, replacements);
-  const hoursCol = (filters.hoursSource === 'O') ? 't.hours_logged' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const hoursCol = (filters.hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
 
   return sequelize.query(
     `SELECT
@@ -3018,7 +3148,8 @@ async function getServicePOHoursTrend(filters) {
        sp.service_po_name,
        sp.client_id,
        c.client_name,
-       ROUND(SUM(${hoursCol})::NUMERIC, 2) AS total_hours
+       ROUND(SUM(${hoursCol})::NUMERIC, 2) AS total_hours,
+       ROUND(SUM(${ORIGINAL_HOURS_SQL})::NUMERIC, 2) AS original_total_hours
      FROM timesheets t
      INNER JOIN service_pos sp   ON sp.id = t.service_po_id
      INNER JOIN service_types st ON st.id = sp.service_type_id
@@ -3098,7 +3229,7 @@ async function getServicePOCostBudgetByMonth(filters) {
 async function getEmployeeBenchDetailReport(filters) {
   const replacements = {};
   const whereClause = buildTrendFilters(filters, replacements);
-  const hoursCol = (filters.hoursSource === 'O') ? 't.hours_logged' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const hoursCol = (filters.hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
 
   return sequelize.query(
     `SELECT
@@ -3106,7 +3237,8 @@ async function getEmployeeBenchDetailReport(filters) {
        e.employee_code,
        e.full_name,
        sp.service_po_name,
-       ROUND(SUM(${hoursCol})::NUMERIC, 2) AS hours
+       ROUND(SUM(${hoursCol})::NUMERIC, 2) AS hours,
+       ROUND(SUM(${ORIGINAL_HOURS_SQL})::NUMERIC, 2) AS original_hours
      FROM timesheets t
      INNER JOIN employees e    ON e.id  = t.employee_id
      INNER JOIN service_pos sp ON sp.id = t.service_po_id

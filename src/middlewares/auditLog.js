@@ -2,6 +2,12 @@
 
 const { AuditLog } = require('../models');
 const logger = require('../utils/logger');
+const requestContext = require('../utils/requestContext');
+
+const toPositiveInt = (value) => {
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 ? n : null;
+};
 
 /**
  * Creates an audit log entry in the database.
@@ -15,6 +21,13 @@ const logger = require('../utils/logger');
  * @param {object|null}  oldValues   - Snapshot of data before the change
  * @param {object|null}  newValues   - Snapshot of data after the change
  * @param {string|null}  ipAddress   - IP address of the requester
+ * @param {{ companyId?: number, actorRole?: string }} [options]
+ *   companyId — the Business Unit the action belongs to. Left out, it is taken from the change
+ *   snapshot (company_id), then the Business Unit itself (entityType 'companies'), then the BU the
+ *   actor was acting under. actorRole — defaults to the role the actor is logged in as.
+ *   userId also falls back to the current request when not given.
+ *   The device the action came from (X-Device-Id header) is stored instead of the IP address —
+ *   ipAddress is accepted for backwards compatibility but no longer stored.
  * @returns {Promise<void>}
  */
 const createAuditLog = async (
@@ -24,17 +37,36 @@ const createAuditLog = async (
   entityId,
   oldValues = null,
   newValues = null,
-  ipAddress = null
+  ipAddress = null,
+  options = {}
 ) => {
+  // Reminders (approval / pending / compliance nudges) are notifications, not changes to data —
+  // they live in the email log and are never part of the audit trail.
+  if (/REMIND/i.test(String(action))) return;
+
   try {
+    const req = requestContext.getRequest();
+    const companyId = toPositiveInt(options.companyId)
+      ?? toPositiveInt(newValues && newValues.company_id)
+      ?? toPositiveInt(oldValues && oldValues.company_id)
+      ?? (String(entityType) === 'companies' ? toPositiveInt(entityId) : null)
+      ?? toPositiveInt(req && req.companyId);
+    const actorId = userId || (req && req.employeeId) || null;
+    const deviceId = options.deviceId || requestContext.getDeviceId(req);
+    const deviceName = options.deviceName || requestContext.getDeviceName(req);
     await AuditLog.create({
-      user_id: userId || null,
+      user_id: actorId,
+      company_id: companyId,
+      actor_role: (options.actorRole || (req && req.userRoleName) || null),
       action: String(action).toUpperCase().slice(0, 50),
       entity_type: String(entityType).slice(0, 50),
       entity_id: entityId || null,
       old_values: oldValues ? JSON.parse(JSON.stringify(oldValues)) : null,
       new_values: newValues ? JSON.parse(JSON.stringify(newValues)) : null,
-      ip_address: ipAddress ? String(ipAddress).slice(0, 45) : null,
+      device_id: deviceId ? String(deviceId).slice(0, 64) : null,
+      device_name: deviceName ? String(deviceName).slice(0, 120) : null,
+      session_id: (options.sessionId || (req && req.sessionId)) ? String(options.sessionId || req.sessionId).slice(0, 64) : null,
+      ip_address: null,
     });
   } catch (error) {
     // Log the failure but never propagate — audit is a side effect

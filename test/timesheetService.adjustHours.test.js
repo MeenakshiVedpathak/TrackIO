@@ -2,9 +2,9 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { adjustHoursTo176 } = require('../src/services/timesheetService');
+const { adjustHoursToCap } = require('../src/services/timesheetService');
 
-// Minimal row fixtures — only the fields adjustHoursTo176 actually reads.
+// Minimal row fixtures — only the fields adjustHoursToCap actually reads.
 function row(overrides) {
   return {
     employeeId: 1,
@@ -34,7 +34,7 @@ test('total hours <= 176: nothing is adjusted (edge case 1)', () => {
     row({ projectLabel: 'P1', hours: 100 }),
     row({ projectLabel: 'P2', hours: 76 }),
   ];
-  const result = adjustHoursTo176(input);
+  const result = adjustHoursToCap(input, 176);
   assert.equal(sum(result), 176);
   assert.equal(byLabel(result, 'P1').hours, 100);
   assert.equal(byLabel(result, 'P2').hours, 76);
@@ -42,7 +42,7 @@ test('total hours <= 176: nothing is adjusted (edge case 1)', () => {
 
 test('total hours == 176 exactly: nothing is adjusted', () => {
   const input = [row({ projectLabel: 'P1', hours: 176 })];
-  const result = adjustHoursTo176(input);
+  const result = adjustHoursToCap(input, 176);
   assert.equal(result[0].hours, 176);
 });
 
@@ -53,7 +53,7 @@ test('worked example from spec: P1=62, P2=60, P3=50, Leave=8 (total=180)', () =>
     row({ projectLabel: 'P3', hours: 50 }),
     leaveRow(8),
   ];
-  const result = adjustHoursTo176(input);
+  const result = adjustHoursToCap(input, 176);
 
   // Leave must be untouched.
   assert.equal(byLabel(result, 'Leave').hours, 8);
@@ -72,7 +72,7 @@ test('edge case 2: Leave = 0 -> ratio = 176 / totalWorkingHours', () => {
     row({ projectLabel: 'P1', hours: 100 }),
     row({ projectLabel: 'P2', hours: 100 }),
   ];
-  const result = adjustHoursTo176(input);
+  const result = adjustHoursToCap(input, 176);
   // ratio = 176/200 = 0.88
   assert.equal(byLabel(result, 'P1').hours, 88);
   assert.equal(byLabel(result, 'P2').hours, 88);
@@ -84,7 +84,7 @@ test('edge case 3: all non-Leave hours are 0 -> no adjustment (Leave alone excee
     leaveRow(180),
     row({ projectLabel: 'P1', hours: 0 }),
   ];
-  const result = adjustHoursTo176(input);
+  const result = adjustHoursToCap(input, 176);
   assert.equal(byLabel(result, 'Leave').hours, 180);
   assert.equal(byLabel(result, 'P1').hours, 0);
 });
@@ -95,7 +95,7 @@ test('a PO with 0 hours is never assigned an adjusted value, even when siblings 
     row({ projectLabel: 'P2', hours: 0 }),
     leaveRow(30),
   ];
-  const result = adjustHoursTo176(input);
+  const result = adjustHoursToCap(input, 176);
   // total = 180 > 176; leaveHours = 30 (Leave) — P2's 0 hours are excluded too,
   // but contribute nothing to leaveHours/workingHours either way.
   // allowedWorkingHours = 176-30 = 146; workingHours = 180-30 = 150; ratio = 146/150
@@ -109,7 +109,7 @@ test('"Is Working = false" bypass still leaves the whole employee untouched', ()
     row({ projectLabel: 'P1', hours: 200, isWorking: false }),
     leaveRow(10, { isWorking: false }),
   ];
-  const result = adjustHoursTo176(input);
+  const result = adjustHoursToCap(input, 176);
   assert.equal(byLabel(result, 'P1').hours, 200);
   assert.equal(byLabel(result, 'Leave').hours, 10);
 });
@@ -119,7 +119,7 @@ test('multiple employees are adjusted independently', () => {
     row({ employeeId: 1, projectLabel: 'P1', hours: 200 }),
     row({ employeeId: 2, projectLabel: 'P1', hours: 100 }), // <= 176, untouched
   ];
-  const result = adjustHoursTo176(input);
+  const result = adjustHoursToCap(input, 176);
   const emp1 = result.find((r) => r.employeeId === 1);
   const emp2 = result.find((r) => r.employeeId === 2);
   assert.equal(emp1.hours, 176);
@@ -135,7 +135,7 @@ test('largest-remainder distribution guarantees an exact 176 total even with rep
     row({ projectLabel: 'P2', hours: 59 }),
     row({ projectLabel: 'P3', hours: 59 }),
   ];
-  const result = adjustHoursTo176(input);
+  const result = adjustHoursToCap(input, 176);
   assert.equal(sum(result), 176);
   // Each row should be within a rounding cent of the true ratio value.
   for (const r of result) {
@@ -149,7 +149,7 @@ test('relative distribution is preserved (larger original hours stay proportiona
     row({ projectLabel: 'P2', hours: 50 }),
     row({ projectLabel: 'P3', hours: 30 }),
   ];
-  const result = adjustHoursTo176(input);
+  const result = adjustHoursToCap(input, 176);
   const p1 = byLabel(result, 'P1').hours;
   const p2 = byLabel(result, 'P2').hours;
   const p3 = byLabel(result, 'P3').hours;
@@ -157,4 +157,75 @@ test('relative distribution is preserved (larger original hours stay proportiona
   // p1/p2 ratio should still be ~100/50 = 2
   assert.ok(Math.abs(p1 / p2 - 2) < 0.01);
   assert.equal(sum(result), 176);
+});
+
+// ── Configurable cap (admin-editable monthly_cap_hours) ─────────────────────
+
+test('cap = 168: 176 total is scaled down to exactly 168', () => {
+  const input = [
+    row({ projectLabel: 'P1', hours: 100 }),
+    row({ projectLabel: 'P2', hours: 76 }),
+  ];
+  const result = adjustHoursToCap(input, 168);
+  assert.equal(Math.round(sum(result) * 100) / 100, 168);
+});
+
+test('cap = 168: total of 168 or less is untouched', () => {
+  const input = [row({ projectLabel: 'P1', hours: 100 }), row({ projectLabel: 'P2', hours: 68 })];
+  const result = adjustHoursToCap(input, 168);
+  assert.equal(byLabel(result, 'P1').hours, 100);
+  assert.equal(byLabel(result, 'P2').hours, 68);
+});
+
+test('cap = 168: Leave rows stay untouched and working rows absorb the reduction', () => {
+  const input = [
+    row({ projectLabel: 'P1', hours: 100 }),
+    row({ projectLabel: 'P2', hours: 80 }),
+    leaveRow(8),
+  ];
+  const result = adjustHoursToCap(input, 168);
+  assert.equal(byLabel(result, 'Leave').hours, 8);
+  assert.equal(Math.round(sum(result) * 100) / 100, 168);
+});
+
+test('cap = 184: a 180-hour total is not adjusted', () => {
+  const input = [row({ projectLabel: 'P1', hours: 120 }), row({ projectLabel: 'P2', hours: 60 })];
+  const result = adjustHoursToCap(input, 184);
+  assert.equal(sum(result), 180);
+});
+
+test('invalid cap is rejected instead of silently falling back', () => {
+  assert.throws(() => adjustHoursToCap([row({ hours: 10 })], 0));
+  assert.throws(() => adjustHoursToCap([row({ hours: 10 })], undefined));
+});
+
+// ── Original (pre-cap) hours are preserved ──────────────────────────────────
+
+test('adjusted rows keep what was logged in originalHours (180 logged, cap 168)', () => {
+  const input = [
+    row({ projectLabel: 'P1', hours: 100 }),
+    row({ projectLabel: 'P2', hours: 80 }),
+  ];
+  const result = adjustHoursToCap(input, 168);
+  assert.equal(Math.round(sum(result) * 100) / 100, 168);
+  assert.equal(byLabel(result, 'P1').originalHours, 100);
+  assert.equal(byLabel(result, 'P2').originalHours, 80);
+  assert.equal(result.reduce((s, r) => s + r.originalHours, 0), 180);
+});
+
+test('rows that are not adjusted still carry originalHours equal to their hours', () => {
+  const input = [row({ projectLabel: 'P1', hours: 100 }), leaveRow(8)];
+  const result = adjustHoursToCap(input, 168);
+  for (const r of result) assert.equal(r.originalHours, r.hours);
+});
+
+test('mergeDuplicateRows sums originalHours alongside the adjusted hours', () => {
+  const { mergeDuplicateRows } = require('../src/services/timesheetService');
+  const merged = mergeDuplicateRows([
+    { employeeId: 1, poId: 5, date: '2026-10-01', hours: 4.5, originalHours: 5 },
+    { employeeId: 1, poId: 5, date: '2026-10-01', hours: 2.7, originalHours: 3 },
+  ]);
+  assert.equal(merged.length, 1);
+  assert.equal(Math.round(merged[0].hours * 100) / 100, 7.2);
+  assert.equal(merged[0].originalHours, 8);
 });

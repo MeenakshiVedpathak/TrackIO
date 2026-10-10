@@ -8,6 +8,7 @@ const companyAccessControlService = require('./companyAccessControlService');
 const { createAuditLog } = require('../middlewares/auditLog');
 const { getPaginationParams, getPaginationMeta } = require('../utils/pagination');
 const logger = require('../utils/logger');
+const monthlyCapService = require('./monthlyCapService');
 const XLSX = require('xlsx');
 const path = require('path');
 const fs = require('fs');
@@ -18,10 +19,11 @@ const fs = require('fs');
  *
  * Key formulas:
  *   total_cost             = salary_cost + ops_cost
- *   per_hour_rate          = total_cost / working_hours  (default 176 h/month)
+ *   per_hour_rate          = total_cost / working_hours  (default: the current Monthly Cap Hours setting, 176 unless an Admin changed it)
  */
 
-const DEFAULT_WORKING_HOURS = 176;
+// Default working hours for the per-hour rate when the caller doesn't supply one.
+const getDefaultWorkingHours = () => monthlyCapService.getCurrentCap();
 
 /**
  * Round a number to 2 decimal places.
@@ -148,7 +150,7 @@ const create = async (data, userId, ip = null, companyId) => {
 
   // 3. Calculate derived fields
   const effectiveOpsCost = parseFloat(ops_cost || 0);
-  const workingHoursValue = parseInt(working_hours || DEFAULT_WORKING_HOURS, 10);
+  const workingHoursValue = parseInt(working_hours || await getDefaultWorkingHours(), 10);
   const { total_cost, per_hour_rate } = calculateDerivedFields(
     salary_cost,
     effectiveOpsCost,
@@ -248,7 +250,7 @@ const update = async (id, data, userId, ip = null, companyId) => {
     ? parseFloat(data.ops_cost)
     : parseFloat(existing.ops_cost || 0);
 
-  const workingHoursValue = parseInt(data.working_hours || DEFAULT_WORKING_HOURS, 10);
+  const workingHoursValue = parseInt(data.working_hours || await getDefaultWorkingHours(), 10);
   const { total_cost, per_hour_rate } = calculateDerivedFields(
     newSalaryCost,
     newOpsCost,
@@ -455,10 +457,10 @@ const deleteByMonth = async (months, userId, ip = null, companyId) => {
  * @param {number} year
  * @param {number} userId
  * @param {string} ip
- * @param {number} [workingHours=176]
+ * @param {number} [workingHours] - defaults to the current Monthly Cap Hours setting
  * @returns {Promise<{ processed: number, updated: number, summary: object }>}
  */
-const calculateForMonth = async (month, year, userId, ip = null, workingHours = DEFAULT_WORKING_HOURS, companyId) => {
+const calculateForMonth = async (month, year, userId, ip = null, workingHours = null, companyId) => {
   const records = await monthlyCostRepository.getBulkForMonth(month, year, companyId);
 
   if (!records || records.length === 0) {
@@ -472,7 +474,7 @@ const calculateForMonth = async (month, year, userId, ip = null, workingHours = 
     0
   );
 
-  const effectiveWorkingHours = parseInt(workingHours || DEFAULT_WORKING_HOURS, 10);
+  const effectiveWorkingHours = parseInt(workingHours || await getDefaultWorkingHours(), 10);
 
   let updatedCount = 0;
   const transaction = await sequelize.transaction();

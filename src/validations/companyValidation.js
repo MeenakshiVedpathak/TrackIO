@@ -43,11 +43,11 @@ const createCompanySchema = Joi.object({
     .trim()
     .uppercase()
     .min(2)
-    .max(20)
+    .max(30)
     .when('parent_business_unit_id', { is: Joi.number().exist(), then: Joi.optional(), otherwise: Joi.required() })
     .messages({
       'string.min': 'Company code must be at least 2 characters.',
-      'string.max': 'Company code cannot exceed 20 characters.',
+      'string.max': 'Company code cannot exceed 30 characters.',
       'string.empty': 'Company code is required.',
       'any.required': 'Company code is required.',
     }),

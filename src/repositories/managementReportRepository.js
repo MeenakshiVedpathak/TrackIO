@@ -3,6 +3,8 @@
 const { sequelize } = require('../models');
 const { QueryTypes } = require('sequelize');
 const { buLessServicePOInTenantSql } = require('../utils/servicePOTenantSql');
+const monthlyCapService = require('../services/monthlyCapService');
+const { capForCompanyMonthSql, capForMonthStartSql } = require('../utils/monthlyCapSql');
 
 /**
  * Whether a `companyIds` scope array resolves to "nothing this caller may
@@ -60,6 +62,11 @@ const EMPLOYEE_COMPANY_SCOPE_SQL = `(
  * reportRepository.js and dashboardRepository.js.
  */
 
+// ALWAYS the original (true logged) hours, regardless of `hoursSource`.
+// Every report that exposes synced/adjusted hours (which follow hoursSource)
+// also exposes an `original_*` / `original*` counterpart computed from this.
+const originalHoursCol = 'COALESCE(t.original_hours, t.hours_logged)';
+
 const formatMonthYear = (month, year) => (
   `${parseInt(year, 10)}-${String(parseInt(month, 10)).padStart(2, '0')}`
 );
@@ -100,7 +107,7 @@ async function getServicePOProfitability(filters) {
     sortBy = 'margin', sortOrder = 'DESC', limit, offset, hoursSource, roleId, companyIds,
   } = filters;
 
-  const hoursCol = (hoursSource === 'O') ? 't.hours_logged' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const hoursCol = (hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
   const allowedSort = ['c.client_name', 'sp.service_po_name', 'invoiced_amount', 'delivery_cost', 'margin', 'margin_pct', 'hours_delivered'];
   const safeSort = allowedSort.includes(sortBy) ? sortBy : 'margin';
   const safeOrder = sortOrder && sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
@@ -138,6 +145,7 @@ async function getServicePOProfitability(filters) {
       st.service_type_name                            AS service_type,
       sc.name                                         AS service_category_name,
       COALESCE(cur.hours_delivered, 0)                AS hours_delivered,
+      COALESCE(cur.original_hours_delivered, 0)       AS original_hours_delivered,
       ROUND(COALESCE(spmb.invoice_amount, 0)::numeric, 2)  AS invoiced_amount,
       ROUND(COALESCE(spmb.billed_amount, 0)::numeric, 2)   AS delivery_cost,
       ROUND((COALESCE(spmb.invoice_amount, 0) - COALESCE(spmb.billed_amount, 0))::numeric, 2) AS margin,
@@ -155,7 +163,8 @@ async function getServicePOProfitability(filters) {
     LEFT JOIN (
       SELECT
         t.service_po_id,
-        SUM(${hoursCol})                                AS hours_delivered
+        SUM(${hoursCol})                                AS hours_delivered,
+        SUM(${originalHoursCol})                        AS original_hours_delivered
       FROM timesheets t
       WHERE EXTRACT(MONTH FROM t.timesheet_date) = :monthNum
         AND EXTRACT(YEAR  FROM t.timesheet_date) = :yearNum
@@ -294,7 +303,7 @@ async function getResourceStaffingPlanAccuracy(filters) {
     sortBy = 'variance', sortOrder = 'DESC', limit, offset, hoursSource, roleId, companyIds,
   } = filters;
 
-  const hoursCol = (hoursSource === 'O') ? 't.hours_logged' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const hoursCol = (hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
   // Bare output-column names (no `e.`/`sp.` qualifier) — sortBy is applied
   // in the OUTER wrapping query below (after the threshold filter), where
   // only the inner SELECT's exposed column names are visible, not its
@@ -351,7 +360,7 @@ async function getResourceStaffingPlanAccuracy(filters) {
       GROUP BY emp_id, service_po_id
     ),
     actual AS (
-      SELECT t.employee_id AS emp_id, t.service_po_id AS po_id, SUM(${hoursCol}) AS actual_hours
+      SELECT t.employee_id AS emp_id, t.service_po_id AS po_id, SUM(${hoursCol}) AS actual_hours, SUM(${originalHoursCol}) AS original_actual_hours
       FROM timesheets t
       WHERE EXTRACT(MONTH FROM t.timesheet_date) = :monthNum
         AND EXTRACT(YEAR  FROM t.timesheet_date) = :yearNum
@@ -364,7 +373,8 @@ async function getResourceStaffingPlanAccuracy(filters) {
         COALESCE(planned.emp_id, actual.emp_id) AS emp_id,
         COALESCE(planned.po_id, actual.po_id)   AS po_id,
         COALESCE(planned.planned_hours, 0)      AS planned_hours,
-        COALESCE(actual.actual_hours, 0)        AS actual_hours
+        COALESCE(actual.actual_hours, 0)        AS actual_hours,
+        COALESCE(actual.original_actual_hours, 0) AS original_actual_hours
       FROM planned
       FULL OUTER JOIN actual ON actual.emp_id = planned.emp_id AND actual.po_id = planned.po_id
     )
@@ -401,7 +411,14 @@ async function getResourceStaffingPlanAccuracy(filters) {
           WHEN combined.planned_hours > 0
             THEN ROUND(((combined.actual_hours - combined.planned_hours) / combined.planned_hours * 100)::numeric, 2)
           ELSE NULL
-        END                       AS variance_pct
+        END                       AS variance_pct,
+        combined.original_actual_hours,
+        ROUND((combined.original_actual_hours - combined.planned_hours)::numeric, 2) AS original_variance,
+        CASE
+          WHEN combined.planned_hours > 0
+            THEN ROUND(((combined.original_actual_hours - combined.planned_hours) / combined.planned_hours * 100)::numeric, 2)
+          ELSE NULL
+        END                       AS original_variance_pct
       FROM combined
       INNER JOIN employees e   ON e.id  = combined.emp_id
       INNER JOIN service_pos sp ON sp.id = combined.po_id
@@ -545,7 +562,7 @@ async function getBUPerformanceScorecard(filters) {
     return { rows: [], count: 0 };
   }
 
-  const hoursCol = (hoursSource === 'O') ? 't.hours_logged' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const hoursCol = (hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
   const allowedSort = ['company_name', 'active_employees', 'active_pos', 'total_invoiced', 'total_delivery_cost', 'total_margin', 'avg_utilization_pct'];
   const safeSort = allowedSort.includes(sortBy) ? sortBy : 'total_margin';
   const safeOrder = sortOrder && sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
@@ -597,7 +614,16 @@ async function getBUPerformanceScorecard(filters) {
             AND EXTRACT(MONTH FROM t.timesheet_date) = :monthNum
             AND EXTRACT(YEAR  FROM t.timesheet_date) = :yearNum
             ${publishGuard}
-        ), 0) AS total_hours_logged
+        ), 0) AS total_hours_logged,
+        COALESCE((
+          SELECT SUM(${originalHoursCol})
+          FROM timesheets t
+          INNER JOIN service_pos sp ON sp.id = t.service_po_id
+          WHERE sp.company_id = co.id
+            AND EXTRACT(MONTH FROM t.timesheet_date) = :monthNum
+            AND EXTRACT(YEAR  FROM t.timesheet_date) = :yearNum
+            ${publishGuard}
+        ), 0) AS original_total_hours_logged
       FROM companies co
       WHERE co.id IN (:companyIds) AND co.is_deleted = false
       ${searchFilter}
@@ -614,9 +640,14 @@ async function getBUPerformanceScorecard(filters) {
       ROUND((total_invoiced - total_delivery_cost)::numeric, 2) AS total_margin,
       CASE
         WHEN active_employees > 0
-          THEN ROUND((total_hours_logged / (active_employees * 176.0) * 100)::numeric, 2)
+          THEN ROUND((total_hours_logged / (active_employees * ${capForCompanyMonthSql('bu.company_id', ':monthNum', ':yearNum')}) * 100)::numeric, 2)
         ELSE NULL
-      END AS avg_utilization_pct
+      END AS avg_utilization_pct,
+      CASE
+        WHEN active_employees > 0
+          THEN ROUND((original_total_hours_logged / (active_employees * ${capForCompanyMonthSql('bu.company_id', ':monthNum', ':yearNum')}) * 100)::numeric, 2)
+        ELSE NULL
+      END AS original_avg_utilization_pct
     FROM bu
     ORDER BY ${safeSort} ${safeOrder}
     LIMIT :limit OFFSET :offset
@@ -637,7 +668,7 @@ async function getBUPerformanceScorecard(filters) {
 // ---------------------------------------------------------------------------
 /**
  * Per active employee: total PLANNED hours (resource_budget_master) across
- * every Service PO for the given month/year, vs the 176-hour cap, plus a
+ * every Service PO for the given month/year, vs the month's Monthly Cap Hours, plus a
  * bench flag driven by active employee_servicepo_mapping rows with little/
  * no planned work.
  *
@@ -650,7 +681,7 @@ async function getEmployeeCapacityForecast(filters) {
     sortBy = 'capacity_used_pct', sortOrder = 'DESC', limit, offset, companyIds,
   } = filters;
 
-  const MONTHLY_CAP = 176;
+  const MONTHLY_CAP = await monthlyCapService.getCapForMonth(month, year, companyIds);
   // undefined -> no bench filtering (existing behavior: every row
   // returned, each merely annotated with bench_flag computed against the
   // display default of 40). A real number (including 0) -> the caller
@@ -768,14 +799,15 @@ async function getServicePOTimelineRiskRaw(filters) {
   const {
     status, clientId, poId, search,
     sortBy = 'sp.end_date', sortOrder = 'ASC', limit, offset, hoursSource, roleId, companyIds,
+    asOfDate, monthStart, monthEnd,
   } = filters;
 
-  const hoursCol = (hoursSource === 'O') ? 't.hours_logged' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const hoursCol = (hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
   const allowedSort = ['sp.service_po_name', 'sp.start_date', 'sp.end_date', 'hours_delivered_to_date'];
   const safeSort = allowedSort.includes(sortBy) ? sortBy : 'sp.end_date';
   const safeOrder = sortOrder && sortOrder.toUpperCase() === 'DESC' ? 'DESC' : 'ASC';
 
-  const replacements = { limit, offset, companyIds };
+  const replacements = { limit, offset, companyIds, asOfDate: asOfDate || null, monthStart: monthStart || null, monthEnd: monthEnd || null };
   const conditions = [
     '(sp.company_id IN (:companyIds) OR ' + buLessServicePOInTenantSql('sp', 'companyIds') + ')',
     'sp.start_date IS NOT NULL',
@@ -807,13 +839,23 @@ async function getServicePOTimelineRiskRaw(filters) {
       sp.po_value,
       c.id                                  AS client_id,
       c.client_name,
-      COALESCE(hrs.hours_delivered_to_date, 0) AS hours_delivered_to_date
+      COALESCE(hrs.hours_delivered_to_date, 0) AS hours_delivered_to_date,
+      COALESCE(hrs.original_hours_delivered_to_date, 0) AS original_hours_delivered_to_date,
+      COALESCE(hrs.hours_in_month, 0) AS hours_in_month,
+      COALESCE(hrs.original_hours_in_month, 0) AS original_hours_in_month
     FROM service_pos sp
     INNER JOIN clients c ON c.id = sp.client_id
     LEFT JOIN (
-      SELECT t.service_po_id, SUM(${hoursCol}) AS hours_delivered_to_date
+      -- Hours delivered up to the report's "as of" date (the end of the selected month, or the chosen
+      -- date; no limit when neither is given) — the SAME cut-off the elapsed-time % uses, so hours and
+      -- risk describe the same moment. Adjusted and original are summed over exactly the same rows.
+      SELECT t.service_po_id,
+             SUM(${hoursCol}) AS hours_delivered_to_date,
+             SUM(${originalHoursCol}) AS original_hours_delivered_to_date,
+             SUM(${hoursCol}) FILTER (WHERE :monthStart::date IS NOT NULL AND t.timesheet_date >= :monthStart::date AND t.timesheet_date <= :monthEnd::date) AS hours_in_month,
+             SUM(${originalHoursCol}) FILTER (WHERE :monthStart::date IS NOT NULL AND t.timesheet_date >= :monthStart::date AND t.timesheet_date <= :monthEnd::date) AS original_hours_in_month
       FROM timesheets t
-      WHERE 1=1
+      WHERE (:asOfDate::date IS NULL OR t.timesheet_date <= :asOfDate::date)
         ${publishGuard}
       GROUP BY t.service_po_id
     ) hrs ON hrs.service_po_id = sp.id
@@ -852,7 +894,7 @@ async function getDeliveryHeadPerformance(filters) {
     sortBy = 'total_margin', sortOrder = 'DESC', limit, offset, hoursSource, roleId, companyIds,
   } = filters;
 
-  const hoursCol = (hoursSource === 'O') ? 't.hours_logged' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const hoursCol = (hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
   const allowedSort = ['full_name', 'po_count', 'total_hours_delivered', 'total_invoiced', 'total_delivery_cost', 'total_margin'];
   const safeSort = allowedSort.includes(sortBy) ? sortBy : 'total_margin';
   const safeOrder = sortOrder && sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
@@ -885,12 +927,14 @@ async function getDeliveryHeadPerformance(filters) {
         COALESCE(spmb.invoice_amount, 0)        AS invoiced_amount,
         COALESCE(cur.delivery_cost, 0)          AS delivery_cost,
         COALESCE(cur.hours_delivered, 0)        AS hours_delivered,
+        COALESCE(cur.original_hours_delivered, 0) AS original_hours_delivered,
         COALESCE(prev.hours_delivered_before, 0) AS hours_delivered_before
       FROM service_pos sp
       LEFT JOIN service_po_monthly_budgets spmb
              ON spmb.service_po_id = sp.id AND spmb.month = :monthNum AND spmb.year = :yearNum
       LEFT JOIN (
         SELECT t.service_po_id, SUM(${hoursCol}) AS hours_delivered,
+               SUM(${originalHoursCol}) AS original_hours_delivered,
                SUM(${hoursCol} * COALESCE(mc.total_cost, 0)) AS delivery_cost
         FROM timesheets t
         LEFT JOIN monthly_costs mc ON mc.employee_id = t.employee_id AND mc.month_year = :monthYear
@@ -918,6 +962,7 @@ async function getDeliveryHeadPerformance(filters) {
       e.full_name,
       COUNT(per_po.service_po_id)              AS po_count,
       ROUND(SUM(per_po.hours_delivered)::numeric, 2)   AS total_hours_delivered,
+      ROUND(SUM(per_po.original_hours_delivered)::numeric, 2) AS original_total_hours_delivered,
       ROUND(SUM(per_po.invoiced_amount)::numeric, 2)   AS total_invoiced,
       ROUND(SUM(per_po.delivery_cost)::numeric, 2)     AS total_delivery_cost,
       ROUND((SUM(per_po.invoiced_amount) - SUM(per_po.delivery_cost))::numeric, 2) AS total_margin
@@ -1049,7 +1094,7 @@ async function getServiceLineBusinessMix(filters) {
     serviceCategoryId, serviceTypeId, hoursSource, roleId, companyIds,
   } = filters;
 
-  const hoursCol = (hoursSource === 'O') ? 't.hours_logged' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const hoursCol = (hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
   const monthNum = parseInt(month, 10);
   const yearNum = parseInt(year, 10);
   const monthYear = formatMonthYear(month, year);
@@ -1081,6 +1126,7 @@ async function getServiceLineBusinessMix(filters) {
       st.id                                AS service_type_id,
       st.service_type_name,
       ROUND(SUM(${hoursCol})::numeric, 2)  AS hours_delivered,
+      ROUND(SUM(${originalHoursCol})::numeric, 2) AS original_hours_delivered,
       ROUND(SUM(${hoursCol} * COALESCE(mc.total_cost, 0))::numeric, 2) AS delivery_cost
     FROM timesheets t
     INNER JOIN service_pos sp        ON sp.id = t.service_po_id
@@ -1124,12 +1170,14 @@ async function getServiceLineBusinessMix(filters) {
       const invoiced = invoiceByType.get(row.service_type_id) || 0;
       const cost = parseFloat(row.delivery_cost) || 0;
       const hours = parseFloat(row.hours_delivered) || 0;
+      const originalHours = parseFloat(row.original_hours_delivered) || 0;
       const margin = Math.round((invoiced - cost) * 100) / 100;
       return {
         ...row,
         invoiced_amount: Math.round(invoiced * 100) / 100,
         margin,
         margin_per_hour: hours > 0 ? Math.round((margin / hours) * 100) / 100 : null,
+        original_margin_per_hour: originalHours > 0 ? Math.round((margin / originalHours) * 100) / 100 : null,
       };
     });
   }
@@ -1192,7 +1240,10 @@ const PM_ROSTER_CTE = `
 // getEmployeeCapacityForecast above and pmDashboardRepository.getTeamCapacity)
 // — reused here for consistency rather than a calendar-working-days figure,
 // which this schema has no holiday/working-day-calendar table to compute.
-const MONTHLY_CAP = 176;
+// Monthly capacity per calendar month of a month-series query (alias `m`, column
+// month_start): the Monthly Cap Hours that month was synced with, scoped to the
+// caller's :companyIds — so a range spanning a cap change uses each month's own cap.
+const CAP_M = capForMonthStartSql('m.month_start', 'companyIds');
 
 // A billable-hours WHERE fragment for getPMWiseUtilization/
 // getProjectWiseUtilization below. `service_pos.is_billable` (a real column,
@@ -1289,7 +1340,7 @@ async function getPMWiseUtilization(filters) {
     return {
       rows: [],
       count: 0,
-      summary: { total_resource_count: 0, total_project_count: 0, total_logged_hours: 0, total_available_hours: 0 },
+      summary: { total_resource_count: 0, total_project_count: 0, total_logged_hours: 0, original_total_logged_hours: 0, total_available_hours: 0 },
     };
   }
 
@@ -1298,7 +1349,7 @@ async function getPMWiseUtilization(filters) {
     sortBy = 'utilization_pct', sortOrder = 'DESC', limit, offset, companyIds,
   } = filters;
 
-  const hoursCol = (hoursSource === 'O') ? 't.hours_logged' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const hoursCol = (hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
   const allowedSort = ['pm_name', 'resource_count', 'project_count', 'total_logged_hours', 'total_available_hours', 'utilization_pct'];
   const safeSort = allowedSort.includes(sortBy) ? sortBy : 'utilization_pct';
   const safeOrder = sortOrder && sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
@@ -1338,7 +1389,7 @@ async function getPMWiseUtilization(filters) {
       GROUP BY pm_id
     ),
     logged AS (
-      SELECT sr.pm_id, SUM(${hoursCol}) AS total_logged_hours
+      SELECT sr.pm_id, SUM(${hoursCol}) AS total_logged_hours, SUM(${originalHoursCol}) AS original_total_logged_hours
       FROM spo_resources sr
       INNER JOIN timesheets t ON t.employee_id = sr.employee_id AND t.service_po_id = sr.service_po_id
       WHERE ${PERIOD_EXPR_SQL} BETWEEN :startPeriod AND :endPeriod
@@ -1362,11 +1413,16 @@ async function getPMWiseUtilization(filters) {
       COALESCE(ps.resource_count, 0)  AS resource_count,
       COALESCE(ps.project_count, 0)   AS project_count,
       ROUND(COALESCE(lg.total_logged_hours, 0)::numeric, 2)     AS total_logged_hours,
+      ROUND(COALESCE(lg.original_total_logged_hours, 0)::numeric, 2) AS original_total_logged_hours,
       ROUND(COALESCE(av.total_available_hours, 0)::numeric, 2) AS total_available_hours,
       CASE WHEN COALESCE(av.total_available_hours, 0) > 0
         THEN ROUND((COALESCE(lg.total_logged_hours, 0) / av.total_available_hours * 100)::numeric, 2)
         ELSE 0
-      END AS utilization_pct
+      END AS utilization_pct,
+      CASE WHEN COALESCE(av.total_available_hours, 0) > 0
+        THEN ROUND((COALESCE(lg.original_total_logged_hours, 0) / av.total_available_hours * 100)::numeric, 2)
+        ELSE 0
+      END AS original_utilization_pct
     FROM pms
     LEFT JOIN pm_staffing ps ON ps.pm_id = pms.pm_id
     LEFT JOIN logged lg      ON lg.pm_id = pms.pm_id
@@ -1385,6 +1441,7 @@ async function getPMWiseUtilization(filters) {
       COALESCE(SUM(resource_count), 0)        AS total_resource_count,
       COALESCE(SUM(project_count), 0)         AS total_project_count,
       COALESCE(SUM(total_logged_hours), 0)    AS total_logged_hours,
+      COALESCE(SUM(original_total_logged_hours), 0) AS original_total_logged_hours,
       COALESCE(SUM(total_available_hours), 0) AS total_available_hours
     FROM (${baseSelect}) all_pms
   `;
@@ -1400,6 +1457,7 @@ async function getPMWiseUtilization(filters) {
     total_resource_count: parseInt(summaryRow.total_resource_count, 10) || 0,
     total_project_count: parseInt(summaryRow.total_project_count, 10) || 0,
     total_logged_hours: parseFloat(summaryRow.total_logged_hours) || 0,
+    original_total_logged_hours: parseFloat(summaryRow.original_total_logged_hours) || 0,
     total_available_hours: parseFloat(summaryRow.total_available_hours) || 0,
   };
 
@@ -1435,7 +1493,7 @@ async function getProjectWiseUtilization(filters) {
     return {
       rows: [],
       count: 0,
-      summary: { total_resource_count: 0, total_logged_hours: 0, total_available_hours: 0 },
+      summary: { total_resource_count: 0, total_logged_hours: 0, original_total_logged_hours: 0, total_available_hours: 0 },
     };
   }
 
@@ -1444,7 +1502,7 @@ async function getProjectWiseUtilization(filters) {
     sortBy = 'utilization_pct', sortOrder = 'DESC', limit, offset, companyIds,
   } = filters;
 
-  const hoursCol = (hoursSource === 'O') ? 't.hours_logged' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const hoursCol = (hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
   const allowedSort = ['client_name', 'project_name', 'service_po_name', 'resource_count', 'total_logged_hours', 'total_available_hours', 'utilization_pct'];
   const safeSort = allowedSort.includes(sortBy) ? sortBy : 'utilization_pct';
   const safeOrder = sortOrder && sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
@@ -1491,7 +1549,7 @@ async function getProjectWiseUtilization(filters) {
       GROUP BY service_po_id
     ),
     logged AS (
-      SELECT sr.service_po_id, SUM(${hoursCol}) AS total_logged_hours
+      SELECT sr.service_po_id, SUM(${hoursCol}) AS total_logged_hours, SUM(${originalHoursCol}) AS original_total_logged_hours
       FROM spo_resources sr
       INNER JOIN timesheets t ON t.employee_id = sr.employee_id AND t.service_po_id = sr.service_po_id
       WHERE ${PERIOD_EXPR_SQL} BETWEEN :startPeriod AND :endPeriod
@@ -1516,11 +1574,16 @@ async function getProjectWiseUtilization(filters) {
       iss.client_id, iss.client_name,
       COALESCE(ss.resource_count, 0) AS resource_count,
       ROUND(COALESCE(lg.total_logged_hours, 0)::numeric, 2)     AS total_logged_hours,
+      ROUND(COALESCE(lg.original_total_logged_hours, 0)::numeric, 2) AS original_total_logged_hours,
       ROUND(COALESCE(av.total_available_hours, 0)::numeric, 2)  AS total_available_hours,
       CASE WHEN COALESCE(av.total_available_hours, 0) > 0
         THEN ROUND((COALESCE(lg.total_logged_hours, 0) / av.total_available_hours * 100)::numeric, 2)
         ELSE 0
-      END AS utilization_pct
+      END AS utilization_pct,
+      CASE WHEN COALESCE(av.total_available_hours, 0) > 0
+        THEN ROUND((COALESCE(lg.original_total_logged_hours, 0) / av.total_available_hours * 100)::numeric, 2)
+        ELSE 0
+      END AS original_utilization_pct
     FROM in_scope_spos iss
     LEFT JOIN spo_staffing ss ON ss.service_po_id = iss.service_po_id
     LEFT JOIN logged lg       ON lg.service_po_id = iss.service_po_id
@@ -1537,6 +1600,7 @@ async function getProjectWiseUtilization(filters) {
     SELECT
       COALESCE(SUM(resource_count), 0)        AS total_resource_count,
       COALESCE(SUM(total_logged_hours), 0)    AS total_logged_hours,
+      COALESCE(SUM(original_total_logged_hours), 0) AS original_total_logged_hours,
       COALESCE(SUM(total_available_hours), 0) AS total_available_hours
     FROM (${baseSelect}) all_spos
   `;
@@ -1551,6 +1615,7 @@ async function getProjectWiseUtilization(filters) {
   const summary = {
     total_resource_count: parseInt(summaryRow.total_resource_count, 10) || 0,
     total_logged_hours: parseFloat(summaryRow.total_logged_hours) || 0,
+    original_total_logged_hours: parseFloat(summaryRow.original_total_logged_hours) || 0,
     total_available_hours: parseFloat(summaryRow.total_available_hours) || 0,
   };
 
@@ -1593,10 +1658,10 @@ function monthRangeDateBounds(startMonth, startYear, endMonth, endYear) {
 async function getMonthWiseBench(filters) {
   const { startMonth, startYear, endMonth, endYear, hoursSource, companyIds } = filters;
 
-  const hoursCol = (hoursSource === 'O') ? 't.hours_logged' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const hoursCol = (hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
   const replacements = {
     ...monthRangeDateBounds(startMonth, startYear, endMonth, endYear),
-    monthlyCap: MONTHLY_CAP, companyIds,
+    companyIds,
   };
 
   const scopeClause = BENCH_COMPANY_SCOPE_SQL;
@@ -1606,7 +1671,8 @@ async function getMonthWiseBench(filters) {
       SELECT generate_series(:startDate::date, (:endDateExclusive::date - interval '1 month'), interval '1 month')::date AS month_start
     ),
     bench_entries AS (
-      SELECT t.employee_id, date_trunc('month', t.timesheet_date)::date AS month_start, ${hoursCol} AS hours
+      SELECT t.employee_id, date_trunc('month', t.timesheet_date)::date AS month_start, ${hoursCol} AS hours,
+             ${originalHoursCol} AS original_hours
       FROM timesheets t
       INNER JOIN service_pos sp ON sp.id = t.service_po_id
       WHERE ${scopeClause}
@@ -1614,7 +1680,8 @@ async function getMonthWiseBench(filters) {
         AND LOWER(sp.service_po_name) IN ('idle', 'on bench')
     ),
     bench_by_month AS (
-      SELECT month_start, COUNT(DISTINCT employee_id) AS resources_on_bench, SUM(hours) AS total_bench_hours
+      SELECT month_start, COUNT(DISTINCT employee_id) AS resources_on_bench, SUM(hours) AS total_bench_hours,
+             SUM(original_hours) AS original_total_bench_hours
       FROM bench_entries GROUP BY month_start
     ),
     active_by_month AS (
@@ -1630,11 +1697,16 @@ async function getMonthWiseBench(filters) {
       EXTRACT(YEAR FROM m.month_start)::int AS year,
       COALESCE(bm.resources_on_bench, 0) AS resources_on_bench,
       ROUND(COALESCE(bm.total_bench_hours, 0)::numeric, 2) AS total_bench_hours,
-      ROUND((COALESCE(ahm.active_employee_count, 0) * :monthlyCap)::numeric, 2) AS total_available_hours,
+      ROUND((COALESCE(ahm.active_employee_count, 0) * ${CAP_M})::numeric, 2) AS total_available_hours,
       CASE WHEN COALESCE(ahm.active_employee_count, 0) > 0
-        THEN ROUND((COALESCE(bm.total_bench_hours, 0) / (ahm.active_employee_count * :monthlyCap) * 100)::numeric, 2)
+        THEN ROUND((COALESCE(bm.total_bench_hours, 0) / (ahm.active_employee_count * ${CAP_M}) * 100)::numeric, 2)
         ELSE 0
-      END AS bench_pct
+      END AS bench_pct,
+      ROUND(COALESCE(bm.original_total_bench_hours, 0)::numeric, 2) AS original_total_bench_hours,
+      CASE WHEN COALESCE(ahm.active_employee_count, 0) > 0
+        THEN ROUND((COALESCE(bm.original_total_bench_hours, 0) / (ahm.active_employee_count * ${CAP_M}) * 100)::numeric, 2)
+        ELSE 0
+      END AS original_bench_pct
     FROM months m
     LEFT JOIN bench_by_month bm ON bm.month_start = m.month_start
     LEFT JOIN active_by_month ahm ON ahm.month_start = m.month_start
@@ -1650,7 +1722,7 @@ async function getMonthWiseBench(filters) {
 // range, with a Bench % per calendar month plus an average across the
 // range. Companion to getMonthWiseBench above (same source Excel tab, split
 // into 2 reports/endpoints per product decision) — same Bench heuristic and
-// MONTHLY_CAP=176 convention. `project_manager_name` is resolved via the
+// monthly-cap convention (per-month Monthly Cap Hours). `project_manager_name` is resolved via the
 // same PM roster this file already builds for getPMWiseUtilization, walked
 // through the Employee's PRIMARY manager mapping only (an Employee with only
 // a SECONDARY manager mapping, no PRIMARY one, gets a null PM here).
@@ -1675,14 +1747,14 @@ async function getResourceWiseBench(filters) {
     sortBy = 'avg_bench_pct', sortOrder = 'DESC', limit, offset, companyIds,
   } = filters;
 
-  const hoursCol = (hoursSource === 'O') ? 't.hours_logged' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const hoursCol = (hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
   const allowedSort = ['full_name', 'avg_bench_pct'];
   const safeSort = allowedSort.includes(sortBy) ? sortBy : 'avg_bench_pct';
   const safeOrder = sortOrder && sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
 
   const replacements = {
     ...monthRangeDateBounds(startMonth, startYear, endMonth, endYear),
-    monthlyCap: MONTHLY_CAP, companyIds, limit, offset,
+    companyIds, limit, offset,
   };
 
   const scopeClause = BENCH_COMPANY_SCOPE_SQL;
@@ -1704,7 +1776,8 @@ async function getResourceWiseBench(filters) {
       SELECT generate_series(:startDate::date, (:endDateExclusive::date - interval '1 month'), interval '1 month')::date AS month_start
     ),
     bench_entries AS (
-      SELECT t.employee_id, date_trunc('month', t.timesheet_date)::date AS month_start, ${hoursCol} AS hours
+      SELECT t.employee_id, date_trunc('month', t.timesheet_date)::date AS month_start, ${hoursCol} AS hours,
+             ${originalHoursCol} AS original_hours
       FROM timesheets t
       INNER JOIN service_pos sp ON sp.id = t.service_po_id
       WHERE ${scopeClause}
@@ -1712,7 +1785,7 @@ async function getResourceWiseBench(filters) {
         AND LOWER(sp.service_po_name) IN ('idle', 'on bench')
     ),
     bench_by_employee_month AS (
-      SELECT employee_id, month_start, SUM(hours) AS bench_hours
+      SELECT employee_id, month_start, SUM(hours) AS bench_hours, SUM(original_hours) AS original_bench_hours
       FROM bench_entries GROUP BY employee_id, month_start
     ),
     flagged_employees AS (
@@ -1728,9 +1801,12 @@ async function getResourceWiseBench(filters) {
         'month', EXTRACT(MONTH FROM m.month_start)::int,
         'year', EXTRACT(YEAR FROM m.month_start)::int,
         'bench_hours', ROUND(COALESCE(bem.bench_hours, 0)::numeric, 2),
-        'bench_pct', ROUND((COALESCE(bem.bench_hours, 0) / :monthlyCap * 100)::numeric, 2)
+        'bench_pct', ROUND((COALESCE(bem.bench_hours, 0) / ${CAP_M} * 100)::numeric, 2),
+        'original_bench_hours', ROUND(COALESCE(bem.original_bench_hours, 0)::numeric, 2),
+        'original_bench_pct', ROUND((COALESCE(bem.original_bench_hours, 0) / ${CAP_M} * 100)::numeric, 2)
       ) ORDER BY m.month_start) AS months,
-      ROUND((AVG(COALESCE(bem.bench_hours, 0)) / :monthlyCap * 100)::numeric, 2) AS avg_bench_pct
+      ROUND(AVG(COALESCE(bem.bench_hours, 0) / ${CAP_M} * 100)::numeric, 2) AS avg_bench_pct,
+      ROUND(AVG(COALESCE(bem.original_bench_hours, 0) / ${CAP_M} * 100)::numeric, 2) AS original_avg_bench_pct
     FROM flagged_employees fe
     CROSS JOIN months m
     INNER JOIN employees e ON e.id = fe.employee_id
@@ -1764,7 +1840,7 @@ async function getResourceWiseBench(filters) {
 // getResourceWiseBench above) so the SQL emits exactly one row per roster
 // entry regardless of how many months are in range — no join-multiplication.
 //
-// Capped Hours is always the literal MONTHLY_CAP (176) — never derived from
+// Capped Hours is always that month's Monthly Cap Hours (CAP_M) — never derived from
 // resource_budget_master/timesheets. Resource Budget Hours (Projection %
 // basis) comes from resource_budget_master; Logged Hours (Actual % basis)
 // comes from timesheets, same hoursSource/roleId conventions as every other
@@ -1828,7 +1904,7 @@ async function getResourceCostUtilization(filters) {
     limit, offset, exportAll, companyIds,
   } = filters;
 
-  const hoursCol = (hoursSource === 'O') ? 't.hours_logged' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const hoursCol = (hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
   const allowedSort = ['employee_name', 'employee_code', 'bu_name', 'client_name', 'project_name', 'service_po_name'];
   const safeSort = allowedSort.includes(sortBy) ? sortBy : 'employee_name';
   const safeOrder = sortOrder && String(sortOrder).toUpperCase() === 'DESC' ? 'DESC' : 'ASC';
@@ -1839,7 +1915,6 @@ async function getResourceCostUtilization(filters) {
     startDate, endDateExclusive,
     startPeriod: startYear * 100 + startMonth,
     endPeriod: endYear * 100 + endMonth,
-    monthlyCap: MONTHLY_CAP,
     companyIds,
     limit, offset,
   };
@@ -1964,7 +2039,8 @@ async function getResourceCostUtilization(filters) {
     ),
     logged_by_month AS (
       SELECT t.employee_id, t.service_po_id, date_trunc('month', t.timesheet_date)::date AS month_start,
-             SUM(${hoursCol}) AS logged_hours
+             SUM(${hoursCol}) AS logged_hours,
+             SUM(${originalHoursCol}) AS original_logged_hours
       FROM timesheets t
       WHERE t.timesheet_date >= :startDate AND t.timesheet_date < :endDateExclusive
         AND t.company_id IN (:companyIds)
@@ -1986,13 +2062,16 @@ async function getResourceCostUtilization(filters) {
     json_agg(json_build_object(
       'month', EXTRACT(MONTH FROM m.month_start)::int,
       'year', EXTRACT(YEAR FROM m.month_start)::int,
-      'cappedHours', :monthlyCap,
+      'cappedHours', ${CAP_M},
       'resourceBudgetHours', ROUND(COALESCE(rb.resource_budget_hours, 0)::numeric, 2),
       'loggedHours', ROUND(COALESCE(lg.logged_hours, 0)::numeric, 2),
       'monthlyCtc', ROUND(COALESCE(mc.total_cost, 0)::numeric, 2),
-      'projectionPercentage', ROUND((COALESCE(rb.resource_budget_hours, 0) / :monthlyCap * 100)::numeric, 2),
-      'actualPercentage', ROUND((COALESCE(lg.logged_hours, 0) / :monthlyCap * 100)::numeric, 2),
-      'contribution', ROUND((COALESCE(mc.total_cost, 0) * (COALESCE(lg.logged_hours, 0) / :monthlyCap))::numeric, 2)
+      'projectionPercentage', ROUND((COALESCE(rb.resource_budget_hours, 0) / ${CAP_M} * 100)::numeric, 2),
+      'actualPercentage', ROUND((COALESCE(lg.logged_hours, 0) / ${CAP_M} * 100)::numeric, 2),
+      'contribution', ROUND((COALESCE(mc.total_cost, 0) * (COALESCE(lg.logged_hours, 0) / ${CAP_M}))::numeric, 2),
+      'originalLoggedHours', ROUND(COALESCE(lg.original_logged_hours, 0)::numeric, 2),
+      'originalActualPercentage', ROUND((COALESCE(lg.original_logged_hours, 0) / ${CAP_M} * 100)::numeric, 2),
+      'originalContribution', ROUND((COALESCE(mc.total_cost, 0) * (COALESCE(lg.original_logged_hours, 0) / ${CAP_M}))::numeric, 2)
     ) ORDER BY m.month_start) AS months
   `;
 
@@ -2029,7 +2108,9 @@ async function getResourceCostUtilization(filters) {
       COUNT(DISTINCT r.service_po_id) AS service_po_count,
       ROUND(SUM(COALESCE(rb.resource_budget_hours, 0))::numeric, 2) AS total_resource_budget_hours,
       ROUND(SUM(COALESCE(lg.logged_hours, 0))::numeric, 2) AS total_logged_hours,
-      ROUND(SUM(COALESCE(mc.total_cost, 0) * (COALESCE(lg.logged_hours, 0) / :monthlyCap))::numeric, 2) AS total_contribution
+      ROUND(SUM(COALESCE(mc.total_cost, 0) * (COALESCE(lg.logged_hours, 0) / ${CAP_M}))::numeric, 2) AS total_contribution,
+      ROUND(SUM(COALESCE(lg.original_logged_hours, 0))::numeric, 2) AS original_total_logged_hours,
+      ROUND(SUM(COALESCE(mc.total_cost, 0) * (COALESCE(lg.original_logged_hours, 0) / ${CAP_M}))::numeric, 2) AS original_total_contribution
     FROM roster r
     CROSS JOIN months m
     LEFT JOIN resource_budget_by_month rb ON rb.emp_id = r.employee_id AND rb.service_po_id = r.service_po_id AND rb.month_start = m.month_start

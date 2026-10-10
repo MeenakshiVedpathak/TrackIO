@@ -118,6 +118,15 @@ module.exports = (sequelize) => {
         allowNull: false,
         defaultValue: false,
       },
+      // The Monthly Cap Hours (system_settings.monthly_cap_hours) in force when
+      // this import was adjusted. Reports use it as that month's capacity so an
+      // old month keeps the cap it was synced with; a re-sync replaces the
+      // import and stamps the then-latest cap. Existing rows default to 176.
+      cap_hours: {
+        type: DataTypes.DECIMAL(6, 2),
+        allowNull: false,
+        defaultValue: 176,
+      },
       // 'excel' (default, every pre-existing row) or 'pms' — tells
       // confirmImport() whether to re-parse the stored file or re-fetch
       // from the PMS provider on confirm (see timesheetService.js).

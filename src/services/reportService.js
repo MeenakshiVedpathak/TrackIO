@@ -1,6 +1,7 @@
 'use strict';
 
 const reportRepo = require('../repositories/reportRepository');
+const monthlyCapService = require('./monthlyCapService');
 const serviceCategoryRepo = require('../repositories/serviceCategoryRepository');
 const { getPaginationParams, getPaginationMeta } = require('../utils/pagination');
 const logger = require('../utils/logger');
@@ -175,11 +176,17 @@ async function getTimesheetSummary(query, companyIds) {
     0
   );
 
+  const pageTotalOriginalHours = rows.reduce(
+    (acc, row) => acc + (parseFloat(row.original_hours_logged) || 0),
+    0
+  );
+
   return {
     data: rows,
     meta,
     summary: {
       total_hours_on_page: Math.round(pageTotalHours * 100) / 100,
+      original_total_hours_on_page: Math.round(pageTotalOriginalHours * 100) / 100,
     },
   };
 }
@@ -250,11 +257,17 @@ async function getSubProjectHours(query, companyIds) {
     0
   );
 
+  const pageTotalOriginalHours = rows.reduce(
+    (acc, row) => acc + (parseFloat(row.original_total_hours) || 0),
+    0
+  );
+
   return {
     data: rows,
     meta,
     summary: {
       total_hours_on_page: Math.round(pageTotalHours * 100) / 100,
+      original_total_hours_on_page: Math.round(pageTotalOriginalHours * 100) / 100,
     },
   };
 }
@@ -322,7 +335,7 @@ function buildPivotResponse(rawColumns, rawRows, count, page, limit, fullDataset
   // Pivot flat rows into per-employee objects.
   // All fields that are NOT pivot-specific are captured as employee fields so
   // extra columns (total_experience, clients, etc.) flow through automatically.
-  const PIVOT_KEYS = new Set(['service_type_id', 'service_type_name', 'category_id', 'category_name', 'hours']);
+  const PIVOT_KEYS = new Set(['service_type_id', 'service_type_name', 'category_id', 'category_name', 'hours', 'original_hours']);
   const empMap = new Map();
   for (const row of rawRows) {
     if (!empMap.has(row.employee_id)) {
@@ -330,9 +343,12 @@ function buildPivotResponse(rawColumns, rawRows, count, page, limit, fullDataset
       for (const [k, v] of Object.entries(row)) {
         if (!PIVOT_KEYS.has(k)) empFields[k] = v;
       }
-      empMap.set(row.employee_id, { ...empFields, hours: {} });
+      empMap.set(row.employee_id, { ...empFields, hours: {}, original_hours: {} });
     }
     empMap.get(row.employee_id).hours[row.service_type_id] = parseFloat(row.hours) || 0;
+    // ORIGINAL (pre-cap-scaling) logged hours per service type — falls back to the synced figure when the repo row carries none.
+    empMap.get(row.employee_id).original_hours[row.service_type_id] =
+      row.original_hours !== undefined && row.original_hours !== null ? (parseFloat(row.original_hours) || 0) : (parseFloat(row.hours) || 0);
   }
 
   // Compute per-employee totals
@@ -340,24 +356,33 @@ function buildPivotResponse(rawColumns, rawRows, count, page, limit, fullDataset
     let billable_total     = 0;
     let non_billable_total = 0;
     let leaves_hours       = 0;
+    let original_billable_total     = 0;
+    let original_non_billable_total = 0;
+    let original_leaves_hours       = 0;
 
     for (const col of rawColumns) {
       const h = emp.hours[col.service_type_id] || 0;
+      const oh = emp.original_hours[col.service_type_id] || 0;
       if (billableCategoryIds.has(col.category_id)) {
         billable_total += h;
+        original_billable_total += oh;
       } else {
         non_billable_total += h;
+        original_non_billable_total += oh;
       }
       if (leaveServiceTypeIds.has(col.service_type_id)) {
         leaves_hours += h;
+        original_leaves_hours += oh;
       }
     }
+    const original_total_hours       = original_billable_total + original_non_billable_total;
+    const original_total_utilization = original_total_hours - original_leaves_hours;
 
     const total_hours       = billable_total + non_billable_total;
     const total_utilization = total_hours - leaves_hours;
 
     // Monthly Resource Utilization report carries `monthly_capacity` on every
-    // employee row (currently a fixed 176); other pivot reports (e.g. plain
+    // employee row (that month's Monthly Cap Hours, 176 by default); other pivot reports (e.g. plain
     // Resource Utilization) don't select it, so this comes back null there
     // and the frontend should hide the column rather than show a bogus %.
     const monthlyCapacity = parseFloat(emp.monthly_capacity) || 0;
@@ -365,7 +390,7 @@ function buildPivotResponse(rawColumns, rawRows, count, page, limit, fullDataset
       ? round2((total_utilization / monthlyCapacity) * 100)
       : null;
     // Contributed % — what share of this employee's Monthly Capacity (the
-    // fixed cap, e.g. 176 — same denominator utilization_percentage above
+    // Monthly Cap Hours, e.g. 176 — same denominator utilization_percentage above
     // uses) was billable. E.g. capacity 176, 150 billable -> 85.23%.
     // Deliberately against monthlyCapacity, NOT total_hours — a pivot report
     // that doesn't select monthly_capacity at all (plain Resource
@@ -373,6 +398,13 @@ function buildPivotResponse(rawColumns, rawRows, count, page, limit, fullDataset
     // same as utilization_percentage.
     const contributed_percentage = monthlyCapacity > 0
       ? round2((billable_total / monthlyCapacity) * 100)
+      : null;
+    // Same formulas/denominator/rounding as the synced figures above, fed by ORIGINAL hours.
+    const original_utilization_percentage = monthlyCapacity > 0
+      ? round2((original_total_utilization / monthlyCapacity) * 100)
+      : null;
+    const original_contributed_percentage = monthlyCapacity > 0
+      ? round2((original_billable_total / monthlyCapacity) * 100)
       : null;
 
     return {
@@ -384,13 +416,20 @@ function buildPivotResponse(rawColumns, rawRows, count, page, limit, fullDataset
       total_utilization:  round2(total_utilization),
       utilization_percentage,
       contributed_percentage,
+      original_billable_total:     round2(original_billable_total),
+      original_non_billable_total: round2(original_non_billable_total),
+      original_total_hours:        round2(original_total_hours),
+      original_leaves_hours:       round2(original_leaves_hours),
+      original_total_utilization:  round2(original_total_utilization),
+      original_utilization_percentage,
+      original_contributed_percentage,
     };
   });
 
   const meta = getPaginationMeta(count, page, limit);
 
   // Full-dataset summary (when the caller supplied one) takes over the
-  // capacity denominator too — `employee_count * 176`, covering every
+  // capacity denominator too — `employee_count * monthly cap`, covering every
   // employee in the filtered set, not just this page's `monthly_capacity`
   // sum. Falls back to the existing page-level reduce for callers that
   // haven't been converted yet.
@@ -401,7 +440,13 @@ function buildPivotResponse(rawColumns, rawRows, count, page, limit, fullDataset
       total_hours: fullDatasetSummary.total_hours,
       leaves_hours: fullDatasetSummary.leaves_hours,
       total_utilization: fullDatasetSummary.total_utilization,
-      monthly_capacity: (fullDatasetSummary.employee_count || 0) * 176,
+      original_billable_total: fullDatasetSummary.original_billable_total,
+      original_non_billable_total: fullDatasetSummary.original_non_billable_total,
+      original_total_hours: fullDatasetSummary.original_total_hours,
+      original_leaves_hours: fullDatasetSummary.original_leaves_hours,
+      original_total_utilization: fullDatasetSummary.original_total_utilization,
+      monthly_capacity: (fullDatasetSummary.employee_count || 0)
+        * (Number(fullDatasetSummary.monthly_capacity_per_employee) || Number(data[0] && data[0].monthly_capacity) || 176),
     }
     : data.reduce(
       (acc, r) => {
@@ -410,10 +455,19 @@ function buildPivotResponse(rawColumns, rawRows, count, page, limit, fullDataset
         acc.total_hours        += r.total_hours;
         acc.leaves_hours       += r.leaves_hours;
         acc.total_utilization  += r.total_utilization;
+        acc.original_billable_total     += r.original_billable_total;
+        acc.original_non_billable_total += r.original_non_billable_total;
+        acc.original_total_hours        += r.original_total_hours;
+        acc.original_leaves_hours       += r.original_leaves_hours;
+        acc.original_total_utilization  += r.original_total_utilization;
         acc.monthly_capacity   += parseFloat(r.monthly_capacity) || 0;
         return acc;
       },
-      { billable_total: 0, non_billable_total: 0, total_hours: 0, leaves_hours: 0, total_utilization: 0, monthly_capacity: 0 }
+      {
+        billable_total: 0, non_billable_total: 0, total_hours: 0, leaves_hours: 0, total_utilization: 0,
+        original_billable_total: 0, original_non_billable_total: 0, original_total_hours: 0, original_leaves_hours: 0, original_total_utilization: 0,
+        monthly_capacity: 0,
+      }
     );
 
   return {
@@ -436,6 +490,17 @@ function buildPivotResponse(rawColumns, rawRows, count, page, limit, fullDataset
       // month employee the same as a full-176-hour one).
       contributed_percentage: summarySource.monthly_capacity > 0
         ? round2((summarySource.billable_total / summarySource.monthly_capacity) * 100)
+        : null,
+      original_billable_total:     round2(summarySource.original_billable_total || 0),
+      original_non_billable_total: round2(summarySource.original_non_billable_total || 0),
+      original_total_hours:        round2(summarySource.original_total_hours || 0),
+      original_leaves_hours:       round2(summarySource.original_leaves_hours || 0),
+      original_total_utilization:  round2(summarySource.original_total_utilization || 0),
+      original_utilization_percentage: summarySource.monthly_capacity > 0
+        ? round2(((summarySource.original_total_utilization || 0) / summarySource.monthly_capacity) * 100)
+        : null,
+      original_contributed_percentage: summarySource.monthly_capacity > 0
+        ? round2(((summarySource.original_billable_total || 0) / summarySource.monthly_capacity) * 100)
         : null,
     },
   };
@@ -599,6 +664,13 @@ async function getEmployeeUtilizationSummary(query, companyIds) {
       leaves_hours:           round2(fullDatasetSummary.leaves_hours),
       lnd_hours:              round2(fullDatasetSummary.lnd_hours),
       others_hours:           round2(fullDatasetSummary.others_hours),
+      original_billable_total:         round2(fullDatasetSummary.original_billable_total || 0),
+      original_non_billable_total:     round2(fullDatasetSummary.original_non_billable_total || 0),
+      original_internal_support_hours: round2(fullDatasetSummary.original_internal_support_hours || 0),
+      original_team_management_hours:  round2(fullDatasetSummary.original_team_management_hours || 0),
+      original_leaves_hours:           round2(fullDatasetSummary.original_leaves_hours || 0),
+      original_lnd_hours:              round2(fullDatasetSummary.original_lnd_hours || 0),
+      original_others_hours:           round2(fullDatasetSummary.original_others_hours || 0),
     },
   };
 }
@@ -674,6 +746,7 @@ async function getServicePOSummary(query, companyIds) {
     (acc, row) => {
       acc.total_po_value                += round2(row.po_value);
       acc.total_hours_delivered         += round2(row.hours_delivered_before_month);
+      acc.total_original_hours_delivered += round2(row.original_hours_delivered_before_month);
       acc.total_exp_hours               += round2(row.exp_hours);
       acc.total_monthly_billable_amount += round2(row.monthly_billable_amount);
       return acc;
@@ -681,6 +754,7 @@ async function getServicePOSummary(query, companyIds) {
     {
       total_po_value: 0,
       total_hours_delivered: 0,
+      total_original_hours_delivered: 0,
       total_exp_hours: 0,
       total_monthly_billable_amount: 0,
     }
@@ -692,6 +766,7 @@ async function getServicePOSummary(query, companyIds) {
     summary: {
       total_po_value:                     round2(pageTotals.total_po_value),
       total_hours_delivered_before_month: round2(pageTotals.total_hours_delivered),
+      original_total_hours_delivered_before_month: round2(pageTotals.total_original_hours_delivered),
       total_exp_hours:                    round2(pageTotals.total_exp_hours),
       total_monthly_billable_amount:      round2(pageTotals.total_monthly_billable_amount),
     },
@@ -774,6 +849,8 @@ async function getInvoicePOSummary(query, companyIds) {
       acc.total_po_value                += round2(row.po_value);
       acc.total_hours_delivered         += round2(row.hours_delivered_before_month);
       acc.total_hours_delivered_current_month += round2(row.hours_delivered_current_month);
+      acc.total_original_hours_delivered += round2(row.original_hours_delivered_before_month);
+      acc.total_original_hours_delivered_current_month += round2(row.original_hours_delivered_current_month);
       acc.total_exp_hours               += round2(row.exp_hours);
       acc.total_monthly_billable_amount += round2(row.monthly_billable_amount);
       acc.total_invoiced_amount         += round2(row.invoiced_amount);
@@ -785,6 +862,8 @@ async function getInvoicePOSummary(query, companyIds) {
       total_po_value: 0,
       total_hours_delivered: 0,
       total_hours_delivered_current_month: 0,
+      total_original_hours_delivered: 0,
+      total_original_hours_delivered_current_month: 0,
       total_exp_hours: 0,
       total_monthly_billable_amount: 0,
       total_invoiced_amount: 0,
@@ -800,6 +879,8 @@ async function getInvoicePOSummary(query, companyIds) {
       total_po_value:                     round2(pageTotals.total_po_value),
       total_hours_delivered_before_month: round2(pageTotals.total_hours_delivered),
       total_hours_delivered_current_month: round2(pageTotals.total_hours_delivered_current_month),
+      original_total_hours_delivered_before_month: round2(pageTotals.total_original_hours_delivered),
+      original_total_hours_delivered_current_month: round2(pageTotals.total_original_hours_delivered_current_month),
       total_exp_hours:                    round2(pageTotals.total_exp_hours),
       total_monthly_billable_amount:      round2(pageTotals.total_monthly_billable_amount),
       total_invoiced_amount:              round2(pageTotals.total_invoiced_amount),
@@ -895,7 +976,6 @@ async function getMonthlyResourceUtilization(query, companyIds) {
   return buildPivotResponse(rawColumns, rawRows, count, page, limit, summary);
 }
 
-const RESOURCE_MONTHLY_UTILIZATION_CAPACITY = 176;
 
 /**
  * Resource Monthly Utilization Report
@@ -909,11 +989,11 @@ const RESOURCE_MONTHLY_UTILIZATION_CAPACITY = 176;
  *
  * Reuses buildPivotResponse() as-is for the billable/non-billable/leave
  * classification and the existing Monthly Resource Utilization "Overall
- * Utilization %" formula (total_utilization / 176-hr monthly_capacity * 100,
+ * Utilization %" formula (total_utilization / monthly_capacity (Monthly Cap Hours) * 100,
  * where total_utilization excludes leave hours) — not reimplemented here.
  * Billable/Non-Billable Utilization % are each computed against the same
- * fixed 176-hr capacity independently (Billable Hours / 176, Non-Billable
- * Hours / 176) — intentionally NOT against Total Hours, per product spec.
+ * monthly capacity independently (Billable Hours / cap, Non-Billable
+ * Hours / cap) — intentionally NOT against Total Hours, per product spec.
  * The page/summary totals are derived from aggregated hours (via
  * buildPivotResponse's own summary reduction), never from averaging
  * per-employee percentages.
@@ -937,6 +1017,9 @@ async function getResourceMonthlyUtilizationReport(query, companyIds) {
   }
 
   const { page, limit, offset } = getPaginationParams(query);
+
+  // That month's Monthly Cap Hours — the same value the repository selects as monthly_capacity.
+  const monthlyCapacity = await monthlyCapService.getCapForMonth(filters.month, filters.year, companyIds);
 
   const clientId = query.clientId ? parseInt(query.clientId, 10) : undefined;
   // poId is accepted as an alias for projectId, same convention as the
@@ -984,15 +1067,22 @@ async function getResourceMonthlyUtilizationReport(query, companyIds) {
     billableHours: emp.billable_total,
     nonBillableHours: emp.non_billable_total,
     totalHours: emp.total_hours,
-    billableUtilizationPercentage: utilizationAgainstCapacity(emp.billable_total, RESOURCE_MONTHLY_UTILIZATION_CAPACITY),
-    nonBillableUtilizationPercentage: utilizationAgainstCapacity(emp.non_billable_total, RESOURCE_MONTHLY_UTILIZATION_CAPACITY),
+    billableUtilizationPercentage: utilizationAgainstCapacity(emp.billable_total, monthlyCapacity),
+    nonBillableUtilizationPercentage: utilizationAgainstCapacity(emp.non_billable_total, monthlyCapacity),
     overallUtilizationPercentage: emp.utilization_percentage,
+    // ORIGINAL (pre-cap-scaling) counterparts — same capacity denominator and formulas.
+    originalBillableHours: emp.original_billable_total,
+    originalNonBillableHours: emp.original_non_billable_total,
+    originalTotalHours: emp.original_total_hours,
+    originalBillableUtilizationPercentage: utilizationAgainstCapacity(emp.original_billable_total, monthlyCapacity),
+    originalNonBillableUtilizationPercentage: utilizationAgainstCapacity(emp.original_non_billable_total, monthlyCapacity),
+    originalOverallUtilizationPercentage: emp.original_utilization_percentage,
   }));
 
   const meta = getPaginationMeta(count, page, limit);
 
   // Billable/Non-Billable % at the summary level are against the SUMMED
-  // capacity across every employee in the FULL filtered dataset (176 ×
+  // capacity across every employee in the FULL filtered dataset (cap ×
   // employee count), not just the current page — the same aggregation basis
   // buildPivotResponse itself now uses internally for Overall Utilization %
   // (see its own fullDatasetSummary handling), so all three summary
@@ -1001,7 +1091,7 @@ async function getResourceMonthlyUtilizationReport(query, companyIds) {
   // repo didn't supply a full-dataset summary (defensive; the one caller of
   // this function always does).
   const totalCapacity = fullDatasetSummary
-    ? (fullDatasetSummary.employee_count || 0) * RESOURCE_MONTHLY_UTILIZATION_CAPACITY
+    ? (fullDatasetSummary.employee_count || 0) * monthlyCapacity
     : pivotData.reduce((sum, emp) => sum + (parseFloat(emp.monthly_capacity) || 0), 0);
 
   const summary = {
@@ -1011,6 +1101,12 @@ async function getResourceMonthlyUtilizationReport(query, companyIds) {
     billableUtilizationPercentage: utilizationAgainstCapacity(pivotSummary.billable_total, totalCapacity),
     nonBillableUtilizationPercentage: utilizationAgainstCapacity(pivotSummary.non_billable_total, totalCapacity),
     overallUtilizationPercentage: pivotSummary.utilization_percentage,
+    originalBillableHours: pivotSummary.original_billable_total,
+    originalNonBillableHours: pivotSummary.original_non_billable_total,
+    originalTotalHours: pivotSummary.original_total_hours,
+    originalBillableUtilizationPercentage: utilizationAgainstCapacity(pivotSummary.original_billable_total, totalCapacity),
+    originalNonBillableUtilizationPercentage: utilizationAgainstCapacity(pivotSummary.original_non_billable_total, totalCapacity),
+    originalOverallUtilizationPercentage: pivotSummary.original_utilization_percentage,
   };
 
   return { data, meta, summary, month: filters.month, year: filters.year };
@@ -1094,6 +1190,7 @@ async function getResourseProjectUtilizationReport(query, companyIds) {
         employeeId: row.employee_id,
         employeeName: row.employee_name,
         totalHours: 0,
+        originalTotalHours: 0,
         remarks: null,
         projects: [],
       });
@@ -1101,9 +1198,13 @@ async function getResourseProjectUtilizationReport(query, companyIds) {
 
     const emp = byEmployee.get(row.employee_id);
     const hrs = parseFloat(row.project_hours) || 0;
+    const origHrs = row.original_project_hours !== undefined && row.original_project_hours !== null
+      ? (parseFloat(row.original_project_hours) || 0)
+      : hrs;
     const rate = costMap.get(row.employee_id) || 0;
 
     emp.totalHours += hrs;
+    emp.originalTotalHours += origHrs;
 
     emp.projects.push({
       client: row.client,
@@ -1112,6 +1213,7 @@ async function getResourseProjectUtilizationReport(query, companyIds) {
       projectSubType: row.project_sub_type,
       category: row.category,
       projectHours: hrs,
+      originalProjectHours: Math.round(origHrs * 100) / 100,
       billableAmount: row.is_billable
         ? Math.round(hrs * rate * 100) / 100
         : 0,
@@ -1121,6 +1223,7 @@ async function getResourseProjectUtilizationReport(query, companyIds) {
   const data = Array.from(byEmployee.values()).map((emp) => ({
     ...emp,
     totalHours: Math.round(emp.totalHours * 100) / 100,
+    originalTotalHours: Math.round(emp.originalTotalHours * 100) / 100,
   }));
 
   const meta = getPaginationMeta(count, page, limit);
@@ -1227,18 +1330,22 @@ async function getClientServicePOHoursReport(query, companyIds) {
         client_id: clientId,
         client_name: row.client_name,
         total_hrs_of_client: 0,
+        original_total_hrs_of_client: 0,
         service_pos: [],
       });
     }
     const hours = round2(row.hours);
+    const originalHours = row.original_hours !== undefined && row.original_hours !== null ? round2(row.original_hours) : hours;
     const client = clientsById.get(clientId);
     client.service_pos.push({
       service_po_id: row.service_po_id,
       service_po_code: row.service_po_code,
       service_po_name: row.service_po_name,
       hours,
+      original_hours: originalHours,
     });
     client.total_hrs_of_client = round2(client.total_hrs_of_client + hours);
+    client.original_total_hrs_of_client = round2(client.original_total_hrs_of_client + originalHours);
   }
 
   return Array.from(clientsById.values());
@@ -1313,13 +1420,26 @@ async function getClientCostAnalytics(query, companyIds) {
   const hoursSource = query.hoursSource;
   const entityId = query.entityId ? parseInt(query.entityId, 10) : undefined;
   companyIds = await intersectCompanyIdsWithEntity(companyIds, parseIdList(query.entityIds) ?? entityId);
+  // Business Unit + Sub-BU: a Parent BU covers its Sub-BUs; picking specific Sub-BU ids narrows to them.
   companyIds = await intersectIdsWithBuHierarchy(companyIds, parseIdList(query.businessUnitIds));
 
+  // OPTIONAL month window (month+year, or startDate+endDate): hours and cost then cover only that
+  // period. With neither, the report stays all-time, as before.
+  const hasPeriod = ['month', 'year', 'startDate', 'endDate'].some((k) => query[k] !== undefined && query[k] !== '');
+  const period = hasPeriod ? resolveClientServicePODateRange(query) : null;
+  const clientIds = parseIdList(query.clientIds ?? query.clientId);
+  const scope = {
+    companyIds,
+    startDate: period ? period.startDate : undefined,
+    endDate: period ? period.endDate : undefined,
+    clientIds,
+  };
+
   const [hoursRows, costRows, categories, matrixRows] = await Promise.all([
-    reportRepo.getClientCostAnalyticsHours({ companyIds, hoursSource }),
-    reportRepo.getClientCostAnalyticsCost({ companyIds }),
+    reportRepo.getClientCostAnalyticsHours({ ...scope, hoursSource, roleId: query.roleId }),
+    reportRepo.getClientCostAnalyticsCost(scope),
     serviceCategoryRepo.findAll({ companyId: companyIds }),
-    reportRepo.getClientCategoryCostMatrixReport({ companyIds }),
+    reportRepo.getClientCategoryCostMatrixReport(scope),
   ]);
   const categoryNames = categories.map((c) => c.name);
 
@@ -1329,6 +1449,7 @@ async function getClientCostAnalytics(query, companyIds) {
       client_id: row.client_id,
       client_name: row.client_name,
       total_hours: round2(row.total_hours),
+      original_total_hours: round2(row.original_total_hours !== undefined && row.original_total_hours !== null ? row.original_total_hours : row.total_hours),
       total_cost: 0,
     });
   }
@@ -1338,6 +1459,7 @@ async function getClientCostAnalytics(query, companyIds) {
         client_id: row.client_id,
         client_name: row.client_name,
         total_hours: 0,
+        original_total_hours: 0,
         total_cost: round2(row.total_cost),
       });
     } else {
@@ -1380,6 +1502,7 @@ async function getClientCostAnalytics(query, companyIds) {
       },
     },
     category_matrix: Array.from(matrixMap.values()).sort((a, b) => b.total_cost - a.total_cost),
+    period: period ? { start_date: period.startDate, end_date: period.endDate } : null,
   };
 }
 
@@ -1427,6 +1550,7 @@ async function getClientWiseAnalyticsReport(query, companyIds) {
       client_id: row.client_id,
       client_name: row.client_name,
       total_hours: parseFloat(row.total_hours) || 0,
+      original_total_hours: parseFloat(row.original_total_hours !== undefined && row.original_total_hours !== null ? row.original_total_hours : row.total_hours) || 0,
       total_projects: parseInt(row.total_projects, 10) || 0,
       total_cost: 0,
     });
@@ -1437,6 +1561,7 @@ async function getClientWiseAnalyticsReport(query, companyIds) {
         client_id: row.client_id,
         client_name: row.client_name,
         total_hours: 0,
+        original_total_hours: 0,
         total_projects: 0,
         total_cost: parseFloat(row.total_cost) || 0,
       });
@@ -1453,6 +1578,7 @@ async function getClientWiseAnalyticsReport(query, companyIds) {
     client_name: c.client_name,
     total_cost: round2(c.total_cost),
     total_hours: round2(c.total_hours),
+    original_total_hours: round2(c.original_total_hours),
     average_cost_per_hour: c.total_hours > 0 ? round2(c.total_cost / c.total_hours) : 0,
     total_projects: c.total_projects,
     percentage_of_total_cost: overallTotalCost > 0 ? round2((c.total_cost / overallTotalCost) * 100) : 0,
@@ -1525,17 +1651,25 @@ async function getMonthlyHoursTrend(query, companyIds) {
 
   const REPORT_BUCKET_LABELS = { billable: 'Billable', non_billable: 'Non-Billable', customer_non_billable: 'Customer Non-Billable' };
   const emptyBucket = () => ({ Billable: 0, 'Non-Billable': 0, 'Customer Non-Billable': 0, Other: 0 });
+  const emptyOriginalBucket = () => ({ original_Billable: 0, 'original_Non-Billable': 0, 'original_Customer Non-Billable': 0, original_Other: 0 });
   const categoryByMonth = new Map();
+  const originalCategoryByMonth = new Map();
   for (const row of categoryRows) {
     const key = `${row.year}-${row.month}`;
     if (!categoryByMonth.has(key)) categoryByMonth.set(key, emptyBucket());
     const bucket = categoryByMonth.get(key);
     const label = REPORT_BUCKET_LABELS[row.report_bucket_key] || 'Other';
     bucket[label] = round2(bucket[label] + (parseFloat(row.hours) || 0));
+    if (!originalCategoryByMonth.has(key)) originalCategoryByMonth.set(key, emptyOriginalBucket());
+    const originalBucket = originalCategoryByMonth.get(key);
+    const originalKey = `original_${label}`;
+    const originalValue = row.original_hours !== undefined && row.original_hours !== null ? row.original_hours : row.hours;
+    originalBucket[originalKey] = round2(originalBucket[originalKey] + (parseFloat(originalValue) || 0));
   }
   const monthly_hours_by_category = months.map(({ year, month }) => ({
     month: reportMonthLabel(year, month),
     ...(categoryByMonth.get(`${year}-${month}`) || emptyBucket()),
+    ...(originalCategoryByMonth.get(`${year}-${month}`) || emptyOriginalBucket()),
   }));
 
   // Cost by category — same "known categories + any extra encountered"
@@ -1569,24 +1703,47 @@ async function getMonthlyHoursTrend(query, companyIds) {
     const row = utilizationByMonth.get(`${year}-${month}`);
     const totalHours = row ? parseFloat(row.total_hours) || 0 : 0;
     const billableHours = row ? parseFloat(row.billable_hours) || 0 : 0;
+    const originalTotalHours = row ? parseFloat(row.original_total_hours) || 0 : 0;
+    const originalBillableHours = row ? parseFloat(row.original_billable_hours) || 0 : 0;
+    // CAPACITY of the month = people who logged that month x that month's Monthly Cap Hours.
+    const employeeCount = row ? parseInt(row.employee_count, 10) || 0 : 0;
+    const capHours = row ? parseFloat(row.cap_hours) || 0 : 0;
+    const capacityHours = employeeCount * capHours;
     return {
       month: reportMonthLabel(year, month),
       total_hours: round2(totalHours),
       billable_hours: round2(billableHours),
+      // Billable MIX: billable / total logged. It is 100% whenever everything logged was billable,
+      // however many hours that is — it does not compare against capacity.
       utilization_percentage: totalHours > 0 ? round2((billableHours / totalHours) * 100) : 0,
+      original_total_hours: round2(originalTotalHours),
+      original_billable_hours: round2(originalBillableHours),
+      original_utilization_percentage: originalTotalHours > 0 ? round2((originalBillableHours / originalTotalHours) * 100) : 0,
+      // Against CAPACITY: hours / capacity. Original hours above the cap give more than 100%.
+      employee_count: employeeCount,
+      cap_hours: round2(capHours),
+      capacity_hours: round2(capacityHours),
+      billable_vs_capacity_percentage: capacityHours > 0 ? round2((billableHours / capacityHours) * 100) : 0,
+      original_billable_vs_capacity_percentage: capacityHours > 0 ? round2((originalBillableHours / capacityHours) * 100) : 0,
+      logged_vs_capacity_percentage: capacityHours > 0 ? round2((totalHours / capacityHours) * 100) : 0,
+      original_logged_vs_capacity_percentage: capacityHours > 0 ? round2((originalTotalHours / capacityHours) * 100) : 0,
     };
   });
 
   const leaveByMonth = new Map(leaveRows.map((row) => [`${row.year}-${row.month}`, parseFloat(row.leave_hours) || 0]));
+  const originalLeaveByMonth = new Map(leaveRows.map((row) => [`${row.year}-${row.month}`, parseFloat(row.original_leave_hours) || 0]));
   const leave_hours_trend = months.map(({ year, month }) => ({
     month: reportMonthLabel(year, month),
     leave_hours: round2(leaveByMonth.get(`${year}-${month}`) || 0),
+    original_leave_hours: round2(originalLeaveByMonth.get(`${year}-${month}`) || 0),
   }));
 
   const noWorkByMonth = new Map(noWorkRows.map((row) => [`${row.year}-${row.month}`, parseFloat(row.no_work_hours) || 0]));
+  const originalNoWorkByMonth = new Map(noWorkRows.map((row) => [`${row.year}-${row.month}`, parseFloat(row.original_no_work_hours) || 0]));
   const no_work_trend = months.map(({ year, month }) => ({
     month: reportMonthLabel(year, month),
     no_work_hours: round2(noWorkByMonth.get(`${year}-${month}`) || 0),
+    original_no_work_hours: round2(originalNoWorkByMonth.get(`${year}-${month}`) || 0),
   }));
 
   return { monthly_hours_by_category, monthly_cost_by_category, monthly_utilization, leave_hours_trend, no_work_trend };
@@ -1633,12 +1790,19 @@ async function getEmployeeBenchPercentage(query, companyIds) {
         full_name: row.full_name,
         bench_hours: 0,
         total_hours: 0,
+        original_bench_hours: 0,
+        original_total_hours: 0,
       });
     }
     const emp = empMap.get(row.employee_id);
     const hours = parseFloat(row.hours) || 0;
+    const originalHours = row.original_hours !== undefined && row.original_hours !== null ? (parseFloat(row.original_hours) || 0) : hours;
     emp.total_hours += hours;
-    if (isBenchServiceTypeReport(row.service_po_name)) emp.bench_hours += hours;
+    emp.original_total_hours += originalHours;
+    if (isBenchServiceTypeReport(row.service_po_name)) {
+      emp.bench_hours += hours;
+      emp.original_bench_hours += originalHours;
+    }
   }
 
   const shaped = Array.from(empMap.values()).map((emp) => ({
@@ -1648,6 +1812,9 @@ async function getEmployeeBenchPercentage(query, companyIds) {
     bench_hours: round2(emp.bench_hours),
     total_hours: round2(emp.total_hours),
     bench_pct: emp.total_hours > 0 ? round2((emp.bench_hours / emp.total_hours) * 100) : 0,
+    original_bench_hours: round2(emp.original_bench_hours),
+    original_total_hours: round2(emp.original_total_hours),
+    original_bench_pct: emp.original_total_hours > 0 ? round2((emp.original_bench_hours / emp.original_total_hours) * 100) : 0,
   }));
 
   const allowedSort = ['bench_pct', 'bench_hours', 'total_hours'];
@@ -1815,6 +1982,8 @@ async function getResourceUtilizationTrendReport(query, companyIds) {
   const shaped = rows.map((row) => {
     const totalHours = parseFloat(row.total_hours) || 0;
     const billableHours = parseFloat(row.billable_hours) || 0;
+    const originalTotalHours = parseFloat(row.original_total_hours) || 0;
+    const originalBillableHours = parseFloat(row.original_billable_hours) || 0;
     return {
       month: reportMonthLabel(row.year, row.month),
       year: row.year,
@@ -1825,6 +1994,9 @@ async function getResourceUtilizationTrendReport(query, companyIds) {
       total_hours: round2(totalHours),
       billable_hours: round2(billableHours),
       utilization_percentage: totalHours > 0 ? round2((billableHours / totalHours) * 100) : 0,
+      original_total_hours: round2(originalTotalHours),
+      original_billable_hours: round2(originalBillableHours),
+      original_utilization_percentage: originalTotalHours > 0 ? round2((originalBillableHours / originalTotalHours) * 100) : 0,
     };
   });
 
@@ -1901,6 +2073,7 @@ async function getServicePOHoursBudgetReport(query, companyIds) {
       client_id: row.client_id,
       client_name: row.client_name,
       total_hours: round2(row.total_hours),
+      original_total_hours: round2(row.original_total_hours !== undefined && row.original_total_hours !== null ? row.original_total_hours : row.total_hours),
       cost_budget: 0,
     });
   }
@@ -1916,6 +2089,7 @@ async function getServicePOHoursBudgetReport(query, companyIds) {
         client_id: row.client_id,
         client_name: row.client_name,
         total_hours: 0,
+        original_total_hours: 0,
         cost_budget: round2(row.cost_budget),
       });
     } else {
@@ -1933,6 +2107,7 @@ async function getServicePOHoursBudgetReport(query, companyIds) {
     client_id: r.client_id,
     client_name: r.client_name,
     total_hours: r.total_hours,
+    original_total_hours: r.original_total_hours,
     cost_budget: r.cost_budget,
   }));
 

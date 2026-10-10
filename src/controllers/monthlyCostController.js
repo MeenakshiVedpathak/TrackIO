@@ -143,7 +143,7 @@ const getById = async (req, res) => {
  *                 type: number
  *               working_hours:
  *                 type: integer
- *                 description: Monthly working hours for per-hour rate calculation (default 176)
+ *                 description: Monthly working hours for per-hour rate calculation (defaults to the current Monthly Cap Hours setting)
  *     responses:
  *       201:
  *         description: Record created with calculated costs
@@ -397,7 +397,7 @@ const deleteByMonth = async (req, res) => {
  *                 type: integer
  *               working_hours:
  *                 type: integer
- *                 description: Monthly working hours used for per-hour rate (default 176)
+ *                 description: Monthly working hours used for per-hour rate (defaults to the current Monthly Cap Hours setting)
  *     responses:
  *       200:
  *         description: Bulk calculation completed
@@ -418,7 +418,7 @@ const calculateSchema = Joi.object({
     'number.min': 'Year must be 2020 or later.',
     'any.required': 'Year is required.',
   }),
-  working_hours: Joi.number().integer().min(1).max(744).default(176).messages({
+  working_hours: Joi.number().integer().min(1).max(744).messages({
     'number.base': 'Working hours must be a number.',
     'number.min': 'Working hours must be at least 1.',
     'number.max': 'Working hours cannot exceed 744 (31 days × 24 hours).',

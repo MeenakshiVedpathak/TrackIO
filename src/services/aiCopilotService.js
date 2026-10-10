@@ -36,7 +36,7 @@ const round2 = (n) => Math.round(parseFloat(n || 0) * 100) / 100;
 // ── Per-intent instructions for the AI (what to do with the data, not what
 // the data IS — the data itself is always the real, already-computed JSON) ──
 const INTENT_INSTRUCTIONS = {
-  utilization: 'The data lists each employee\'s billable/non-billable hours and total utilization for the stated month. Identify who is under-utilized (low total_utilization relative to a ~176-hour month) or over-utilized, and name them specifically.',
+  utilization: 'The data lists each employee\'s billable/non-billable hours and total utilization for the stated month. Identify who is under-utilized (low total_utilization relative to the standard monthly cap hours (about one month of full-time work)) or over-utilized, and name them specifically.',
   bench: 'The data lists employees currently on bench (idle) with their bench hours and bench percentage over the trailing window described in the data. Summarize who is on bench and for how long.',
   timesheet: 'The data lists active employees missing a timesheet entry for the specified check date. State exactly who is missing an entry and how many employees that is.',
   cost: 'The data lists cost records (salary/ops/total cost) for the stated month. Summarize total cost and any notably high-cost entries.',

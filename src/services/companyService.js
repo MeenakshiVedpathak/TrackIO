@@ -161,25 +161,29 @@ const validateParentBusinessUnit = async (parentBusinessUnitId, entityIds, selfI
 
 /**
  * Auto-generate a unique company_code for a Sub-BU — "no need of BU code" at
- * Sub-BU creation time, same reasoning as entity_id being derived instead of
- * asked for. Built from company_name (uppercase alphanumeric, truncated to
- * the column's 20-char limit), with a numeric suffix appended if that base
- * collides with an existing code.
+ * Sub-BU creation time. Format: `<parentCode>-<n>`, where n is one more than
+ * the highest number already used under that parent (first Sub-BU -> -1,
+ * second -> -2, ...). Soft-deleted Sub-BUs still count, so numbers are never
+ * reused.
  *
- * @param {string} companyName
+ * @param {object} parent - the validated parent Company row
  * @returns {Promise<string>}
  */
-const generateSubBuCode = async (companyName) => {
-  const base = String(companyName || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 20) || 'SUBBU';
+const generateSubBuCode = async (parent) => {
+  const prefix = `${parent.company_code}-`;
+  const existing = await companyRepository.findSubBuCodes(parent.id);
 
-  let candidate = base;
-  let suffix = 1;
-  while (await companyRepository.findByCode(candidate)) {
-    const suffixStr = String(suffix);
-    candidate = `${base.slice(0, 20 - suffixStr.length)}${suffixStr}`;
-    suffix += 1;
+  let max = 0;
+  for (const code of existing) {
+    if (code.toLowerCase().startsWith(prefix.toLowerCase())) {
+      const n = Number(code.slice(prefix.length));
+      if (Number.isInteger(n) && n > max) max = n;
+    }
   }
-  return candidate;
+
+  let next = max + 1;
+  while (await companyRepository.findByCode(`${prefix}${next}`)) next += 1;
+  return `${prefix}${next}`;
 };
 
 /**
@@ -229,7 +233,7 @@ const create = async (data, actorId, ipAddress = null, entityIds = []) => {
     effectiveEntityId = parent.entity_id;
     effectiveSaturdayOffRule = parent.saturday_off_rule;
     if (!effectiveCompanyCode) {
-      effectiveCompanyCode = await generateSubBuCode(company_name);
+      effectiveCompanyCode = await generateSubBuCode(parent);
     }
   } else {
     // "Entity Admin cannot access Entities belonging to another Entity

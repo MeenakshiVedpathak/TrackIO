@@ -1,6 +1,7 @@
 'use strict';
 
 const managementReportService = require('../services/managementReportService');
+const monthlyCapService = require('../services/monthlyCapService');
 const { sendPaginated, sendSuccess, sendError } = require('../utils/response');
 const logger = require('../utils/logger');
 const { toGroupedExcelBuffer } = require('../utils/reportExporter');
@@ -86,7 +87,6 @@ async function getServiceLineBusinessMix(req, res, next) {
 }
 
 const MONTH_NAMES_UPPER = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
-const CAPPED_MONTHLY_HOURS = 176;
 
 /**
  * GET /reports/resource-cost-utilization/export
@@ -149,13 +149,20 @@ async function exportResourceCostUtilization(req, res, next) {
       monthColumns.push(
         { key: `${prefix}_hours`, label: 'Hours', group, fill, width: 10, numFmt: '0.00' },
         { key: `${prefix}_logged`, label: 'Logged Hrs', group, fill, width: 12, numFmt: '0.00' },
+        { key: `${prefix}_original_logged`, label: 'Original Logged Hrs', group, fill, width: 14, numFmt: '0.00' },
         { key: `${prefix}_projection`, label: 'Utilization % - Projection', group, fill, width: 15, numFmt: '0.00"%"' },
         { key: `${prefix}_actual`, label: 'Utilization % - Actual', group, fill, width: 15, numFmt: '0.00"%"' },
-        { key: `${prefix}_contribution`, label: 'Contribution', group, fill, width: 14, numFmt: '#,##0.00' }
+        { key: `${prefix}_original_actual`, label: 'Original Utilization % - Actual', group, fill, width: 17, numFmt: '0.00"%"' },
+        { key: `${prefix}_contribution`, label: 'Contribution', group, fill, width: 14, numFmt: '#,##0.00' },
+        { key: `${prefix}_original_contribution`, label: 'Original Contribution', group, fill, width: 14, numFmt: '#,##0.00' }
       );
     });
 
     const columns = [...staticColumns, ...monthColumns];
+
+    // Only used for a month an employee row somehow carries no data for; normally every
+    // month already has its own cappedHours (that month's Monthly Cap Hours) from the report.
+    const fallbackCappedHours = await monthlyCapService.getCurrentCap();
 
     const rows = data.map((emp) => {
       const row = {
@@ -175,11 +182,14 @@ async function exportResourceCostUtilization(req, res, next) {
       monthSequence.forEach(({ month, year }) => {
         const prefix = `m_${year}_${month}`;
         const mo = byMonth.get(`${year}_${month}`);
-        row[`${prefix}_hours`] = mo ? mo.cappedHours : CAPPED_MONTHLY_HOURS;
+        row[`${prefix}_hours`] = mo ? mo.cappedHours : fallbackCappedHours;
         row[`${prefix}_logged`] = mo ? mo.loggedHours : 0;
+        row[`${prefix}_original_logged`] = mo ? mo.originalLoggedHours : 0;
         row[`${prefix}_projection`] = mo ? mo.projectionPercentage : 0;
         row[`${prefix}_actual`] = mo ? mo.actualPercentage : 0;
+        row[`${prefix}_original_actual`] = mo ? mo.originalActualPercentage : 0;
         row[`${prefix}_contribution`] = mo ? mo.contribution : 0;
+        row[`${prefix}_original_contribution`] = mo ? mo.originalContribution : 0;
       });
       return row;
     });

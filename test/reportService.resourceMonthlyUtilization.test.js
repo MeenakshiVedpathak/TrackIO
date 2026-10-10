@@ -3,6 +3,11 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
+// The monthly cap is read from the DB (admin-editable setting) — pin it so these tests don't depend on local data.
+const monthlyCapService = require('../src/services/monthlyCapService');
+monthlyCapService.getCapForMonth = async () => 176;
+monthlyCapService.getCurrentCap = async () => 176;
+
 // Required BEFORE the service so we can monkey-patch its exported function —
 // reportService.js holds a live reference to this SAME module-cached object.
 // Same pattern as test/reportService.resourceUtilizationTrend.test.js.

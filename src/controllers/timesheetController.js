@@ -479,16 +479,18 @@ const deleteTimesheet = async (req, res, next) => {
       employeeBusinessUnits: req.employeeBusinessUnits,
     });
 
-    await timesheetService.deleteTimesheet(id, fullReachCompanyIds);
+    const deleted = await timesheetService.deleteTimesheet(id, fullReachCompanyIds);
 
+    // Records WHICH timesheet (employee, PO, date, hours) and the BU it belonged to.
     createAuditLog(
       req.userId,
       'DELETE',
       'timesheets',
       id,
+      deleted,
       null,
-      null,
-      getIpAddress(req)
+      getIpAddress(req),
+      { companyId: deleted && deleted.company_id }
     );
 
     return sendNoContent(res);
@@ -543,17 +545,22 @@ const deleteImports = async (req, res, next) => {
       employeeBusinessUnits: req.employeeBusinessUnits,
     });
 
-    const result = await timesheetService.deleteImports(ids, fullReachCompanyIds);
+    const { deletedImports = [], ...result } = await timesheetService.deleteImports(ids, fullReachCompanyIds);
 
-    createAuditLog(
-      req.userId,
-      'DELETE',
-      'timesheet_import_history',
-      null,
-      null,
-      { deletedIds: ids, ...result },
-      getIpAddress(req)
-    );
+    // One audit row PER monthly sheet, so each one carries its own month, year, source and BU /
+    // Sub-BU (a single batch can span several of them) and can be filtered by BU.
+    for (const sheet of deletedImports) {
+      createAuditLog(
+        req.userId,
+        'DELETE',
+        'timesheet_import_history',
+        sheet.import_id,
+        sheet,
+        { deleted_in_batch: deletedImports.length, work_logs_reverted_to_approved: result.revertedWorkLogs },
+        getIpAddress(req),
+        { companyId: sheet.company_id }
+      );
+    }
 
     return sendSuccess(
       res,

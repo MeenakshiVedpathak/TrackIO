@@ -8,7 +8,7 @@ const companyAccessControlService = require('./companyAccessControlService');
 const { intersectCompanyIdsWithEntity, intersectIdsWithBuHierarchy } = companyAccessControlService;
 const { createAuditLog, getIpAddress } = require('../middlewares/auditLog');
 const { parseMonthString, toMonthString } = require('../helpers/monthPeriodHelper');
-const { MAX_MONTHLY_HOURS } = require('../config/resourceBudget.config');
+const monthlyCapService = require('./monthlyCapService');
 const { parseIdList } = require('../utils/idListParser');
 const logger = require('../utils/logger');
 
@@ -20,7 +20,7 @@ const logger = require('../utils/logger');
  *
  * Central rule enforced everywhere hours are written: one employee's total
  * ACTIVE resource budget hours across every Service PO, for one month, must
- * never exceed MAX_MONTHLY_HOURS (176 by default).
+ * never exceed the Monthly Cap Hours for that month (176 by default; admin-editable).
  */
 
 const round2 = (value) => Math.round((parseFloat(value || 0) + Number.EPSILON) * 100) / 100;
@@ -77,10 +77,11 @@ async function assertEmployeeMappedToServicePO(empId, servicePOId, companyId) {
  * Build the "cannot exceed N hours" message shared by the single-record and
  * bulk validation paths.
  * @param {number} newTotal
+ * @param {number} maxMonthlyHours - the Monthly Cap Hours that applies to the budget's month
  * @returns {string}
  */
-function overCapMessage(newTotal) {
-  return `Employee monthly resource budget cannot exceed ${MAX_MONTHLY_HOURS} hours. Current total after this request would be ${newTotal} hours.`;
+function overCapMessage(newTotal, maxMonthlyHours) {
+  return `Employee monthly resource budget cannot exceed ${maxMonthlyHours} hours. Current total after this request would be ${newTotal} hours.`;
 }
 
 /**
@@ -163,10 +164,11 @@ const create = async (data, userId, req) => {
     throw err;
   }
 
+  const maxMonthlyHours = await monthlyCapService.getCapForEmployeeMonth(emp_id, month, year);
   const currentTotal = await resourceBudgetRepository.sumActiveHoursForEmployeeMonth(emp_id, month, year);
   const newTotal = round2(currentTotal + hours);
-  if (newTotal > MAX_MONTHLY_HOURS) {
-    const err = new Error(overCapMessage(newTotal));
+  if (newTotal > maxMonthlyHours) {
+    const err = new Error(overCapMessage(newTotal, maxMonthlyHours));
     err.statusCode = 400;
     throw err;
   }
@@ -222,9 +224,10 @@ const update = async (id, data, userId, req) => {
     existing.year,
     { excludeId: id }
   );
+  const maxMonthlyHours = await monthlyCapService.getCapForEmployeeMonth(existing.emp_id, existing.month, existing.year);
   const newTotal = round2(currentTotal + hours);
-  if (newTotal > MAX_MONTHLY_HOURS) {
-    const err = new Error(overCapMessage(newTotal));
+  if (newTotal > maxMonthlyHours) {
+    const err = new Error(overCapMessage(newTotal, maxMonthlyHours));
     err.statusCode = 400;
     throw err;
   }
@@ -348,12 +351,13 @@ const bulkUpsert = async (data, userId, req) => {
     throw err;
   }
 
-  // Pass 2 — the 176-hour cap, per employee. baseTotal excludes this Service
+  // Pass 2 — the monthly cap (Monthly Cap Hours), per employee. baseTotal excludes this Service
   // PO entirely (whatever existing row it has for this PO/month is being
   // REPLACED by this request's value, not added to), then adds the
   // requested hours back on top of every OTHER Service PO's active total.
   const hoursErrors = [];
   for (const item of resources) {
+    const maxMonthlyHours = await monthlyCapService.getCapForEmployeeMonth(item.emp_id, month, year);
     const hours = round2(item.hours);
     const baseTotal = await resourceBudgetRepository.sumActiveHoursForEmployeeMonth(
       item.emp_id,
@@ -362,10 +366,10 @@ const bulkUpsert = async (data, userId, req) => {
       { excludeServicePOId: service_po_id }
     );
     const newTotal = round2(baseTotal + hours);
-    if (newTotal > MAX_MONTHLY_HOURS) {
+    if (newTotal > maxMonthlyHours) {
       hoursErrors.push({
         emp_id: item.emp_id,
-        message: `Employee monthly resource budget cannot exceed ${MAX_MONTHLY_HOURS} hours. Current total would be ${newTotal} hours.`,
+        message: `Employee monthly resource budget cannot exceed ${maxMonthlyHours} hours. Current total would be ${newTotal} hours.`,
       });
     }
   }

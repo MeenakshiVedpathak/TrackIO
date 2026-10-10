@@ -2,6 +2,10 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+
+// The fallback capped hours come from the admin-editable setting — pin it so this test doesn't depend on local data.
+const monthlyCapService = require('../src/services/monthlyCapService');
+monthlyCapService.getCurrentCap = async () => 176;
 const ExcelJS = require('exceljs');
 
 const managementReportService = require('../src/services/managementReportService');
@@ -28,7 +32,7 @@ test('exportResourceCostUtilization: same-year range groups columns as plain APR
         employeeCode: 'EMP001', employeeName: 'Ravichandran', monthlyCtc: 4167, buName: 'DATA + AI', subBuName: 'IBM',
         projectManagers: ['Balaji', 'Suresh'], client: 'LIC', project: 'Capital-M', spo: 'Capital-M',
         months: [
-          { monthNumber: 4, year: 2026, cappedHours: 176, loggedHours: 88, projectionPercentage: 73.86, actualPercentage: 50, contribution: 2083.5 },
+          { monthNumber: 4, year: 2026, cappedHours: 176, loggedHours: 88, projectionPercentage: 73.86, actualPercentage: 50, contribution: 2083.5, originalLoggedHours: 100, originalActualPercentage: 56.82, originalContribution: 2367.5 },
           { monthNumber: 5, year: 2026, cappedHours: 176, loggedHours: 42, projectionPercentage: 56.82, actualPercentage: 23.86, contribution: 1073.86 },
         ],
       }],
@@ -57,10 +61,13 @@ test('exportResourceCostUtilization: same-year range groups columns as plain APR
     assert.equal(sheet.getCell(1, empColCount + 1).value, 'APR');
     assert.equal(sheet.getCell(2, empColCount + 1).value, 'Hours');
     assert.equal(sheet.getCell(2, empColCount + 2).value, 'Logged Hrs');
-    assert.equal(sheet.getCell(2, empColCount + 3).value, 'Utilization % - Projection');
-    assert.equal(sheet.getCell(2, empColCount + 4).value, 'Utilization % - Actual');
-    assert.equal(sheet.getCell(2, empColCount + 5).value, 'Contribution');
-    assert.equal(sheet.getCell(1, empColCount + 6).value, 'MAY');
+    assert.equal(sheet.getCell(2, empColCount + 3).value, 'Original Logged Hrs');
+    assert.equal(sheet.getCell(2, empColCount + 4).value, 'Utilization % - Projection');
+    assert.equal(sheet.getCell(2, empColCount + 5).value, 'Utilization % - Actual');
+    assert.equal(sheet.getCell(2, empColCount + 6).value, 'Original Utilization % - Actual');
+    assert.equal(sheet.getCell(2, empColCount + 7).value, 'Contribution');
+    assert.equal(sheet.getCell(2, empColCount + 8).value, 'Original Contribution');
+    assert.equal(sheet.getCell(1, empColCount + 9).value, 'MAY');
 
     // Data row: Expected CTC / Billed Status blank; hours/contribution populated.
     const dataRow = sheet.getRow(3);
@@ -74,7 +81,10 @@ test('exportResourceCostUtilization: same-year range groups columns as plain APR
     assert.equal(dataRow.getCell(8).value, 'Balaji, Suresh'); // merged PMs, one cell
     assert.equal(dataRow.getCell(empColCount + 1).value, 176);
     assert.equal(dataRow.getCell(empColCount + 2).value, 88);
-    assert.equal(dataRow.getCell(empColCount + 5).value, 2083.5);
+    assert.equal(dataRow.getCell(empColCount + 3).value, 100);
+    assert.equal(dataRow.getCell(empColCount + 6).value, 56.82);
+    assert.equal(dataRow.getCell(empColCount + 7).value, 2083.5);
+    assert.equal(dataRow.getCell(empColCount + 8).value, 2367.5);
   } finally {
     restore();
   }
@@ -97,9 +107,9 @@ test('exportResourceCostUtilization: a year-crossing range (Nov->Feb) suffixes m
 
     const empColCount = 11;
     assert.equal(sheet.getCell(1, empColCount + 1).value, 'NOV-26');
-    assert.equal(sheet.getCell(1, empColCount + 6).value, 'DEC-26');
-    assert.equal(sheet.getCell(1, empColCount + 11).value, 'JAN-27');
-    assert.equal(sheet.getCell(1, empColCount + 16).value, 'FEB-27');
+    assert.equal(sheet.getCell(1, empColCount + 9).value, 'DEC-26');
+    assert.equal(sheet.getCell(1, empColCount + 17).value, 'JAN-27');
+    assert.equal(sheet.getCell(1, empColCount + 25).value, 'FEB-27');
   } finally {
     restore();
   }
@@ -128,8 +138,8 @@ test('exportResourceCostUtilization: a roster row missing a month in range still
     const sheet = workbook.worksheets[0];
     const empColCount = 11;
     const dataRow = sheet.getRow(3);
-    assert.equal(dataRow.getCell(empColCount + 6).value, 176); // May Hours still 176, not blank
-    assert.equal(dataRow.getCell(empColCount + 7).value, 0);   // May Logged Hrs defaults to 0
+    assert.equal(dataRow.getCell(empColCount + 9).value, 176); // May Hours still 176, not blank
+    assert.equal(dataRow.getCell(empColCount + 10).value, 0);   // May Logged Hrs defaults to 0
   } finally {
     restore();
   }

@@ -50,6 +50,21 @@ const findByCode = async (code) => {
 };
 
 /**
+ * Company codes of every Sub-BU under a parent, INCLUDING soft-deleted ones
+ * (so a deleted Sub-BU's number is never reused).
+ * @param {number} parentId
+ * @returns {Promise<string[]>}
+ */
+const findSubBuCodes = async (parentId) => {
+  const rows = await Company.findAll({
+    where: { parent_business_unit_id: parentId },
+    attributes: ['company_code'],
+    raw: true,
+  });
+  return rows.map((r) => r.company_code);
+};
+
+/**
  * Insert a new company.
  * @param {object} data
  * @param {object} [options] - Sequelize options (e.g. { transaction })
@@ -311,6 +326,7 @@ module.exports = {
   findAll,
   findById,
   findByCode,
+  findSubBuCodes,
   create,
   update,
   updateSubBuSaturdayOffRule,

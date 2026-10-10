@@ -286,6 +286,7 @@ const deleteMonthlyWorkLog = async (employeeId, companyId, month, year) => {
   await employeeWorkLogRepository.deleteByEmployeeAndDateRange(employeeId, startDate, endDate, companyId);
 
   logger.info('Employee monthly work log deleted', { employeeId, companyId, month, year });
+
 };
 
 module.exports = {

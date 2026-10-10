@@ -2,18 +2,22 @@
 
 const { sequelize } = require('../models');
 const { QueryTypes } = require('sequelize');
+const { companyRangeCapacitySql, employeeRangeCapacitySql } = require('../utils/monthlyCapSql');
 
 /**
  * Utilisation report queries — (1) BU-wise Utilisation, (2) Employee × Project
  * Utilisation (original vs after-sync adjusted hours).
  *
- * Source of truth is the official `timesheets` table: hours_logged is the
- * original logged value, COALESCE(modified_hours, hours_logged) is the
- * "adjusted / after sync" value (same convention as every other report —
- * hoursSource 'O' selects the original instead).
+ * Source of truth is the official `timesheets` table: COALESCE(original_hours, hours_logged)
+ * is the original logged value (what the employee actually logged, before the monthly-cap
+ * adjustment; older rows without original_hours fall back to hours_logged), and
+ * COALESCE(modified_hours, hours_logged) is the "adjusted / after sync" value (same
+ * convention as every other report — hoursSource 'O' selects the original instead).
  */
 
-const MONTHLY_CAPACITY = 176;
+// Capacity = the Monthly Cap Hours each BU / employee's months were synced with, summed over the
+// months in the range (see utils/monthlyCapSql) — never one shared number, since BUs of the same
+// month can sit on different caps.
 
 // Utility POs that are never "work": excluded from Billable/Non-Billable/
 // Customer Non-Billable and from Total Logged in the BU-wise report.
@@ -29,8 +33,11 @@ const CAT_NON_BILLABLE_SQL = `LOWER(TRIM(sc.name)) = 'non-billable'`;
 
 const isEmptyScope = (ids) => !ids || ids.length === 0;
 
+// What the employee actually logged (before the monthly-cap adjustment) — independent of hoursSource.
+const ORIGINAL_HOURS_SQL = 'COALESCE(t.original_hours, t.hours_logged)';
+
 const hoursColumn = (hoursSource) => (
-  hoursSource === 'O' ? 't.hours_logged' : 'COALESCE(t.modified_hours, t.hours_logged)'
+  hoursSource === 'O' ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)'
 );
 
 // Role 5 only sees rows from published imports (same guard as the other reports).
@@ -50,6 +57,12 @@ const ORDERABLE_BU = {
   customerNonBillableHours: 'customer_non_billable_hours',
   totalLoggedHours: 'total_logged_hours',
   utilizationPercentage: 'utilization_percentage',
+  originalBillableHours: 'original_billable_hours',
+  originalNonBillableHours: 'original_non_billable_hours',
+  originalCustomerNonBillableHours: 'original_customer_non_billable_hours',
+  originalTotalLoggedHours: 'original_total_logged_hours',
+  originalUtilizationPercentage: 'original_utilization_percentage',
+  notLoggedHours: 'not_logged_hours',
 };
 
 const ORDERABLE_EMP_PROJECT = {
@@ -94,7 +107,6 @@ async function getBuWiseUtilisation(f) {
     startDate: f.startDate,
     endDate: f.endDate,
     companyIds: f.companyIds,
-    capacity: MONTHLY_CAPACITY * f.monthsInRange,
     limit: f.limit,
     offset: f.offset,
   };
@@ -169,7 +181,10 @@ async function getBuWiseUtilisation(f) {
         t.company_id AS bu_id,
         COALESCE(SUM(CASE WHEN NOT ${EXCLUDED_PO_SQL} AND ${CAT_BILLABLE_SQL} THEN ${hoursCol} ELSE 0 END), 0) AS billable_hours,
         COALESCE(SUM(CASE WHEN NOT ${EXCLUDED_PO_SQL} AND ${CAT_CUSTOMER_NB_SQL} THEN ${hoursCol} ELSE 0 END), 0) AS customer_non_billable_hours,
-        COALESCE(SUM(CASE WHEN NOT ${EXCLUDED_PO_SQL} AND ${CAT_NON_BILLABLE_SQL} THEN ${hoursCol} ELSE 0 END), 0) AS non_billable_hours
+        COALESCE(SUM(CASE WHEN NOT ${EXCLUDED_PO_SQL} AND ${CAT_NON_BILLABLE_SQL} THEN ${hoursCol} ELSE 0 END), 0) AS non_billable_hours,
+        COALESCE(SUM(CASE WHEN NOT ${EXCLUDED_PO_SQL} AND ${CAT_BILLABLE_SQL} THEN ${ORIGINAL_HOURS_SQL} ELSE 0 END), 0) AS original_billable_hours,
+        COALESCE(SUM(CASE WHEN NOT ${EXCLUDED_PO_SQL} AND ${CAT_CUSTOMER_NB_SQL} THEN ${ORIGINAL_HOURS_SQL} ELSE 0 END), 0) AS original_customer_non_billable_hours,
+        COALESCE(SUM(CASE WHEN NOT ${EXCLUDED_PO_SQL} AND ${CAT_NON_BILLABLE_SQL} THEN ${ORIGINAL_HOURS_SQL} ELSE 0 END), 0) AS original_non_billable_hours
       FROM timesheets t
       JOIN employees e           ON e.id  = t.employee_id
       JOIN service_pos sp        ON sp.id = t.service_po_id
@@ -184,18 +199,25 @@ async function getBuWiseUtilisation(f) {
         b.bu_name,
         b.sub_bu_name,
         COALESCE(ec.total_employees, 0)::int AS total_employees,
-        COALESCE(ec.total_employees, 0) * :capacity AS expected_hours,
+        COALESCE(ec.total_employees, 0) * ${companyRangeCapacitySql('b.bu_id')} AS expected_hours,
         ROUND(COALESCE(h.billable_hours, 0)::numeric, 2) AS billable_hours,
         ROUND(COALESCE(h.non_billable_hours, 0)::numeric, 2) AS non_billable_hours,
         ROUND(COALESCE(h.customer_non_billable_hours, 0)::numeric, 2) AS customer_non_billable_hours,
-        ROUND((COALESCE(h.billable_hours, 0) + COALESCE(h.non_billable_hours, 0) + COALESCE(h.customer_non_billable_hours, 0))::numeric, 2) AS total_logged_hours
+        ROUND((COALESCE(h.billable_hours, 0) + COALESCE(h.non_billable_hours, 0) + COALESCE(h.customer_non_billable_hours, 0))::numeric, 2) AS total_logged_hours,
+        ROUND(COALESCE(h.original_billable_hours, 0)::numeric, 2) AS original_billable_hours,
+        ROUND(COALESCE(h.original_non_billable_hours, 0)::numeric, 2) AS original_non_billable_hours,
+        ROUND(COALESCE(h.original_customer_non_billable_hours, 0)::numeric, 2) AS original_customer_non_billable_hours,
+        ROUND((COALESCE(h.original_billable_hours, 0) + COALESCE(h.original_non_billable_hours, 0) + COALESCE(h.original_customer_non_billable_hours, 0))::numeric, 2) AS original_total_logged_hours
       FROM bus b
       LEFT JOIN emp_counts ec ON ec.bu_id = b.bu_id
       LEFT JOIN hours h       ON h.bu_id  = b.bu_id
     ),
     final AS (
       SELECT r.*,
-        CASE WHEN r.expected_hours > 0 THEN ROUND((r.total_logged_hours / r.expected_hours * 100)::numeric, 2) ELSE 0 END AS utilization_percentage
+        CASE WHEN r.expected_hours > 0 THEN ROUND((r.total_logged_hours / r.expected_hours * 100)::numeric, 2) ELSE 0 END AS utilization_percentage,
+        CASE WHEN r.expected_hours > 0 THEN ROUND((r.original_total_logged_hours / r.expected_hours * 100)::numeric, 2) ELSE 0 END AS original_utilization_percentage,
+        -- Expected - Total Logged (never negative: logging more than expected leaves nothing un-logged)
+        GREATEST(ROUND((r.expected_hours - r.total_logged_hours)::numeric, 2), 0) AS not_logged_hours
       FROM report r
     )
   `;
@@ -217,7 +239,12 @@ async function getBuWiseUtilisation(f) {
          COALESCE(SUM(billable_hours), 0) AS billable_hours,
          COALESCE(SUM(non_billable_hours), 0) AS non_billable_hours,
          COALESCE(SUM(customer_non_billable_hours), 0) AS customer_non_billable_hours,
-         COALESCE(SUM(total_logged_hours), 0) AS total_logged_hours
+         COALESCE(SUM(total_logged_hours), 0) AS total_logged_hours,
+         COALESCE(SUM(original_billable_hours), 0) AS original_billable_hours,
+         COALESCE(SUM(original_non_billable_hours), 0) AS original_non_billable_hours,
+         COALESCE(SUM(original_customer_non_billable_hours), 0) AS original_customer_non_billable_hours,
+         COALESCE(SUM(original_total_logged_hours), 0) AS original_total_logged_hours,
+         COALESCE(SUM(not_logged_hours), 0) AS not_logged_hours
        FROM final`,
       { replacements, type: QueryTypes.SELECT }
     ),
@@ -249,7 +276,6 @@ async function getEmployeeProjectUtilisation(f) {
     startDate: f.startDate,
     endDate: f.endDate,
     companyIds: f.companyIds,
-    capacity: MONTHLY_CAPACITY * f.monthsInRange,
     limit: f.limit,
     offset: f.offset,
   };
@@ -292,7 +318,7 @@ async function getEmployeeProjectUtilisation(f) {
     replacements.search = `%${f.search}%`;
   }
 
-  const origCol = 't.hours_logged';
+  const origCol = 'COALESCE(t.original_hours, t.hours_logged)';
   const adjCol = 'COALESCE(t.modified_hours, t.hours_logged)';
 
   const orderCol = ORDERABLE_EMP_PROJECT[f.sortBy] || 'employee_name';
@@ -311,7 +337,8 @@ async function getEmployeeProjectUtilisation(f) {
     WITH emp_totals AS (
       SELECT t.employee_id,
         SUM(${origCol}) AS total_logged,
-        SUM(${adjCol})  AS total_adjusted
+        SUM(${adjCol})  AS total_adjusted,
+        ${employeeRangeCapacitySql('t.employee_id')} AS capacity
       ${joins}
       WHERE ${scope.join(' AND ')}
       GROUP BY t.employee_id
@@ -333,8 +360,8 @@ async function getEmployeeProjectUtilisation(f) {
     ),
     final AS (
       SELECT d.*,
-        ROUND((et.total_logged   / :capacity * 100)::numeric, 2) AS original_utilization_percentage,
-        ROUND((et.total_adjusted / :capacity * 100)::numeric, 2) AS total_utilization_percentage
+        ROUND((et.total_logged   / NULLIF(et.capacity, 0) * 100)::numeric, 2) AS original_utilization_percentage,
+        ROUND((et.total_adjusted / NULLIF(et.capacity, 0) * 100)::numeric, 2) AS total_utilization_percentage
       FROM detail d
       JOIN emp_totals et ON et.employee_id = d.employee_id
     )
@@ -368,7 +395,6 @@ async function getEmployeeProjectUtilisation(f) {
 }
 
 module.exports = {
-  MONTHLY_CAPACITY,
   getBuWiseUtilisation,
   getEmployeeProjectUtilisation,
 };

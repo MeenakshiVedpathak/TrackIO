@@ -96,7 +96,9 @@ test('getResourceMonthlyUtilization: an empty companyIds array short-circuits to
     assert.deepEqual(result.rows, []);
     assert.equal(result.count, 0);
     assert.deepEqual(result.summary, {
-      billable_total: 0, non_billable_total: 0, total_hours: 0, leaves_hours: 0, total_utilization: 0, employee_count: 0,
+      billable_total: 0, non_billable_total: 0, total_hours: 0, leaves_hours: 0, total_utilization: 0,
+      original_billable_total: 0, original_non_billable_total: 0, original_total_hours: 0, original_leaves_hours: 0, original_total_utilization: 0,
+      employee_count: 0,
     });
   } finally {
     restore();
@@ -130,6 +132,11 @@ test('getResourceMonthlyUtilization: runs a FOURTH unpaginated summary query cla
       total_hours: 1760,
       leaves_hours: 40,
       total_utilization: 1720,
+      original_billable_total: 0,
+      original_non_billable_total: 0,
+      original_total_hours: 0,
+      original_leaves_hours: 0,
+      original_total_utilization: 0,
       employee_count: 10,
     });
   } finally {

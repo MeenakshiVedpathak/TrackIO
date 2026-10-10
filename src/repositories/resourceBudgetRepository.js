@@ -6,7 +6,7 @@ const { ResourceBudget, EmployeeServicePOMapping, Employee, ServicePO } = requir
 /**
  * Resource Budget Repository
  * All direct database interaction for resource_budget_master. No business
- * logic — the 176-hour validation lives in resourceBudgetService.js.
+ * logic — the monthly-cap validation lives in resourceBudgetService.js.
  */
 
 const employeeInclude = {
@@ -115,13 +115,13 @@ const findAll = async (filters, companyId) => {
  * single-record update flow) and/or one Service PO (used by the bulk flow,
  * which is replacing every row for that Service PO in this same call).
  *
- * Deliberately NOT company-scoped: the 176-hour cap is a per-employee,
+ * Deliberately NOT company-scoped: the monthly cap is a per-employee,
  * per-month invariant across the employee's ENTIRE cross-BU footprint, not
  * per-company. Each budget row is stamped with its own Service PO's owning
  * company_id (see resourceBudgetService.js's create()/bulkUpsert() doc
  * comments on cross-BU staffing), so scoping this sum to one companyId would
  * only ever see one BU's slice of the employee's hours — letting the same
- * employee be booked well over 176 combined hours across multiple BUs
+ * employee be booked well over the cap in combined hours across multiple BUs
  * undetected. Confirmed live: an employee with 150 active hours under one
  * BU's Service PO was invisible to a second BU's cap check entirely.
  *

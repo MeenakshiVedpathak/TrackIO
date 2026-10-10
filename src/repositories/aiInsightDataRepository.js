@@ -4,6 +4,7 @@ const moment = require('moment-timezone');
 const { sequelize } = require('../models');
 const { QueryTypes } = require('sequelize');
 const { buLessServicePOInTenantSql } = require('../utils/servicePOTenantSql');
+const { timesheetCapSql } = require('../utils/monthlyCapSql');
 
 /**
  * AI Insight Data Repository
@@ -161,7 +162,7 @@ async function getUtilizationAndCostSummary(startDate, endDate, companyId) {
     `SELECT
        COALESCE(SUM(t.hours_logged), 0) AS total_hours,
        COALESCE(SUM(CASE WHEN sp.is_billable THEN t.hours_logged END), 0) AS billable_hours,
-       COALESCE(SUM(t.hours_logged * COALESCE(mc.total_cost, 0) / 176.0), 0) AS total_cost,
+       COALESCE(SUM(t.hours_logged * COALESCE(mc.total_cost, 0) / ${timesheetCapSql('t')}), 0) AS total_cost,
        COUNT(DISTINCT t.employee_id) AS active_employee_count
      FROM timesheets t
      INNER JOIN service_pos sp ON sp.id = t.service_po_id
@@ -197,7 +198,7 @@ async function getTopClientsByCostForPeriod(startDate, endDate, limit = 5, compa
     `SELECT
        c.id AS client_id,
        c.client_name,
-       ROUND(SUM(t.hours_logged * COALESCE(mc.total_cost, 0) / 176.0)::NUMERIC, 2) AS cost,
+       ROUND(SUM(t.hours_logged * COALESCE(mc.total_cost, 0) / ${timesheetCapSql('t')})::NUMERIC, 2) AS cost,
        ROUND(SUM(t.hours_logged)::NUMERIC, 2) AS hours
      FROM timesheets t
      INNER JOIN service_pos sp ON sp.id = t.service_po_id

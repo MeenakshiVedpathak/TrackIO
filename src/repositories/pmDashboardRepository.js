@@ -3,6 +3,7 @@
 const { sequelize } = require('../models');
 const { QueryTypes } = require('sequelize');
 const { buLessServicePOInTenantSql } = require('../utils/servicePOTenantSql');
+const monthlyCapService = require('../services/monthlyCapService');
 
 /**
  * Project Manager Dashboard Repository
@@ -254,7 +255,7 @@ async function getTeamCapacity(filters) {
   const safeSort = allowedSort.includes(sortBy) ? sortBy : 'capacity_used_pct';
   const safeOrder = sortOrder && sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
 
-  const MONTHLY_CAP = 176;
+  const MONTHLY_CAP = await monthlyCapService.getCapForMonth(monthNum, yearNum);
   const replacements = {
     monthNum, yearNum, employeeIds, limit, offset,
     monthlyCap: MONTHLY_CAP, benchThreshold: parseFloat(benchThresholdHours),

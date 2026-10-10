@@ -24,7 +24,7 @@ test('getPMWiseUtilization: empty companyIds short-circuits without querying', a
     assert.deepEqual(result, {
       rows: [],
       count: 0,
-      summary: { total_resource_count: 0, total_project_count: 0, total_logged_hours: 0, total_available_hours: 0 },
+      summary: { total_resource_count: 0, total_project_count: 0, total_logged_hours: 0, original_total_logged_hours: 0, total_available_hours: 0 },
     });
   } finally {
     restore();
@@ -42,7 +42,7 @@ test('getProjectWiseUtilization: empty companyIds short-circuits without queryin
     assert.deepEqual(result, {
       rows: [],
       count: 0,
-      summary: { total_resource_count: 0, total_logged_hours: 0, total_available_hours: 0 },
+      summary: { total_resource_count: 0, total_logged_hours: 0, original_total_logged_hours: 0, total_available_hours: 0 },
     });
   } finally {
     restore();

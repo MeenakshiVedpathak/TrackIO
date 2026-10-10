@@ -5,6 +5,7 @@ const managementReportRepo = require('../repositories/managementReportRepository
 const { Company } = require('../models');
 const { getPaginationParams, getPaginationMeta } = require('../utils/pagination');
 const logger = require('../utils/logger');
+const dateHelper = require('../helpers/dateHelper');
 const { intersectCompanyIdsWithEntity, intersectIdsWithBuHierarchy } = require('./companyAccessControlService');
 const { parseIdList } = require('../utils/idListParser');
 
@@ -115,17 +116,27 @@ async function getServicePOProfitability(query, companyIds) {
   });
 
   const meta = getPaginationMeta(count, page, limit);
-  const totals = rows.reduce((acc, r) => {
+  // hours_delivered follows hoursSource; original_hours_delivered is ALWAYS the as-entered hours.
+  const data = rows.map((r) => ({
+    ...r,
+    hours_delivered: parseFloat(r.hours_delivered) || 0,
+    original_hours_delivered: parseFloat(r.original_hours_delivered) || 0,
+  }));
+  const totals = data.reduce((acc, r) => {
     acc.total_invoiced += parseFloat(r.invoiced_amount) || 0;
     acc.total_delivery_cost += parseFloat(r.delivery_cost) || 0;
     acc.total_margin += parseFloat(r.margin) || 0;
+    acc.hours += r.hours_delivered;
+    acc.originalHours += r.original_hours_delivered;
     return acc;
-  }, { total_invoiced: 0, total_delivery_cost: 0, total_margin: 0 });
+  }, { total_invoiced: 0, total_delivery_cost: 0, total_margin: 0, hours: 0, originalHours: 0 });
 
   return {
-    data: rows,
+    data,
     meta,
     summary: {
+      total_hours_delivered: round2(totals.hours),
+      original_total_hours_delivered: round2(totals.originalHours),
       total_invoiced_amount: round2(totals.total_invoiced),
       total_delivery_cost: round2(totals.total_delivery_cost),
       total_margin: round2(totals.total_margin),
@@ -205,14 +216,18 @@ async function getResourceStaffingPlanAccuracy(query, companyIds) {
   const enriched = rows.map((r) => ({
     ...r,
     at_risk: r.variance_pct !== null && Math.abs(parseFloat(r.variance_pct)) >= varianceThresholdPctForFlag,
+    // Same flag against the ORIGINAL (un-scaled) actual hours — display only.
+    original_at_risk: r.original_variance_pct !== null && r.original_variance_pct !== undefined
+      && Math.abs(parseFloat(r.original_variance_pct)) >= varianceThresholdPctForFlag,
   }));
 
   const meta = getPaginationMeta(count, page, limit);
   const totals = rows.reduce((acc, r) => {
     acc.planned += parseFloat(r.planned_hours) || 0;
     acc.actual += parseFloat(r.actual_hours) || 0;
+    acc.originalActual += parseFloat(r.original_actual_hours) || 0;
     return acc;
-  }, { planned: 0, actual: 0 });
+  }, { planned: 0, actual: 0, originalActual: 0 });
 
   return {
     data: enriched,
@@ -221,6 +236,8 @@ async function getResourceStaffingPlanAccuracy(query, companyIds) {
       total_planned_hours: round2(totals.planned),
       total_actual_hours: round2(totals.actual),
       total_variance_hours: round2(totals.actual - totals.planned),
+      total_original_actual_hours: round2(totals.originalActual),
+      total_original_variance_hours: round2(totals.originalActual - totals.planned),
       variance_threshold_pct_used: varianceThresholdPctForFlag,
       variance_threshold_filter_applied: varianceThresholdPctFilter !== undefined,
     },
@@ -398,7 +415,22 @@ async function getServicePOTimelineRisk(query, companyIds) {
   // Reading case-insensitively here fixes it without touching
   // parseCommonFilters, which every other report also depends on.
   const rawAsOfDate = getParamCaseInsensitive(query, 'asOfDate');
-  const asOfDate = rawAsOfDate ? new Date(rawAsOfDate) : new Date();
+  // Monthly filter: month + year => the report is "as of the end of that month" and also shows that
+  // month's own hours. An explicit asOfDate still wins.
+  const rawMonth = getParamCaseInsensitive(query, 'month');
+  const rawYear = getParamCaseInsensitive(query, 'year');
+  let monthBounds = null;
+  if (rawMonth !== undefined && rawMonth !== '' || rawYear !== undefined && rawYear !== '') {
+    const m = parseInt(rawMonth, 10);
+    const y = parseInt(rawYear, 10);
+    if (!m || !y || m < 1 || m > 12) {
+      const err = new Error('Both month (1-12) and year are required together.');
+      err.statusCode = 422;
+      throw err;
+    }
+    monthBounds = dateHelper.getMonthBounds(m, y);
+  }
+  const asOfDate = rawAsOfDate ? new Date(rawAsOfDate) : (monthBounds ? new Date(monthBounds.endDate) : new Date());
 
   const rawClientId = getParamCaseInsensitive(query, 'clientId');
   const clientId = rawClientId ? parseInt(rawClientId, 10) : undefined;
@@ -416,6 +448,11 @@ async function getServicePOTimelineRisk(query, companyIds) {
 
   const { rows, count } = await managementReportRepo.getServicePOTimelineRiskRaw({
     ...filters, clientId, poId, status, search, limit, offset, companyIds,
+    // hours are cut off at the same date the elapsed-time % is measured at (only when a month or an
+    // explicit date was chosen; with neither, today = everything logged so far, as before)
+    asOfDate: (rawAsOfDate || monthBounds) ? asOfDate.toISOString().slice(0, 10) : null,
+    monthStart: monthBounds ? monthBounds.startDate : null,
+    monthEnd: monthBounds ? monthBounds.endDate : null,
   });
 
   const enriched = rows.map((r) => computeTimelineRisk(r, asOfDate));
@@ -428,6 +465,7 @@ async function getServicePOTimelineRisk(query, companyIds) {
       overdue_count_on_page: enriched.filter((r) => r.risk_level === 'overdue').length,
     },
     as_of_date: asOfDate.toISOString().slice(0, 10),
+    period: monthBounds ? { month: parseInt(rawMonth, 10), year: parseInt(rawYear, 10), start_date: monthBounds.startDate, end_date: monthBounds.endDate } : null,
   };
 }
 
@@ -550,16 +588,18 @@ async function getServiceLineBusinessMix(query, companyIds) {
 
   const totals = enriched.reduce((acc, r) => {
     acc.hours += parseFloat(r.hours_delivered) || 0;
+    acc.originalHours += parseFloat(r.original_hours_delivered) || 0;
     acc.cost += parseFloat(r.delivery_cost) || 0;
     acc.invoiced += parseFloat(r.invoiced_amount) || 0;
     acc.margin += parseFloat(r.margin) || 0;
     return acc;
-  }, { hours: 0, cost: 0, invoiced: 0, margin: 0 });
+  }, { hours: 0, originalHours: 0, cost: 0, invoiced: 0, margin: 0 });
 
   return {
     data: enriched,
     summary: {
       total_hours_delivered: round2(totals.hours),
+      original_total_hours_delivered: round2(totals.originalHours),
       total_delivery_cost: round2(totals.cost),
       total_invoiced_amount: round2(totals.invoiced),
       total_margin: round2(totals.margin),
@@ -618,9 +658,13 @@ async function getPMWiseUtilization(query, companyIds) {
       total_resource_count: fullDatasetSummary.total_resource_count,
       total_project_count: fullDatasetSummary.total_project_count,
       total_logged_hours: round2(fullDatasetSummary.total_logged_hours),
+      original_total_logged_hours: round2(fullDatasetSummary.original_total_logged_hours),
       total_available_hours: round2(fullDatasetSummary.total_available_hours),
       utilization_pct: fullDatasetSummary.total_available_hours > 0
         ? round2((fullDatasetSummary.total_logged_hours / fullDatasetSummary.total_available_hours) * 100)
+        : 0,
+      original_utilization_pct: fullDatasetSummary.total_available_hours > 0
+        ? round2((fullDatasetSummary.original_total_logged_hours / fullDatasetSummary.total_available_hours) * 100)
         : 0,
     },
     period: range,
@@ -653,9 +697,13 @@ async function getProjectWiseUtilization(query, companyIds) {
     summary: {
       total_resource_count: fullDatasetSummary.total_resource_count,
       total_logged_hours: round2(fullDatasetSummary.total_logged_hours),
+      original_total_logged_hours: round2(fullDatasetSummary.original_total_logged_hours),
       total_available_hours: round2(fullDatasetSummary.total_available_hours),
       utilization_pct: fullDatasetSummary.total_available_hours > 0
         ? round2((fullDatasetSummary.total_logged_hours / fullDatasetSummary.total_available_hours) * 100)
+        : 0,
+      original_utilization_pct: fullDatasetSummary.total_available_hours > 0
+        ? round2((fullDatasetSummary.original_total_logged_hours / fullDatasetSummary.total_available_hours) * 100)
         : 0,
     },
     period: range,
@@ -805,6 +853,11 @@ async function buildResourceCostUtilization(query, companyIds, { exportAll = fal
       projectionPercentage: parseFloat(m.projectionPercentage) || 0,
       actualPercentage: parseFloat(m.actualPercentage) || 0,
       contribution: parseFloat(m.contribution) || 0,
+      // ORIGINAL (un-scaled) counterparts — loggedHours/actualPercentage/
+      // contribution above follow hoursSource; these always use original hours.
+      originalLoggedHours: parseFloat(m.originalLoggedHours) || 0,
+      originalActualPercentage: parseFloat(m.originalActualPercentage) || 0,
+      originalContribution: parseFloat(m.originalContribution) || 0,
     }));
 
     return {
@@ -847,6 +900,8 @@ async function buildResourceCostUtilization(query, companyIds, { exportAll = fal
     totalResourceBudgetHours: parseFloat(s.total_resource_budget_hours) || 0,
     totalLoggedHours: parseFloat(s.total_logged_hours) || 0,
     totalContribution: parseFloat(s.total_contribution) || 0,
+    originalTotalLoggedHours: parseFloat(s.original_total_logged_hours) || 0,
+    originalTotalContribution: parseFloat(s.original_total_contribution) || 0,
   }));
 
   return { data, count, page, limit, summary: summaryData, period: range };

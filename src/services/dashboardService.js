@@ -248,6 +248,11 @@ function buildEmployeeBillableBreakdown(rows) {
         customer_non_billable_hours: 0,
         total_hours: 0,
         billable_pct: 0,
+        original_billable_hours: 0,
+        original_non_billable_hours: 0,
+        original_customer_non_billable_hours: 0,
+        original_total_hours: 0,
+        original_billable_pct: 0,
         billable_reasons: [],
         non_billable_reasons: [],
         customer_non_billable_reasons: [],
@@ -256,22 +261,27 @@ function buildEmployeeBillableBreakdown(rows) {
 
     const emp = empMap.get(row.employee_id);
     const hours = parseFloat(row.hours) || 0;
+    const originalHours = parseFloat(row.original_hours) || 0;
     const reason = {
       service_po_id: row.service_po_id,
       service_po_code: row.service_po_code,
       service_po_name: row.service_po_name,
       service_type_name: row.service_type_name,
       hours: round2(hours),
+      original_hours: round2(originalHours),
     };
 
     if (row.report_bucket_key === 'customer_non_billable') {
       emp.customer_non_billable_hours += hours;
+      emp.original_customer_non_billable_hours += originalHours;
       emp.customer_non_billable_reasons.push(reason);
     } else if (row.is_billable) {
       emp.billable_hours += hours;
+      emp.original_billable_hours += originalHours;
       emp.billable_reasons.push(reason);
     } else {
       emp.non_billable_hours += hours;
+      emp.original_non_billable_hours += originalHours;
       emp.non_billable_reasons.push(reason);
     }
   }
@@ -279,6 +289,8 @@ function buildEmployeeBillableBreakdown(rows) {
   return Array.from(empMap.values()).map((emp) => {
     const total = emp.billable_hours + emp.non_billable_hours + emp.customer_non_billable_hours;
     const billablePct = total > 0 ? round2((emp.billable_hours / total) * 100) : 0;
+    const originalTotal = emp.original_billable_hours + emp.original_non_billable_hours + emp.original_customer_non_billable_hours;
+    const originalBillablePct = originalTotal > 0 ? round2((emp.original_billable_hours / originalTotal) * 100) : 0;
 
     const summaryParts = [];
     if (emp.billable_reasons.length) {
@@ -304,6 +316,11 @@ function buildEmployeeBillableBreakdown(rows) {
       customer_non_billable_hours: round2(emp.customer_non_billable_hours),
       total_hours: round2(total),
       billable_pct: billablePct,
+      original_billable_hours: round2(emp.original_billable_hours),
+      original_non_billable_hours: round2(emp.original_non_billable_hours),
+      original_customer_non_billable_hours: round2(emp.original_customer_non_billable_hours),
+      original_total_hours: round2(originalTotal),
+      original_billable_pct: originalBillablePct,
       reason_summary: `${billablePct}% billable (${round2(emp.billable_hours)}h of ${round2(total)}h). ${summaryParts.join('. ')}.`,
     };
   });
@@ -349,7 +366,7 @@ async function getDashboardStats(query = {}, companyId) {
     totalClients,
     activePOs,
     closedPOs,
-    currentMonthHours,
+    currentMonthHoursRow,
     billableSplit,
     totalRevenue,
     recentActivity,
@@ -363,7 +380,7 @@ async function getDashboardStats(query = {}, companyId) {
     dashboardRepo.getTotalClients(companyId),
     dashboardRepo.getActivePOs(companyId),
     dashboardRepo.getClosedPOs(companyId),
-    dashboardRepo.getCurrentMonthHours(currentMonth, currentYear, hoursSource, roleId, companyId),
+    dashboardRepo.getCurrentMonthHoursWithOriginal(currentMonth, currentYear, hoursSource, roleId, companyId),
     dashboardRepo.getCurrentMonthBillableSplit(currentMonth, currentYear, hoursSource, roleId, companyId),
     dashboardRepo.getTotalRevenue({ year: currentYear, companyId }),
     dashboardRepo.getRecentTimesheetActivity(hoursSource, roleId, companyId),
@@ -402,9 +419,13 @@ async function getDashboardStats(query = {}, companyId) {
 
     // ── Current month metrics ─────────────────────────────────────────────────
     current_month: {
-      total_hours_logged: round2(currentMonthHours),
+      total_hours_logged: round2(currentMonthHoursRow.total_hours),
       billable_hours_logged: round2(billableSplit.billable_hours),
       non_billable_hours_logged: round2(billableSplit.non_billable_hours),
+      // Original (pre-cap-scaling) counterparts of the three figures above.
+      original_total_hours_logged: round2(currentMonthHoursRow.original_total_hours),
+      original_billable_hours_logged: round2(billableSplit.original_billable_hours),
+      original_non_billable_hours_logged: round2(billableSplit.original_non_billable_hours),
       // Activity-based counts (distinct active employees/clients with logged
       // hours this period) — comparable to /dashboard/analytics tiles, unlike
       // workforce.active_employees/portfolio.total_clients above which are
@@ -506,6 +527,7 @@ async function getPOBillableBreakdown(query = {}, companyId) {
       service_type_name: row.service_type_name,
       category_name: row.category_name,
       hours_logged: round2(row.hours_logged),
+      original_hours_logged: round2(row.original_hours_logged),
       reason,
     };
   });
@@ -567,6 +589,7 @@ async function getTopEmployeesByPO(query = {}, companyId) {
       employee_code: row.employee_code,
       full_name: row.full_name,
       hours: round2(row.hours),
+      original_hours: round2(row.original_hours),
     });
   }
 
@@ -688,6 +711,8 @@ async function getBillableTrend(query = {}, companyId) {
     periodMap.set(`${p.year}-${p.month}`, {
       billable_hours: 0,
       non_billable_hours: 0,
+      original_billable_hours: 0,
+      original_non_billable_hours: 0,
       pos: new Map(), // service_po_id -> { service_po_name, is_billable, hours }
     });
   }
@@ -697,8 +722,14 @@ async function getBillableTrend(query = {}, companyId) {
     if (!bucket) continue; // outside the requested window (shouldn't happen)
 
     const hours = parseFloat(row.hours) || 0;
-    if (row.is_billable) bucket.billable_hours += hours;
-    else bucket.non_billable_hours += hours;
+    const originalHours = parseFloat(row.original_hours) || 0;
+    if (row.is_billable) {
+      bucket.billable_hours += hours;
+      bucket.original_billable_hours += originalHours;
+    } else {
+      bucket.non_billable_hours += hours;
+      bucket.original_non_billable_hours += originalHours;
+    }
 
     bucket.pos.set(row.service_po_id, {
       service_po_name: row.service_po_name,
@@ -716,6 +747,10 @@ async function getBillableTrend(query = {}, companyId) {
     const non_billable_hours = round2(bucket.non_billable_hours);
     const total_hours = round2(billable_hours + non_billable_hours);
     const billable_pct = total_hours > 0 ? round2((billable_hours / total_hours) * 100) : 0;
+    const original_billable_hours = round2(bucket.original_billable_hours);
+    const original_non_billable_hours = round2(bucket.original_non_billable_hours);
+    const original_total_hours = round2(original_billable_hours + original_non_billable_hours);
+    const original_billable_pct = original_total_hours > 0 ? round2((original_billable_hours / original_total_hours) * 100) : 0;
 
     let change = null;
     if (idx > 0) {
@@ -738,6 +773,8 @@ async function getBillableTrend(query = {}, companyId) {
         vs_label: prevLabel,
         billable_delta,
         non_billable_delta,
+        original_billable_delta: round2(original_billable_hours - round2(prevBucket.original_billable_hours)),
+        original_non_billable_delta: round2(original_non_billable_hours - round2(prevBucket.original_non_billable_hours)),
         billable_drivers,
         non_billable_drivers,
         reason_summary: `${billableSentence} ${nonBillableSentence}`,
@@ -752,6 +789,10 @@ async function getBillableTrend(query = {}, companyId) {
       non_billable_hours,
       total_hours,
       billable_pct,
+      original_billable_hours,
+      original_non_billable_hours,
+      original_total_hours,
+      original_billable_pct,
       change,
     };
   });
@@ -905,6 +946,7 @@ async function getAnalyticsDashboard(query = {}, companyId) {
       employee_code: row.employee_code,
       full_name: row.full_name,
       hours: round2(row.hours),
+      original_hours: round2(row.original_hours),
     });
   }
   const employees_by_po = Array.from(poEmployeeMap.values());
@@ -926,18 +968,25 @@ async function getAnalyticsDashboard(query = {}, companyId) {
   }
   const emptyTrendBucket = () => ({ Billable: 0, 'Non-Billable': 0, 'Customer Non-Billable': 0, Other: 0 });
   const trendByMonth = new Map();
+  const originalTrendByMonth = new Map();
   for (const row of trendRows) {
     const key = `${row.year}-${row.month}`;
     if (!trendByMonth.has(key)) trendByMonth.set(key, emptyTrendBucket());
+    if (!originalTrendByMonth.has(key)) originalTrendByMonth.set(key, emptyTrendBucket());
     const bucket = trendByMonth.get(key);
+    const originalBucket = originalTrendByMonth.get(key);
     const category = normalizeTrendCategory(row.report_bucket_key);
     bucket[category] = round2(bucket[category] + (parseFloat(row.hours) || 0));
+    originalBucket[category] = round2(originalBucket[category] + (parseFloat(row.original_hours) || 0));
   }
   const monthly_hours_trend = fiscalMonths.map(({ year, month }) => ({
     year,
     month,
     label: monthLabel(year, month),
     ...(trendByMonth.get(`${year}-${month}`) || emptyTrendBucket()),
+    // Original (pre-cap-scaling) hours per category for the same month — a
+    // nested object so the existing flat category keys above stay untouched.
+    original_hours_by_category: originalTrendByMonth.get(`${year}-${month}`) || emptyTrendBucket(),
   }));
 
   // ── Hours by Client / Hours by Employee ──────────────────────────────────
@@ -945,6 +994,7 @@ async function getAnalyticsDashboard(query = {}, companyId) {
     client_id: r.client_id,
     client_name: r.client_name,
     hours: round2(r.hours),
+    original_hours: round2(r.original_hours),
   }));
 
   const hours_by_employee = byEmployeeRows.map((r) => ({
@@ -954,6 +1004,9 @@ async function getAnalyticsDashboard(query = {}, companyId) {
     billable_hours: round2(r.billable_hours),
     non_billable_hours: round2(r.non_billable_hours),
     hours: round2(r.hours),
+    original_billable_hours: round2(r.original_billable_hours),
+    original_non_billable_hours: round2(r.original_non_billable_hours),
+    original_hours: round2(r.original_hours),
   }));
 
   // ── Client x Service PO (flat rows; frontend pivots into a matrix) ──────
@@ -963,6 +1016,7 @@ async function getAnalyticsDashboard(query = {}, companyId) {
     service_po_id: r.service_po_id,
     service_po_name: r.service_po_name,
     hours: round2(r.hours),
+    original_hours: round2(r.original_hours),
   }));
 
   // ── Employee Bench % (Idle + On Bench only) ─────────────────────────────
@@ -975,12 +1029,19 @@ async function getAnalyticsDashboard(query = {}, companyId) {
         full_name: row.full_name,
         bench_hours: 0,
         total_hours: 0,
+        original_bench_hours: 0,
+        original_total_hours: 0,
       });
     }
     const emp = empBenchMap.get(row.employee_id);
     const hours = parseFloat(row.hours) || 0;
+    const originalHours = parseFloat(row.original_hours) || 0;
     emp.total_hours += hours;
-    if (isBenchServiceType(row.service_po_name)) emp.bench_hours += hours;
+    emp.original_total_hours += originalHours;
+    if (isBenchServiceType(row.service_po_name)) {
+      emp.bench_hours += hours;
+      emp.original_bench_hours += originalHours;
+    }
   }
   const employee_bench_pct = Array.from(empBenchMap.values())
     .map((emp) => ({
@@ -988,6 +1049,9 @@ async function getAnalyticsDashboard(query = {}, companyId) {
       bench_hours: round2(emp.bench_hours),
       total_hours: round2(emp.total_hours),
       bench_pct: emp.total_hours > 0 ? round2((emp.bench_hours / emp.total_hours) * 100) : 0,
+      original_bench_hours: round2(emp.original_bench_hours),
+      original_total_hours: round2(emp.original_total_hours),
+      original_bench_pct: emp.original_total_hours > 0 ? round2((emp.original_bench_hours / emp.original_total_hours) * 100) : 0,
     }))
     .sort((a, b) => b.bench_pct - a.bench_pct);
 
@@ -995,6 +1059,8 @@ async function getAnalyticsDashboard(query = {}, companyId) {
   const totalHours = round2(tilesRow.total_hours);
   const billableHours = round2(tilesRow.billable_hours);
   const activeEmployees = parseInt(tilesRow.active_employees, 10) || 0;
+  const originalTotalHours = round2(tilesRow.original_total_hours);
+  const originalBillableHours = round2(tilesRow.original_billable_hours);
 
   return {
     as_of: dateHelper.nowISO(),
@@ -1038,10 +1104,15 @@ async function getAnalyticsDashboard(query = {}, companyId) {
       non_billable_hours: round2(totalHours - billableHours),
       total_cost: round2(tilesRow.total_cost),
       utilization_pct: totalHours > 0 ? round2((billableHours / totalHours) * 100) : 0,
+      original_total_hours: originalTotalHours,
+      original_billable_hours: originalBillableHours,
+      original_non_billable_hours: round2(originalTotalHours - originalBillableHours),
+      original_utilization_pct: originalTotalHours > 0 ? round2((originalBillableHours / originalTotalHours) * 100) : 0,
       active_employees: activeEmployees,
       active_clients: parseInt(tilesRow.active_clients, 10) || 0,
       active_service_pos: parseInt(tilesRow.active_service_pos, 10) || 0,
       avg_hours_per_employee: activeEmployees > 0 ? round2(totalHours / activeEmployees) : 0,
+      original_avg_hours_per_employee: activeEmployees > 0 ? round2(originalTotalHours / activeEmployees) : 0,
     },
     charts: {
       monthly_hours_trend,
@@ -1172,6 +1243,7 @@ async function buildClientWiseAnalytics(filters) {
       client_name: row.client_name,
       total_cost: round2(totalCost),
       total_hours: round2(totalHours),
+      original_total_hours: round2(parseFloat(row.original_total_hours) || 0),
       average_cost_per_hour: totalHours > 0 ? round2(totalCost / totalHours) : 0,
       total_projects: parseInt(row.total_projects, 10) || 0,
       percentage_of_total_cost: overallTotalCost > 0 ? round2((totalCost / overallTotalCost) * 100) : 0,
@@ -1193,10 +1265,12 @@ async function buildClientWiseAnalytics(filters) {
 async function buildLeaveHoursTrend(filters, months) {
   const rows = await dashboardRepo.getLeaveHoursTrend(filters);
   const hoursByMonth = new Map(rows.map((row) => [`${row.year}-${row.month}`, parseFloat(row.leave_hours) || 0]));
+  const originalHoursByMonth = new Map(rows.map((row) => [`${row.year}-${row.month}`, parseFloat(row.original_leave_hours) || 0]));
 
   return months.map(({ year, month }) => ({
     month: monthLabel(year, month),
     leave_hours: round2(hoursByMonth.get(`${year}-${month}`) || 0),
+    original_leave_hours: round2(originalHoursByMonth.get(`${year}-${month}`) || 0),
   }));
 }
 
@@ -1214,10 +1288,12 @@ async function buildLeaveHoursTrend(filters, months) {
 async function buildNoWorkTrend(filters, months) {
   const rows = await dashboardRepo.getNoWorkTrend(filters);
   const hoursByMonth = new Map(rows.map((row) => [`${row.year}-${row.month}`, parseFloat(row.no_work_hours) || 0]));
+  const originalHoursByMonth = new Map(rows.map((row) => [`${row.year}-${row.month}`, parseFloat(row.original_no_work_hours) || 0]));
 
   return months.map(({ year, month }) => ({
     month: monthLabel(year, month),
     no_work_hours: round2(hoursByMonth.get(`${year}-${month}`) || 0),
+    original_no_work_hours: round2(originalHoursByMonth.get(`${year}-${month}`) || 0),
   }));
 }
 
@@ -1371,6 +1447,7 @@ async function buildClientWiseCostAnalytics(hoursSource, companyId) {
     client_id: row.client_id,
     client_name: row.client_name,
     total_hours: round2(parseFloat(row.total_hours) || 0),
+    original_total_hours: round2(parseFloat(row.original_total_hours) || 0),
     total_cost: round2(parseFloat(row.total_cost) || 0),
   }));
 }
@@ -1578,11 +1655,16 @@ async function getMonthlyResourceUtilization(query = {}, companyId, options = {}
   const monthlyResourceUtilization = utilizationRows.map((row) => {
     const totalHours = parseFloat(row.total_hours) || 0;
     const billableHours = parseFloat(row.billable_hours) || 0;
+    const originalTotalHours = parseFloat(row.original_total_hours) || 0;
+    const originalBillableHours = parseFloat(row.original_billable_hours) || 0;
     return {
       month: monthLabel(row.year, row.month),
       total_hours: round2(totalHours),
       billable_hours: round2(billableHours),
       utilization_percentage: totalHours > 0 ? round2((billableHours / totalHours) * 100) : 0,
+      original_total_hours: round2(originalTotalHours),
+      original_billable_hours: round2(originalBillableHours),
+      original_utilization_percentage: originalTotalHours > 0 ? round2((originalBillableHours / originalTotalHours) * 100) : 0,
     };
   });
 
@@ -1633,6 +1715,11 @@ async function buildBuWiseUtilization(query, period, companyId) {
       customer_non_billable_hours: summary.customerNonBillableHours,
       total_logged_hours: summary.totalLoggedHours,
       utilization_percentage: summary.utilizationPercentage,
+      original_billable_hours: round2(summary.originalBillableHours),
+      original_non_billable_hours: round2(summary.originalNonBillableHours),
+      original_customer_non_billable_hours: round2(summary.originalCustomerNonBillableHours),
+      original_total_logged_hours: round2(summary.originalTotalLoggedHours),
+      original_utilization_percentage: round2(summary.originalUtilizationPercentage),
     },
     records: data.map((row) => ({
       bu_id: row.buId,
@@ -1645,6 +1732,11 @@ async function buildBuWiseUtilization(query, period, companyId) {
       customer_non_billable_hours: row.customerNonBillableHours,
       total_logged_hours: row.totalLoggedHours,
       utilization_percentage: row.utilizationPercentage,
+      original_billable_hours: round2(row.originalBillableHours),
+      original_non_billable_hours: round2(row.originalNonBillableHours),
+      original_customer_non_billable_hours: round2(row.originalCustomerNonBillableHours),
+      original_total_logged_hours: round2(row.originalTotalLoggedHours),
+      original_utilization_percentage: round2(row.originalUtilizationPercentage),
     })),
   };
 }

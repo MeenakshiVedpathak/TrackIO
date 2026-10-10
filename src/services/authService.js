@@ -14,6 +14,10 @@ const {
   REFRESH_TOKEN_EXPIRY,
 } = require('../config/jwt');
 const logger = require('../utils/logger');
+const { createAuditLog } = require('../middlewares/auditLog');
+const securityAuditService = require('./securityAuditService');
+const deviceRegistryService = require('./deviceRegistryService');
+const requestContext = require('../utils/requestContext');
 const moment = require('moment-timezone');
 const { extractIsOriginalDataVisible } = require('../utils/timesheetPublishPolicy');
 
@@ -231,6 +235,23 @@ async function issueSession(employee, rolesToGrant, ipAddress, userAgent) {
   const activeBusinessUnits = getActiveBusinessUnits(employee);
   const isOriginalDataVisible = extractIsOriginalDataVisible(activeBusinessUnits[0] || null);
 
+  // Every sign-in (password, SSO or role pick) passes through here — one LOGIN audit row, with the
+  // role the session was opened as and the person's own (first) Business Unit.
+  const loginRequest = requestContext.getRequest();
+  const device = await deviceRegistryService.registerLogin({
+    employeeId: employee.id,
+    deviceId: requestContext.getDeviceId(loginRequest),
+    deviceName: requestContext.getDeviceName(loginRequest),
+    userAgent,
+    ip: ipAddress,
+  });
+  await createAuditLog(
+    employee.id, 'LOGIN', 'employees', employee.id, null,
+    { role: roleNames[0] || null, new_device: device.isNewDevice, first_device: device.isFirstDevice },
+    ipAddress,
+    { actorRole: roleNames[0] || null, companyId: activeBusinessUnits[0]?.id ?? null, sessionId: familyId }
+  );
+
   return {
     accessToken,
     refreshToken,
@@ -332,8 +353,11 @@ async function completeAuthenticatedLogin(employee, activeRoles, ipAddress, user
 async function login(email, password, ipAddress, userAgent) {
   const employee = await authRepository.findEmployeeByEmail(email);
 
+  const deviceId = requestContext.getDeviceId(requestContext.getRequest());
+
   if (!employee || !employee.password) {
     logger.warn('Login attempt with unregistered email', { email });
+    await securityAuditService.recordFailedLogin({ email, employee: null, deviceId });
     throw emailNotRegisteredError();
   }
 
@@ -342,9 +366,14 @@ async function login(email, password, ipAddress, userAgent) {
   const isPasswordValid = await employee.validatePassword(password);
   if (!isPasswordValid) {
     logger.warn('Login attempt with incorrect password', { employeeId: employee.id });
+    // 3 wrong passwords in a short window are written to the audit log (see securityAuditService).
+    await securityAuditService.recordFailedLogin({
+      email, employee, deviceId, companyId: getActiveBusinessUnits(employee)[0]?.id ?? null,
+    });
     throw invalidCredentialsError();
   }
 
+  await securityAuditService.clearFailedLogins(email);
   logger.info('Employee logged in successfully', { employeeId: employee.id, email: employee.email });
   return completeAuthenticatedLogin(employee, activeRoles, ipAddress, userAgent);
 }

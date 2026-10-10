@@ -38,6 +38,7 @@ const costBudgetRoutes = require('./routes/costBudget.routes');
 const resourceBudgetRoutes = require('./routes/resourceBudget.routes');
 const timesheetRoutes = require('./routes/timesheet.routes');
 const reportRoutes = require('./routes/report.routes');
+const auditLogRoutes = require('./routes/auditLog.routes');
 const managementReportRoutes = require('./routes/managementReport.routes');
 const tenantExportRoutes = require('./routes/tenantExport.routes');
 const dashboardRoutes = require('./routes/dashboard.routes');
@@ -51,6 +52,7 @@ const employeeMonthlyWorkLogRoutes = require('./routes/employeeMonthlyWorkLog.ro
 const employeeReportRoutes = require('./routes/employeeReport.routes');
 const platformAdminRoutes = require('./routes/platformAdmin.routes');
 const employeeWorkLogComplianceRoutes = require('./routes/employeeWorkLogCompliance.routes');
+const systemSettingsRoutes = require('./routes/systemSettings.routes');
 
 const app = express();
 
@@ -118,7 +120,7 @@ app.use(cors({
     return callback(null, true);
   },
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Company-Id'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Company-Id', 'X-Device-Id', 'X-Device-Name'],
   credentials: true,
 }));
 
@@ -228,6 +230,8 @@ app.get('/health', (_req, res) => {
 // Allow overriding the API prefix via environment for flexibility (e.g. "/api")
 const API_PREFIX = process.env.API_PREFIX || '/api/v1';
 
+// Makes the request (device id, acting BU/role) visible to createAuditLog(), including on login.
+app.use(require('./utils/requestContext').captureMiddleware);
 app.use(`${API_PREFIX}/auth`, authRoutes);
 app.use(`${API_PREFIX}/employees`, employeeRoutes);
 app.use(`${API_PREFIX}/roles`, roleRoutes);
@@ -251,6 +255,8 @@ app.use(`${API_PREFIX}/service-po-monthly-budgets`, servicePOMonthlyBudgetRoutes
 app.use(`${API_PREFIX}/cost-budgets`, costBudgetRoutes);
 app.use(`${API_PREFIX}/resource-budgets`, resourceBudgetRoutes);
 app.use(`${API_PREFIX}/timesheets`, timesheetRoutes);
+// Audit Log — who did what / when / as which role / for which BU (Platform Admin, Admin, Entity Admin, BU Admin).
+app.use(`${API_PREFIX}/audit-logs`, auditLogRoutes);
 app.use(`${API_PREFIX}/reports`, reportRoutes);
 // 10 new management/business reports (managementReportRepository/Service/
 // Controller/Routes) — mounted at the same /reports base path; endpoint
@@ -267,6 +273,7 @@ app.use(`${API_PREFIX}/employee-timesheets`, employeeTimesheetRoutes);
 app.use(`${API_PREFIX}/employee-timesheets/monthly`, employeeMonthlyWorkLogRoutes);
 app.use(`${API_PREFIX}/employee-reports`, employeeReportRoutes);
 app.use(`${API_PREFIX}/platform-admin`, platformAdminRoutes);
+app.use(`${API_PREFIX}/system-settings`, systemSettingsRoutes);
 // Employee Work Log Compliance / Missing Work Log report — mounted at the
 // same /reports base path; paths are disjoint from all existing report routes.
 app.use(`${API_PREFIX}/reports`, employeeWorkLogComplianceRoutes);

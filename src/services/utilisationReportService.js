@@ -81,7 +81,10 @@ const periodOut = (period) => ({
  * Report 1 — BU-wise Utilisation.
  * Total Logged = Billable + Non-Billable + Customer Non-Billable (Leave, On
  * Bench and Idle excluded); Utilisation % = Total Logged / Expected x 100;
- * Expected = employees in the BU x 176 (x months in range).
+ * Expected = employees in the BU x Monthly Cap Hours (summed over the months in range).
+ * Original* fields are the same figures using what employees actually logged, before the
+ * monthly-cap adjustment (original util % = original total logged / the same Expected).
+ * Not Logged = Expected - Total Logged (floored at 0).
  */
 async function getBuWiseUtilisationReport(query, companyIds, { exportAll = false } = {}) {
   const period = resolvePeriod(query);
@@ -106,6 +109,12 @@ async function getBuWiseUtilisationReport(query, companyIds, { exportAll = false
     customerNonBillableHours: round2(r.customer_non_billable_hours),
     totalLoggedHours: round2(r.total_logged_hours),
     utilizationPercentage: round2(r.utilization_percentage),
+    originalBillableHours: round2(r.original_billable_hours),
+    originalNonBillableHours: round2(r.original_non_billable_hours),
+    originalCustomerNonBillableHours: round2(r.original_customer_non_billable_hours),
+    originalTotalLoggedHours: round2(r.original_total_logged_hours),
+    originalUtilizationPercentage: round2(r.original_utilization_percentage),
+    notLoggedHours: round2(r.not_logged_hours),
   }));
 
   const t = totals || {};
@@ -120,6 +129,12 @@ async function getBuWiseUtilisationReport(query, companyIds, { exportAll = false
     totalLoggedHours: round2(t.total_logged_hours),
     // From aggregated hours, never an average of per-BU percentages.
     utilizationPercentage: expected > 0 ? round2((parseFloat(t.total_logged_hours) || 0) / expected * 100) : 0,
+    originalBillableHours: round2(t.original_billable_hours),
+    originalNonBillableHours: round2(t.original_non_billable_hours),
+    originalCustomerNonBillableHours: round2(t.original_customer_non_billable_hours),
+    originalTotalLoggedHours: round2(t.original_total_logged_hours),
+    originalUtilizationPercentage: expected > 0 ? round2((parseFloat(t.original_total_logged_hours) || 0) / expected * 100) : 0,
+    notLoggedHours: round2(t.not_logged_hours),
   };
 
   return { data, meta: getPaginationMeta(count, page, limit), summary, period: periodOut(period) };

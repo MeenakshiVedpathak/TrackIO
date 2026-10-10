@@ -5,6 +5,7 @@ const { verifyToken, ROLE_SELECTION_TICKET_TYPE } = require('../config/jwt');
 const { Employee, Role, Company } = require('../models');
 const roleHierarchyService = require('../services/roleHierarchyService');
 const logger = require('../utils/logger');
+const requestContext = require('../utils/requestContext');
 const resolveCompany = require('./resolveCompany');
 const employeeBusinessUnitRoleExclusionRepository = require('../repositories/employeeBusinessUnitRoleExclusionRepository');
 
@@ -250,6 +251,8 @@ const authenticateIdentity = async (req, res, next) => {
     req.userRoles = req.employeeRoleNames;
     req.userRole = req.userRoleName;
     req.activeRoles = activeRoles;
+    // The login session this request belongs to (null for a token issued before `sid` existed).
+    req.sessionId = typeof decoded.sid === 'string' && decoded.sid ? decoded.sid.slice(0, 64) : null;
 
     // Platform Admin (effective hierarchy_rank === 1) is platform-only —
     // see isPlatformAdminAllowedRoute() above.
@@ -268,6 +271,8 @@ const authenticateIdentity = async (req, res, next) => {
     //   });
     // }
 
+    // Lets createAuditLog() know who/which role/which BU/which IP without `req` being threaded through.
+    requestContext.enter(req);
     return next();
   } catch (error) {
     logger.error('Authentication middleware error', {

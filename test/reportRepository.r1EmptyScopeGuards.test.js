@@ -50,6 +50,8 @@ test('getEmployeeUtilizationSummary: empty companyIds short-circuits without que
     assert.deepEqual(result.summary, {
       billable_total: 0, non_billable_total: 0, internal_support_hours: 0,
       team_management_hours: 0, leaves_hours: 0, lnd_hours: 0, others_hours: 0,
+      original_billable_total: 0, original_non_billable_total: 0, original_internal_support_hours: 0,
+      original_team_management_hours: 0, original_leaves_hours: 0, original_lnd_hours: 0, original_others_hours: 0,
     });
   } finally {
     restore();
