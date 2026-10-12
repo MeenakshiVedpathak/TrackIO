@@ -239,7 +239,7 @@ test('findById(): Admin B cannot open Admin A\'s Centralised PO by id (hierarchy
 
 test('buLessServicePOInTenantSql(): bounds company_id NULL rows by the viewer\'s tenant owners, from the same :companyIds binding', () => {
   const sql = buLessServicePOInTenantSql('sp', 'companyIds').replace(/\s+/g, ' ');
-  assert.match(sql, /^\(sp\.company_id IS NULL AND sp\.created_by IN \(/);
+  assert.match(sql, /^\(sp\.company_id IS NULL AND sp\.is_centralised = true AND sp\.created_by IN \(/);
   assert.match(sql, /tenant_c\.id IN \(:companyIds\)/);
   assert.match(sql, /tenant_e\.created_by/);
   assert.match(sql, /tenant_e\.entity_admin_employee_id/);

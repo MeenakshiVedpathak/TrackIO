@@ -21,21 +21,26 @@ const timesheetService = require('../src/services/timesheetService');
  */
 
 const ORIGINAL = {
+  findById: companyRepository.findById,
   hasChildren: companyRepository.hasChildren,
-  findForSync: employeeWorkLogRepository.findForSync,
+  resolveSyncEmployeeIds: employeeWorkLogRepository.resolveSyncEmployeeIds,
   findImportById: timesheetImportRepository.findImportById,
 };
 
 function restore() {
+  companyRepository.findById = ORIGINAL.findById;
   companyRepository.hasChildren = ORIGINAL.hasChildren;
-  employeeWorkLogRepository.findForSync = ORIGINAL.findForSync;
+  employeeWorkLogRepository.resolveSyncEmployeeIds = ORIGINAL.resolveSyncEmployeeIds;
   timesheetImportRepository.findImportById = ORIGINAL.findImportById;
 }
 
+const activeBu = (id) => async () => ({ id, company_name: `BU ${id}`, status: 'active' });
+
 test('previewPmsImport(): rejects syncing a Business Unit that currently has Sub-BUs, without reading any work logs', async () => {
   try {
+    companyRepository.findById = activeBu(40);
     companyRepository.hasChildren = async (id) => id === 40; // "DATA + AI" has Sub-BU "DAS"
-    employeeWorkLogRepository.findForSync = async () => {
+    employeeWorkLogRepository.resolveSyncEmployeeIds = async () => {
       throw new Error('must not be called — the Sub-BU guard must reject before any work logs are read');
     };
 
@@ -52,14 +57,15 @@ test('previewPmsImport(): rejects syncing a Business Unit that currently has Sub
   }
 });
 
-test('previewPmsImport(): a Business Unit with no Sub-BUs proceeds exactly as before (unchanged, reaches findForSync)', async () => {
+test('previewPmsImport(): a Business Unit with no Sub-BUs proceeds exactly as before (unchanged, reaches the employee-wise sync fetch (resolveSyncEmployeeIds))', async () => {
   try {
+    companyRepository.findById = activeBu(42);
     companyRepository.hasChildren = async () => false; // e.g. "DAS" itself, or any BU with no children
-    employeeWorkLogRepository.findForSync = async () => { throw new Error('__reached_findForSync__'); };
+    employeeWorkLogRepository.resolveSyncEmployeeIds = async () => { throw new Error('__reached_resolveSyncEmployeeIds__'); };
 
     await assert.rejects(
       () => timesheetService.previewPmsImport(7, 2031, 1, 42),
-      (err) => err.message === '__reached_findForSync__'
+      (err) => err.message === '__reached_resolveSyncEmployeeIds__'
     );
   } finally {
     restore();
@@ -69,10 +75,11 @@ test('previewPmsImport(): a Business Unit with no Sub-BUs proceeds exactly as be
 test('confirmImport(): rejects confirming a pending "pms" import whose Business Unit now has Sub-BUs (defense-in-depth)', async () => {
   try {
     timesheetImportRepository.findImportById = async () => ({
-      id: 99, status: 'pending', source: 'pms', valid_rows: 1, import_month: 7, import_year: 2031,
+      id: 99, company_id: 40, status: 'pending', source: 'pms', valid_rows: 1, import_month: 7, import_year: 2031,
     });
+    companyRepository.findById = activeBu(40);
     companyRepository.hasChildren = async () => true;
-    employeeWorkLogRepository.findForSync = async () => {
+    employeeWorkLogRepository.resolveSyncEmployeeIds = async () => {
       throw new Error('must not be called — the Sub-BU guard must reject before any work logs are read');
     };
 
@@ -105,6 +112,38 @@ test('confirmImport(): an Excel-source ("import") pending record is never subjec
     // the Sub-BU guard ran is under test.
     await assert.rejects(() => timesheetService.confirmImport(98, 1, '127.0.0.1', 40));
     assert.equal(hasChildrenCalled, false, 'the Sub-BU sync guard must only apply to source: "pms"');
+  } finally {
+    restore();
+  }
+});
+
+test('previewPmsImport(): rejects an unknown or inactive BU / Sub-BU before reading any work logs', async () => {
+  try {
+    employeeWorkLogRepository.resolveSyncEmployeeIds = async () => { throw new Error('must not be called'); };
+
+    companyRepository.findById = async () => null;
+    await assert.rejects(() => timesheetService.previewPmsImport(7, 2031, 1, 999), (err) => err.statusCode === 404);
+
+    companyRepository.findById = async () => ({ id: 41, company_name: 'Old BU', status: 'inactive' });
+    await assert.rejects(() => timesheetService.previewPmsImport(7, 2031, 1, 41), (err) => err.statusCode === 400 && /inactive/.test(err.message));
+  } finally {
+    restore();
+  }
+});
+
+test('confirmImport(): rejects a pending "pms" import whose company_id differs from the BU / Sub-BU being synced — nothing is deleted', async () => {
+  try {
+    timesheetImportRepository.findImportById = async () => ({
+      id: 97, company_id: 5, status: 'pending', source: 'pms', valid_rows: 1, import_month: 7, import_year: 2031,
+    });
+    companyRepository.findById = activeBu(40);
+    companyRepository.hasChildren = async () => false;
+    employeeWorkLogRepository.resolveSyncEmployeeIds = async () => { throw new Error('must not be called'); };
+
+    await assert.rejects(
+      () => timesheetService.confirmImport(97, 1, '127.0.0.1', 40),
+      (err) => err.statusCode === 409 && /different Business Unit/.test(err.message)
+    );
   } finally {
     restore();
   }
