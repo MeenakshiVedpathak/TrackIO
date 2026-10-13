@@ -37,6 +37,10 @@ function mapWorkLogsToImportRows(workLogs) {
     resourceName: log.employee?.employee_code,
     servicePOName: log.servicePO?.service_po_name,
     subProject: log.subProject?.sub_project_name,
+    // Already-resolved ids (Employee Sync): the log's own employee / Service PO — which may belong to ANOTHER
+    // BU than the one being synced — are used as-is instead of being re-found by name (names can repeat across BUs).
+    employeeId: log.employee_id,
+    poId: log.service_po_id,
     date: log.work_date,
     hours: parseFloat(log.hours),
     isWorking: true,
@@ -798,6 +802,12 @@ const validateRows = async (rows, companyId) => {
   const validRows = [];
   const errorRows = [];
 
+  // Rows from an Employee Sync carry the ids of the Employee / Service PO they were logged against (see
+  // mapWorkLogsToImportRows). Those are admitted below even when they sit outside this BU's own scope, so a
+  // cross-BU Service PO or an employee mapped to several BUs resolves instead of false-failing.
+  const presetEmployeeIds = [...new Set(rows.map((r) => r.employeeId).filter(Boolean))];
+  const presetPoIds = [...new Set(rows.map((r) => r.poId).filter(Boolean))];
+
   // Cross-BU resourcing also runs in the OPPOSITE direction from the
   // mappedPoIds fix below: an Employee whose own company_id/BU membership
   // is entirely elsewhere can still hold an active employee_servicepo_mapping
@@ -853,6 +863,7 @@ const validateRows = async (rows, companyId) => {
         { company_id: companyId },
         { '$businessUnits.id$': companyId },
         { id: { [Op.in]: foreignEmployeeIds } },
+        ...(presetEmployeeIds.length ? [{ id: { [Op.in]: presetEmployeeIds } }] : []),
       ],
     },
     attributes: ['id', 'full_name', 'employee_code', 'status'],
@@ -883,7 +894,12 @@ const validateRows = async (rows, companyId) => {
       // timesheetRepository.js) isn't wrongly reported as "not found" just
       // because it has no owning company_id, and OR in mappedPoIds so a
       // legitimately cross-BU-mapped PO resolves too (see comment above).
-      [Op.or]: [{ company_id: companyId }, { company_id: null }, { id: { [Op.in]: mappedPoIds } }],
+      [Op.or]: [
+        { company_id: companyId },
+        { company_id: null },
+        { id: { [Op.in]: mappedPoIds } },
+        ...(presetPoIds.length ? [{ id: { [Op.in]: presetPoIds } }] : []),
+      ],
     },
     attributes: ['id', 'service_po_name', 'status'],
     include: [
@@ -912,6 +928,8 @@ const validateRows = async (rows, companyId) => {
   allPOs.forEach((po) => {
     poMap.set(po.service_po_name.trim().toLowerCase(), po);
   });
+  const employeeById = new Map(allEmployees.map((e) => [e.id, e]));
+  const poById = new Map(allPOs.map((po) => [po.id, po]));
 
   for (const row of rows) {
     const errors = [];
@@ -939,8 +957,13 @@ const validateRows = async (rows, companyId) => {
     let po = null;
     let subProjectRecord = null;
 
-    // 4. Employee lookup
-    if (resourceName) {
+    // 4. Employee lookup — by id when the row already carries it (Employee Sync), else by employee code
+    if (row.employeeId) {
+      employee = employeeById.get(row.employeeId);
+      if (!employee) {
+        errors.push(`Employee with code "${resourceName}" was not found in the system.`);
+      }
+    } else if (resourceName) {
       employee = employeeMap.get(resourceName.toLowerCase());
       if (!employee) {
         errors.push(`Employee with code "${resourceName}" was not found in the system.`);
@@ -950,8 +973,9 @@ const validateRows = async (rows, companyId) => {
     // 5. Service PO / Sub-project lookup
     const lookupLabel = projectLabel.toLowerCase();
     if (lookupLabel) {
-      po = poMap.get(lookupLabel);
-      if (!po) {
+      // A pre-resolved Service PO id (Employee Sync) wins over the name lookup — PO names are not unique across BUs.
+      po = row.poId ? poById.get(row.poId) : poMap.get(lookupLabel);
+      if (!po && !row.poId) {
         const subProjectMatch = allPOs
           .flatMap((poItem) => (poItem.subProjects || []).map((sp) => ({ po: poItem, subProject: sp })))
           .find((entry) => entry.subProject.sub_project_name.trim().toLowerCase() === lookupLabel);
@@ -1109,6 +1133,86 @@ const previewImport = async (filePath, fileName, userId, mimetype, importMonth, 
 const MONTH_ABBREVIATIONS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 /**
+ * Which Employees a Sync of this BU / Sub-BU covers for the month.
+ *
+ * Sync is EMPLOYEE-wise: every active Employee mapped to the BU / Sub-BU, with ALL of their logs of the
+ * month (any Service PO, including cross-BU ones) — so the monthly cap applies to the employee's whole
+ * month, and an employee mapped to several BUs is synced exactly once.
+ *
+ * An Employee whose month already exists under ANOTHER Business Unit's sync/import (they are mapped to
+ * more than one BU and were synced from the first) is NOT synced again: they are returned in
+ * `skippedEmployees` with a message and left untouched, so no duplicates are created and their records
+ * stay locked as synced. `hasOwnRows` marks a legacy case (month synced the old BU-by-BU way) where the
+ * employee ALSO has rows under this BU — those rows are preserved by the confirm step.
+ *
+ * @returns {Promise<{ employeeIds: number[], skippedEmployees: object[] }>}
+ */
+const resolveSyncEmployees = async (companyId, month, year) => {
+  const mappedIds = await employeeWorkLogRepository.resolveSyncEmployeeIds(companyId);
+  const elsewhere = await timesheetRepository.findEmployeesSyncedElsewhere(mappedIds, month, year, companyId);
+  if (elsewhere.length === 0) return { employeeIds: mappedIds, skippedEmployees: [] };
+
+  const people = await Employee.findAll({
+    where: { id: { [Op.in]: elsewhere.map((e) => e.employeeId) } },
+    attributes: ['id', 'full_name', 'employee_code'],
+    raw: true,
+  });
+  const personById = new Map(people.map((person) => [person.id, person]));
+  const monthLabel = `${MONTH_ABBREVIATIONS[month - 1]} ${year}`;
+
+  const skippedEmployees = elsewhere.map((e) => {
+    const person = personById.get(e.employeeId) || {};
+    const buName = e.syncedCompanyName || 'another Business Unit';
+    return {
+      employeeId: e.employeeId,
+      employeeCode: person.employee_code || null,
+      employeeName: person.full_name || null,
+      syncedBusinessUnitId: e.syncedCompanyId ?? null,
+      syncedBusinessUnitName: e.syncedCompanyName || null,
+      importId: e.importId ?? null,
+      hasOwnRows: e.hasOwnRows,
+      message: `${person.full_name || 'Employee #' + e.employeeId}${person.employee_code ? ` (${person.employee_code})` : ''} is already synced for ${monthLabel} from ${buName} — skipped.`,
+    };
+  });
+  const skippedIds = new Set(elsewhere.map((e) => e.employeeId));
+  return { employeeIds: mappedIds.filter((id) => !skippedIds.has(id)), skippedEmployees };
+};
+
+/**
+ * BU / Sub-BU guard for "Sync Employee Work Logs" (preview AND confirm). Confirm replaces the whole month
+ * of `companyId`, so before anything is deleted the target must be a real, active, leaf Business Unit /
+ * Sub-BU, and — on confirm — the import record must belong to exactly that BU / Sub-BU id.
+ *
+ * @param {number} companyId   - the BU / Sub-BU id being synced
+ * @param {object} [importRecord] - the pending import (confirm only)
+ * @returns {Promise<object>} the validated company row (name / parent_business_unit_id are used for sync logging)
+ */
+const assertSyncableBusinessUnit = async (companyId, importRecord = null) => {
+  const fail = (statusCode, message) => {
+    const err = new Error(message);
+    err.statusCode = statusCode;
+    throw err;
+  };
+
+  if (!Number.isInteger(Number(companyId)) || Number(companyId) <= 0) {
+    fail(400, 'A valid Business Unit / Sub-BU is required to sync.');
+  }
+  const company = await companyRepository.findById(companyId);
+  if (!company) fail(404, `Business Unit #${companyId} was not found.`);
+  if (company.status && company.status !== 'active') {
+    fail(400, `Business Unit "${company.company_name}" is inactive — it cannot be synced.`);
+  }
+  if (importRecord && Number(importRecord.company_id) !== Number(companyId)) {
+    fail(409, `Import #${importRecord.id} belongs to a different Business Unit / Sub-BU than the one selected — sync aborted, nothing was changed.`);
+  }
+  // A parent BU with Sub-BUs cannot be synced directly (a Sub-BU added AFTER the import was first created is caught here too).
+  if (await companyRepository.hasChildren(companyId, { activeOnly: true })) {
+    fail(400, 'This Business Unit has Sub-BUs — select the specific Sub-BU to sync instead.');
+  }
+  return company;
+};
+
+/**
  * Preview a "Sync Employee Work Logs" run: reads every row from
  * `employee_work_logs` (Employee Self Timesheet module) for the selected
  * company/month/year instead of parsing an uploaded file, maps them into
@@ -1138,13 +1242,15 @@ const MONTH_ABBREVIATIONS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'A
 const previewPmsImport = async (month, year, userId, companyId) => {
   logger.info('Employee Work Log sync preview started', { userId, month, year, companyId });
 
-  if (await companyRepository.hasChildren(companyId, { activeOnly: true })) {
-    const err = new Error('This Business Unit has Sub-BUs — select the specific Sub-BU to sync instead.');
-    err.statusCode = 400;
-    throw err;
-  }
+  const company = await assertSyncableBusinessUnit(companyId);
+  // Re-sync = this BU / Sub-BU already has synced timesheets for the month (confirm will replace them).
+  const alreadySyncedImports = await timesheetRepository.getImportIdsByMonth(month, year, null, companyId);
+  const isResync = alreadySyncedImports.length > 0;
 
-  const workLogs = await employeeWorkLogRepository.findForSync(companyId, month, year);
+  // Employee-wise: the BU / Sub-BU's mapped employees, each with ALL their logs of the month (cross-BU Service
+  // POs included). Employees already synced from another BU are skipped and reported back.
+  const { employeeIds, skippedEmployees } = await resolveSyncEmployees(companyId, month, year);
+  const workLogs = await employeeWorkLogRepository.findForSyncByEmployees(employeeIds, month, year);
   const parsedRows = mapWorkLogsToImportRows(workLogs);
 
   // Find-or-update: reuse the existing INCOMPLETE Sync import for this
@@ -1156,7 +1262,7 @@ const previewPmsImport = async (month, year, userId, companyId) => {
   // reverting the already-confirmed one back to 'pending'.
   const existing = await timesheetImportRepository.findByMonthYearSource(companyId, month, year, 'pms');
 
-  return runImportPreview(parsedRows, {
+  const result = await runImportPreview(parsedRows, {
     fileName: `${MONTH_ABBREVIATIONS[month - 1]}.xlsx`,
     filePath: null,
     userId,
@@ -1166,6 +1272,31 @@ const previewPmsImport = async (month, year, userId, companyId) => {
     source: 'pms',
     existingImportId: existing ? existing.id : null,
   });
+
+  // A preview is only a draft. Keep exactly ONE pending preview per BU / Sub-BU + month (this one) — and keep none at
+  // all when it found nothing to sync, instead of leaving an empty 'pending' row behind.
+  let importId = result.importId;
+  if (result.validRows === 0) {
+    await timesheetImportRepository.deleteImportsById([result.importId], null, companyId);
+    importId = null;
+  } else {
+    await timesheetImportRepository.deleteStalePending(companyId, month, year, 'pms', result.importId);
+  }
+
+  return {
+    ...result,
+    importId,
+    skippedEmployees,
+    skippedCount: skippedEmployees.length,
+    syncContext: {
+      businessUnitId: Number(companyId),
+      businessUnitName: company.company_name,
+      parentBusinessUnitId: company.parent_business_unit_id ?? null,
+      isSubBusinessUnit: company.parent_business_unit_id != null,
+      mode: isResync ? 'RESYNC' : 'SYNC',
+      previousImportIds: alreadySyncedImports,
+    },
+  };
 };
 
 /**
@@ -1324,10 +1455,9 @@ const confirmImport = async (importId, userId, ipAddress = null, companyId) => {
   // 'pms'-source import can only exist for a childless Business Unit (that
   // flow rejects it up front), but re-check here too in case a Sub-BU got
   // configured under this BU AFTER the import was first created.
-  if (importRecord.source === 'pms' && await companyRepository.hasChildren(companyId, { activeOnly: true })) {
-    const err = new Error('This Business Unit has Sub-BUs — select the specific Sub-BU to sync instead.');
-    err.statusCode = 400;
-    throw err;
+  let syncCompany = null;
+  if (importRecord.source === 'pms') {
+    syncCompany = await assertSyncableBusinessUnit(companyId, importRecord);
   }
 
   // 2. Re-fetch/re-parse the source rows and re-validate to get current
@@ -1338,10 +1468,17 @@ const confirmImport = async (importId, userId, ipAddress = null, companyId) => {
   //    instead — everything downstream of this point is identical for
   //    both sources.
   let parsedRows;
+  // Employee Sync only: employees skipped because another BU already synced their month, and the subset of
+  // them that still have rows under THIS BU (legacy BU-by-BU sync) which the full-replace below must not wipe.
+  let skippedEmployees = [];
+  let preserveEmployeeIds = [];
   try {
     if (importRecord.source === 'pms') {
-      const workLogs = await employeeWorkLogRepository.findForSync(
-        companyId,
+      const resolved = await resolveSyncEmployees(companyId, importRecord.import_month, importRecord.import_year);
+      skippedEmployees = resolved.skippedEmployees;
+      preserveEmployeeIds = resolved.skippedEmployees.filter((e) => e.hasOwnRows).map((e) => e.employeeId);
+      const workLogs = await employeeWorkLogRepository.findForSyncByEmployees(
+        resolved.employeeIds,
         importRecord.import_month,
         importRecord.import_year
       );
@@ -1450,11 +1587,25 @@ const confirmImport = async (importId, userId, ipAddress = null, companyId) => {
     const importMonth = parseInt(firstDate.slice(5, 7), 10);
 
     const oldImportIds = await timesheetRepository.getImportIdsByMonth(importMonth, importYear, t, companyId);
-    const deleted = await timesheetRepository.deleteByMonth(importMonth, importYear, t, companyId);
+    const deleted = await timesheetRepository.deleteByMonth(importMonth, importYear, t, companyId, { excludeEmployeeIds: preserveEmployeeIds });
+    // Work logs behind the wiped rows go back to 'approved'; the ones re-inserted below are re-marked 'synced'.
+    // Without this a dropped row stays 'synced' with no timesheet, and never shows up for the next sync.
+    const reopenedWorkLogs = importRecord.source === 'pms'
+      ? await employeeWorkLogRepository.revertOrphanedSyncStatus(oldImportIds, preserveEmployeeIds, t)
+      : 0;
+    if (deleted > records.length) {
+      logger.warn('Timesheet full-replace: fewer rows re-inserted than were removed', { importId, companyId, deleted, reinserted: records.length, reopenedWorkLogs });
+    }
+    // Rows kept above must not be orphaned when the old import record is retired just below.
+    await timesheetRepository.reassignEmployeesToImport(preserveEmployeeIds, importMonth, importYear, companyId, importId, t);
     const deletedHistory = await timesheetImportRepository.deleteImportsByIds(oldImportIds, importId, t, companyId);
-    logger.info('Timesheet full-replace: cleared month', { importId, importMonth, importYear, deleted, deletedHistory, companyId });
+    // A month that already held timesheets for this BU / Sub-BU is being replaced = a RESYNC (or an Excel re-import).
+    const isReplace = deleted > 0 || oldImportIds.length > 0;
+    logger.info('Timesheet full-replace: cleared month', { importId, importMonth, importYear, deleted, deletedHistory, reopenedWorkLogs, companyId });
 
     const inserted = await timesheetRepository.bulkCreate(records, t);
+    // Any other never-confirmed preview of this same BU / Sub-BU + month is now obsolete.
+    await timesheetImportRepository.deleteStalePending(companyId, importMonth, importYear, importRecord.source, importId, t);
 
     // 5. Update history: completed/partial/failed (also stamp month/year
     // from actual data). 'completed' when every re-validated row made it
@@ -1483,7 +1634,9 @@ const confirmImport = async (importId, userId, ipAddress = null, companyId) => {
       cap_hours:    capHours,
     }, null, companyId);
 
-    // Persist any new error rows found on re-validation
+    // Persist the error rows found on re-validation. The preview already stored its own copy for this import:
+    // clear it first so the same failure is not listed twice.
+    await timesheetImportRepository.deleteErrorsByImportIds([importId], null, companyId);
     if (errorRows.length > 0) {
       const errorInserts = errorRows.map((e) => ({
         import_id:     importId,
@@ -1502,16 +1655,19 @@ const confirmImport = async (importId, userId, ipAddress = null, companyId) => {
     // vice versa).
     if (importRecord.source === 'pms') {
       const tuples = mergedRows.map((row) => ({ employeeId: row.employeeId, poId: row.poId, date: row.date }));
-      const syncedCount = await employeeWorkLogRepository.markSyncedByTuples(companyId, tuples, importId, t);
+      const syncedCount = await employeeWorkLogRepository.markSyncedByTuples(companyId, tuples, importId, t, { ignoreCompany: true });
       logger.info('Employee work logs marked as synced', { importId, syncedCount });
     }
 
     await t.commit();
 
-    // 6. Audit log (non-blocking)
+    // 6. Audit log (non-blocking). A confirm that replaced a month which already had data is a
+    // RE-SYNC (Employee Work Log sync) / RE-IMPORT (Excel), not a first import — logged as its own action.
+    const isReplacement = oldImportIds.length > 0 || deleted > 0;
+    const auditAction = !isReplacement ? 'IMPORT' : (importRecord.source === 'pms' ? 'RESYNC' : 'REIMPORT');
     createAuditLog(
       userId,
-      'IMPORT',
+      auditAction,
       'timesheets',
       importId,
       null,
@@ -1523,6 +1679,11 @@ const confirmImport = async (importId, userId, ipAddress = null, companyId) => {
         source: importRecord.source,
         file_name: importRecord.file_name,
         company_id: companyId,
+        ...(isReplacement && {
+          replaced_rows: deleted,
+          replaced_imports: oldImportIds.length,
+          work_logs_reopened: reopenedWorkLogs,
+        }),
       },
       ipAddress
     );
@@ -1534,12 +1695,46 @@ const confirmImport = async (importId, userId, ipAddress = null, companyId) => {
       insertedRows: inserted.length,
     });
 
+    // WHY rows disappeared: a confirm over an already-populated month deletes the old rows first. Recorded as its
+    // own DELETE audit row so the Audit Log shows who replaced which BU / Sub-BU / month, and how many rows went.
+    if (isReplace) {
+      createAuditLog(
+        userId,
+        'DELETE',
+        'timesheets',
+        importId,
+        { company_id: companyId, month: importMonth, year: importYear, deleted_rows: deleted, previous_import_ids: oldImportIds, work_logs_reopened: reopenedWorkLogs },
+        {
+          reason: importRecord.source === 'pms' ? 'REPLACED_BY_RESYNC' : 'REPLACED_BY_EXCEL_IMPORT',
+          replaced_by_import_id: importId,
+          reinserted_rows: inserted.length,
+          source: importRecord.source,
+        },
+        ipAddress,
+        { companyId }
+      );
+    }
+
     return {
       importId,
       status:       finalStatus,
       insertedRows: inserted.length,
       errorRows:    errorRows.length,
+      // WHICH rows failed and why (row, employee, PO, date, reason) — shown right after Confirm, not only in the preview.
+      errors:       errorRows.slice(0, 500),
       duplicates,
+      skippedEmployees,
+      skippedCount: skippedEmployees.length,
+      syncContext: {
+        businessUnitId: Number(companyId),
+        businessUnitName: syncCompany ? syncCompany.company_name : null,
+        parentBusinessUnitId: syncCompany ? (syncCompany.parent_business_unit_id ?? null) : null,
+        isSubBusinessUnit: !!(syncCompany && syncCompany.parent_business_unit_id != null),
+        mode: isReplace ? 'RESYNC' : 'SYNC',
+        replacedRows: deleted,
+        reopenedWorkLogs,
+        previousImportIds: oldImportIds,
+      },
     };
   } catch (err) {
     await t.rollback();
@@ -1576,9 +1771,16 @@ const getImportHistory = async (query = {}, companyId) => {
   const month = query.month ? parseInt(query.month, 10) : undefined;
   const year = query.year ? parseInt(query.year, 10) : undefined;
 
+  // Optional ?status=completed,partial — applied in SQL, before pagination.
+  const IMPORT_STATUSES = ['pending', 'processing', 'completed', 'partial', 'failed'];
+  const statuses = String(query.status || '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => IMPORT_STATUSES.includes(s));
+
   const { rows, count } = await timesheetImportRepository.findAllImports(
     { limit, offset },
-    { month, year, companyId }
+    { month, year, companyId, statuses }
   );
 
   const importIds = rows.map((r) => r.id);

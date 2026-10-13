@@ -69,6 +69,37 @@ async function getSummary({ employeeIds, startDate, endDate, search, sortBy, sor
   return { rows, count: countRows[0].count };
 }
 
+// The employee's BUs rolled up to their top-level BU (a Sub-BU counts as its Parent) — active
+// employee_business_units rows, or the legacy employees.company_id only when there is no membership.
+// Same rule as the Cross-BU Employee & PO Hours report.
+const EMPLOYEE_ROOT_BUS_CTE = `
+  emp_root_bus AS (
+    SELECT DISTINCT COALESCE(c.parent_business_unit_id, c.id) AS root_id
+      FROM companies c
+     WHERE c.is_deleted = false
+       AND c.id IN (
+         SELECT m.business_unit_id FROM employee_business_units m
+          WHERE m.employee_id = :employeeId AND m.status = 'active'
+         UNION
+         SELECT e0.company_id FROM employees e0
+          WHERE e0.id = :employeeId AND e0.company_id IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM employee_business_units x WHERE x.employee_id = e0.id AND x.status = 'active')
+       )
+  )`;
+
+// Cross BU = the PO's BU (rolled up to its Parent) is none of the employee's BUs. A Centralised PO,
+// a PO with no BU, or an employee with no BU is never cross-BU. Needs `sp` and the emp_root_bus CTE.
+const IS_CROSS_BU_SQL = `(
+  sp.is_centralised IS NOT TRUE
+  AND sp.company_id IS NOT NULL
+  AND EXISTS (SELECT 1 FROM emp_root_bus)
+  AND NOT EXISTS (
+    SELECT 1 FROM companies po_bu
+     WHERE po_bu.id = sp.company_id
+       AND COALESCE(po_bu.parent_business_unit_id, po_bu.id) IN (SELECT root_id FROM emp_root_bus)
+  )
+)`;
+
 /**
  * Detail history expands TIME_BASED rows into their individual time slots.
  * Non-time-based rows remain one row. The separate total query always sums
@@ -78,7 +109,8 @@ async function getSummary({ employeeIds, startDate, endDate, search, sortBy, sor
 async function getDetails({ employeeId, startDate, endDate, limit, offset }) {
   const replacements = { employeeId, startDate, endDate, limit, offset };
   const entries = await sequelize.query(
-    `SELECT
+    `WITH ${EMPLOYEE_ROOT_BUS_CTE}
+     SELECT
        wl.id AS work_log_id,
        wl.work_date AS date,
        sp.service_po_code,
@@ -96,7 +128,8 @@ async function getDetails({ employeeId, startDate, endDate, limit, offset }) {
          WHEN wl.log_type = 'monthly' THEN 'MONTHLY'
          ELSE 'HOURLY'
        END AS entry_type,
-       wl.status
+       wl.status,
+       ${IS_CROSS_BU_SQL} AS is_cross_bu
      FROM employee_work_logs wl
      INNER JOIN service_pos sp ON sp.id = wl.service_po_id
      LEFT JOIN projects p ON p.id = sp.project_id
@@ -120,6 +153,17 @@ async function getDetails({ employeeId, startDate, endDate, limit, offset }) {
     { replacements, type: QueryTypes.SELECT }
   );
 
+  // Whole period, not just this page of entries.
+  const [crossBu] = await sequelize.query(
+    `WITH ${EMPLOYEE_ROOT_BUS_CTE}
+     SELECT COALESCE(BOOL_OR(${IS_CROSS_BU_SQL}), false) AS has_cross_bu
+     FROM employee_work_logs wl
+     INNER JOIN service_pos sp ON sp.id = wl.service_po_id
+     WHERE wl.employee_id = :employeeId
+       AND wl.work_date BETWEEN :startDate AND :endDate`,
+    { replacements, type: QueryTypes.SELECT }
+  );
+
   const countRows = await sequelize.query(
     `SELECT COUNT(*)::int AS count
      FROM employee_work_logs wl
@@ -129,7 +173,13 @@ async function getDetails({ employeeId, startDate, endDate, limit, offset }) {
     { replacements, type: QueryTypes.SELECT }
   );
 
-  return { entries, totalHours: totals.total_hours, workLogCount: totals.work_log_count, count: countRows[0].count };
+  return {
+    entries,
+    totalHours: totals.total_hours,
+    workLogCount: totals.work_log_count,
+    hasCrossBu: crossBu.has_cross_bu === true,
+    count: countRows[0].count,
+  };
 }
 
 module.exports = { getSummary, getDetails };

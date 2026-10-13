@@ -81,6 +81,19 @@ const CTE_SQL = `
      GROUP BY em.employee_id
   )`;
 
+// Adjusted (after monthly-cap) hours per Employee + PO + month. They only exist on the official
+// `timesheets` rows a Sync creates, so an unsynced work log has none (NULL, never a guess).
+const ADJUSTED_HOURS_CTE_SQL = `,
+  ts_adj AS (
+    SELECT t.employee_id, t.service_po_id,
+           EXTRACT(MONTH FROM t.timesheet_date)::int AS m,
+           EXTRACT(YEAR FROM t.timesheet_date)::int AS y,
+           SUM(COALESCE(t.modified_hours, t.hours_logged)) AS adj_hours
+      FROM timesheets t
+     WHERE t.timesheet_date BETWEEN :startDate AND :endDate
+     GROUP BY t.employee_id, t.service_po_id, EXTRACT(MONTH FROM t.timesheet_date), EXTRACT(YEAR FROM t.timesheet_date)
+  )`;
+
 const FROM_SQL = `
   FROM employee_work_logs wl
   JOIN employees e        ON e.id = wl.employee_id AND e.is_deleted = false
@@ -110,7 +123,12 @@ const FROM_SQL = `
  * @param {string|null} [f.search]
  */
 function buildWhere(f) {
-  const replacements = { startDate: f.startDate, endDate: f.endDate };
+  // Adjusted hours exist only for synced work, so a status filter that excludes 'synced' has none to show.
+  const replacements = {
+    startDate: f.startDate,
+    endDate: f.endDate,
+    includeSynced: !f.statuses || f.statuses.includes('synced'),
+  };
   const conditions = ['wl.work_date BETWEEN :startDate AND :endDate'];
 
   // Visibility. For the BU-scoped tiers a row is visible when EITHER the employee belongs to one
@@ -174,7 +192,7 @@ async function findRows(filters, { sortBy = 'employee', limit = null, offset = 0
   const paging = limit != null ? 'LIMIT :limit OFFSET :offset' : '';
 
   return sequelize.query(
-    `${CTE_SQL}
+    `${CTE_SQL}${ADJUSTED_HOURS_CTE_SQL}
      SELECT
        e.id AS employee_id,
        e.employee_code,
@@ -195,10 +213,13 @@ async function findRows(filters, { sortBy = 'employee', limit = null, offset = 0
        EXTRACT(MONTH FROM wl.work_date)::int AS month,
        EXTRACT(YEAR FROM wl.work_date)::int AS year,
        ROUND(SUM(wl.hours)::NUMERIC, 2) AS hours,
+       CASE WHEN :includeSynced THEN ROUND(MAX(ta.adj_hours)::NUMERIC, 2) END AS adjusted_hours,
        COUNT(DISTINCT wl.work_date)::int AS days_logged,
        (${WORK_TYPE_SQL}) AS work_type,
        COUNT(*) OVER() AS total_rows
      ${FROM_SQL}
+     LEFT JOIN ts_adj ta ON ta.employee_id = e.id AND ta.service_po_id = sp.id
+                        AND ta.m = EXTRACT(MONTH FROM wl.work_date)::int AND ta.y = EXTRACT(YEAR FROM wl.work_date)::int
      WHERE ${whereSql}
      GROUP BY e.id, e.employee_code, e.full_name, eb.bu_names, eb.sub_bu_names, cl.id, cl.client_name,
               p.id, p.project_name, sp.id, sp.service_po_code, sp.service_po_name, sp.is_centralised,
@@ -214,6 +235,16 @@ async function findRows(filters, { sortBy = 'employee', limit = null, offset = 0
 /** Whole-filtered-set summary cards: hours by work type and unique employees. */
 async function getTotals(filters) {
   const { whereSql, replacements } = buildWhere(filters);
+  const adjusted = replacements.includeSynced
+    ? await sequelize.query(
+      `${CTE_SQL},
+       keys AS (SELECT DISTINCT wl.employee_id, wl.service_po_id, wl.work_date ${FROM_SQL} WHERE ${whereSql})
+       SELECT COALESCE(ROUND(SUM(COALESCE(t.modified_hours, t.hours_logged))::NUMERIC, 2), 0) AS adjusted_total_hours
+         FROM timesheets t
+         JOIN keys k ON k.employee_id = t.employee_id AND k.service_po_id = t.service_po_id AND k.work_date = t.timesheet_date`,
+      { replacements, type: QueryTypes.SELECT }
+    )
+    : [{ adjusted_total_hours: 0 }];
   const [row] = await sequelize.query(
     `${CTE_SQL}
      SELECT
@@ -227,7 +258,7 @@ async function getTotals(filters) {
      WHERE ${whereSql}`,
     { replacements, type: QueryTypes.SELECT }
   );
-  return row;
+  return { ...row, adjusted_total_hours: adjusted[0].adjusted_total_hours };
 }
 
 /**

@@ -124,10 +124,11 @@ async function getDetails(employeeId, query, authContext, companyIds) {
       id: employee.id,
       full_name: employee.full_name,
       employee_code: employee.employee_code,
+      is_cross_bu: result.hasCrossBu === true,
     },
     total_hours: asNumber(result.totalHours),
     work_log_count: result.workLogCount,
-    entries: result.entries.map((entry) => ({ ...entry, hours: asNumber(entry.hours) })),
+    entries: result.entries.map((entry) => ({ ...entry, hours: asNumber(entry.hours), is_cross_bu: entry.is_cross_bu === true })),
     meta: getPaginationMeta(result.count, page, limit),
   };
 }

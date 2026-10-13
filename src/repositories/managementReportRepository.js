@@ -67,6 +67,13 @@ const EMPLOYEE_COMPANY_SCOPE_SQL = `(
 // also exposes an `original_*` / `original*` counterpart computed from this.
 const originalHoursCol = 'COALESCE(t.original_hours, t.hours_logged)';
 
+// Hours on a Centralised Service PO (company_id NULL + is_centralised) are logged by employees of MANY
+// Business Units, but every BU admin of the tenant can see that PO. A BU's report must only count its OWN
+// BU's timesheets against it; any other PO keeps every row (cross-BU staffing on a BU's own PO is intended).
+// Needs the timesheets alias `t` and the :companyIds replacement (the caller's BU scope).
+const CENTRALISED_HOURS_GUARD_SQL =
+  '(t.company_id IN (:companyIds) OR NOT EXISTS (SELECT 1 FROM service_pos spc WHERE spc.id = t.service_po_id AND spc.is_centralised = true))';
+
 const formatMonthYear = (month, year) => (
   `${parseInt(year, 10)}-${String(parseInt(month, 10)).padStart(2, '0')}`
 );
@@ -168,6 +175,7 @@ async function getServicePOProfitability(filters) {
       FROM timesheets t
       WHERE EXTRACT(MONTH FROM t.timesheet_date) = :monthNum
         AND EXTRACT(YEAR  FROM t.timesheet_date) = :yearNum
+        AND ${CENTRALISED_HOURS_GUARD_SQL}
         ${publishGuard}
       GROUP BY t.service_po_id
     ) cur ON cur.service_po_id = sp.id
@@ -365,6 +373,7 @@ async function getResourceStaffingPlanAccuracy(filters) {
       WHERE EXTRACT(MONTH FROM t.timesheet_date) = :monthNum
         AND EXTRACT(YEAR  FROM t.timesheet_date) = :yearNum
         AND t.service_po_id IN (SELECT id FROM in_scope_pos)
+        AND ${CENTRALISED_HOURS_GUARD_SQL}
         ${publishGuard}
       GROUP BY t.employee_id, t.service_po_id
     ),
@@ -606,11 +615,14 @@ async function getBUPerformanceScorecard(filters) {
           INNER JOIN service_pos sp ON sp.id = spmb.service_po_id
           WHERE sp.company_id = co.id AND spmb.month = :monthNum AND spmb.year = :yearNum
         ), 0) AS total_delivery_cost,
+        -- BU-wise hours (feeds the utilisation %): grouped by t.company_id = the SYNC BU the employee's
+        -- month was synced from (employee-wise sync), the same basis as the headcount above (employees
+        -- mapped to the BU) — so hours on a cross-BU / Centralised PO sit under the employee's BU and
+        -- are no longer lost (they used to be anchored on the PO's owner, sp.company_id).
         COALESCE((
           SELECT SUM(${hoursCol})
           FROM timesheets t
-          INNER JOIN service_pos sp ON sp.id = t.service_po_id
-          WHERE sp.company_id = co.id
+          WHERE t.company_id = co.id
             AND EXTRACT(MONTH FROM t.timesheet_date) = :monthNum
             AND EXTRACT(YEAR  FROM t.timesheet_date) = :yearNum
             ${publishGuard}
@@ -618,8 +630,7 @@ async function getBUPerformanceScorecard(filters) {
         COALESCE((
           SELECT SUM(${originalHoursCol})
           FROM timesheets t
-          INNER JOIN service_pos sp ON sp.id = t.service_po_id
-          WHERE sp.company_id = co.id
+          WHERE t.company_id = co.id
             AND EXTRACT(MONTH FROM t.timesheet_date) = :monthNum
             AND EXTRACT(YEAR  FROM t.timesheet_date) = :yearNum
             ${publishGuard}
@@ -856,6 +867,7 @@ async function getServicePOTimelineRiskRaw(filters) {
              SUM(${originalHoursCol}) FILTER (WHERE :monthStart::date IS NOT NULL AND t.timesheet_date >= :monthStart::date AND t.timesheet_date <= :monthEnd::date) AS original_hours_in_month
       FROM timesheets t
       WHERE (:asOfDate::date IS NULL OR t.timesheet_date <= :asOfDate::date)
+        AND ${CENTRALISED_HOURS_GUARD_SQL}
         ${publishGuard}
       GROUP BY t.service_po_id
     ) hrs ON hrs.service_po_id = sp.id
@@ -940,6 +952,7 @@ async function getDeliveryHeadPerformance(filters) {
         LEFT JOIN monthly_costs mc ON mc.employee_id = t.employee_id AND mc.month_year = :monthYear
         WHERE EXTRACT(MONTH FROM t.timesheet_date) = :monthNum
           AND EXTRACT(YEAR  FROM t.timesheet_date) = :yearNum
+          AND ${CENTRALISED_HOURS_GUARD_SQL}
           ${publishGuard}
         GROUP BY t.service_po_id
       ) cur ON cur.service_po_id = sp.id
@@ -947,6 +960,7 @@ async function getDeliveryHeadPerformance(filters) {
         SELECT service_po_id, SUM(${hoursCol}) AS hours_delivered_before
         FROM timesheets t
         WHERE timesheet_date < MAKE_DATE(:yearNum, :monthNum, 1)
+          AND ${CENTRALISED_HOURS_GUARD_SQL}
           ${publishGuard}
         GROUP BY service_po_id
       ) prev ON prev.service_po_id = sp.id
@@ -1107,7 +1121,9 @@ async function getServiceLineBusinessMix(filters) {
   // employee's hours/cost land under one BU's row while the matching PO's
   // invoice landed under a different BU's row for the same service type,
   // producing a numerically wrong (not just missing) margin.
-  const conditions = ['(sp.company_id IN (:companyIds) OR ' + buLessServicePOInTenantSql('sp', 'companyIds') + ')', 'EXTRACT(MONTH FROM t.timesheet_date) = :monthNum', 'EXTRACT(YEAR FROM t.timesheet_date) = :yearNum'];
+  // Hours of a Centralised PO only count the viewer's own BU's timesheets (CENTRALISED_HOURS_GUARD_SQL);
+  // any other PO keeps every employee's rows (cross-BU staffing, regardless of t.company_id).
+  const conditions = ['(sp.company_id IN (:companyIds) OR ' + buLessServicePOInTenantSql('sp', 'companyIds') + ')', CENTRALISED_HOURS_GUARD_SQL, 'EXTRACT(MONTH FROM t.timesheet_date) = :monthNum', 'EXTRACT(YEAR FROM t.timesheet_date) = :yearNum'];
 
   if (serviceCategoryId) { conditions.push('sc.id = :serviceCategoryId'); replacements.serviceCategoryId = serviceCategoryId; }
   if (serviceTypeId) { conditions.push('st.id = :serviceTypeId'); replacements.serviceTypeId = serviceTypeId; }
@@ -1277,7 +1293,25 @@ const PERIOD_EXPR_SQL = `(EXTRACT(YEAR FROM t.timesheet_date)::int * 100 + EXTRA
 // this exact same getNoWorkTrend/getLeaveHoursTrend bench/leave scenario —
 // except without ITS "OR sp.company_id IS NULL" clause, which would
 // reintroduce the same bug.
-const BENCH_COMPANY_SCOPE_SQL = `(t.company_id IN (:companyIds) OR sp.company_id IN (:companyIds))`;
+//
+// UPDATE (employee-wise Sync Employee Work Logs): a synced timesheet row's company_id is now the
+// employee's SYNC BU (one of the BUs they are mapped to), and a multi-BU employee is synced only once.
+// The Bench reports are EMPLOYEE-wise, so the scope is "the EMPLOYEE is mapped to the selected BU/Sub-BU"
+// (EXISTS — never a JOIN, so a multi-BU employee is not multiplied) instead of t.company_id/sp.company_id.
+// Needs the timesheets alias `t` and the :companyIds replacement.
+const BENCH_COMPANY_SCOPE_SQL = `EXISTS (
+  SELECT 1 FROM employees be
+  WHERE be.id = t.employee_id
+    AND (
+      be.company_id IN (:companyIds)
+      OR EXISTS (
+        SELECT 1 FROM employee_business_units bebu
+        WHERE bebu.employee_id = be.id
+          AND bebu.business_unit_id IN (:companyIds)
+          AND bebu.status = 'active'
+      )
+    )
+)`;
 
 // The bare Project Manager roster (id/name/code) — reused by
 // getPMWiseUtilization below (which needs ONLY this, not the org-hierarchy
@@ -2043,7 +2077,9 @@ async function getResourceCostUtilization(filters) {
              SUM(${originalHoursCol}) AS original_logged_hours
       FROM timesheets t
       WHERE t.timesheet_date >= :startDate AND t.timesheet_date < :endDateExclusive
-        AND t.company_id IN (:companyIds)
+        -- EMPLOYEE-wise: no t.company_id filter (it is the employee's SYNC BU, and a multi-BU employee is
+        -- synced once). The roster is already scoped by the employee's BU mapping (EMPLOYEE_COMPANY_SCOPE_SQL)
+        -- and every logged row of a roster (employee, Service PO) pair counts, cross-BU/Centralised included.
         ${publishGuard}
       GROUP BY t.employee_id, t.service_po_id, date_trunc('month', t.timesheet_date)
     ),

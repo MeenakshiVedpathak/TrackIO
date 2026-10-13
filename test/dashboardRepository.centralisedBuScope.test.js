@@ -26,7 +26,9 @@ test('getAnalyticsTiles(): Centralised-PO rows are scoped by the employee\'s BU 
     });
 
     const tilesSql = captured[0].sql.replace(/\s+/g, ' ');
-    assert.match(tilesSql, /sp\.company_id IS NULL AND EXISTS \( SELECT 1 FROM employee_business_units ebu_scope/);
+    // Employee-wise scope (employee-wise Sync): rows are attributed by the EMPLOYEE's BU mapping.
+    assert.match(tilesSql, /t\.employee_id IN \( SELECT emp_scope\.id FROM employees emp_scope/);
+    assert.match(tilesSql, /FROM employee_business_units ebu_scope/);
     assert.match(tilesSql, /ebu_scope\.business_unit_id IN \(:companyId\)/);
     assert.doesNotMatch(tilesSql, /OR sp\.company_id IS NULL\)/);
     assert.deepEqual(captured[0].replacements.companyId, [42]);

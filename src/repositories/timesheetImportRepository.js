@@ -132,11 +132,14 @@ const findImportById = async (id, companyId) => {
  */
 const findAllImports = async (pagination = {}, filters = {}) => {
   const { limit = 20, offset = 0 } = pagination;
-  const { month, year, companyId } = filters;
+  const { month, year, companyId, statuses } = filters;
 
   const where = { ...companyScope(companyId) };
   if (month) where.import_month = month;
   if (year) where.import_year = year;
+  // Filter in SQL (before LIMIT/OFFSET): filtering the returned page afterwards drops rows from a page of N and
+  // makes the list look shorter than it is.
+  if (Array.isArray(statuses) && statuses.length > 0) where.status = { [Op.in]: statuses };
 
   const isMultiBU = Array.isArray(companyId) && companyId.length > 1;
 
@@ -271,6 +274,26 @@ const findByMonthYearSource = async (companyId, month, year, source) => {
 };
 
 /**
+ * Delete the stale, never-confirmed ('pending') previews of one company + month + year + source, except the one
+ * in use. A 'pending' row is only a preview draft — confirmImport() re-reads and re-validates everything and no
+ * timesheet or work log ever references it — so keeping several adds nothing. 'processing' (a confirm that is
+ * running right now) and 'failed' (kept for diagnosis) are never touched. Error rows go with them (ON DELETE CASCADE).
+ *
+ * @returns {Promise<number>} number of deleted previews
+ */
+const deleteStalePending = async (companyId, month, year, source, keepId = null, transaction = null) => {
+  const where = {
+    company_id: companyId,
+    import_month: month,
+    import_year: year,
+    source,
+    status: 'pending',
+    ...(keepId != null ? { id: { [Op.ne]: keepId } } : {}),
+  };
+  return TimesheetImportHistory.destroy({ where, ...(transaction ? { transaction } : {}) });
+};
+
+/**
  * Fetch multiple import history records by their IDs (no associations).
  * Used by the monthly-sheet delete API to look up file_path/file_name
  * for each import before removing the DB rows and the files on disk.
@@ -374,6 +397,7 @@ module.exports = {
   createImportErrors,
   findImportById,
   findByMonthYearSource,
+  deleteStalePending,
   findAllImports,
   findImportsByIds,
   getEmployeeCountsByImportIds,

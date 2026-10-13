@@ -31,6 +31,35 @@ const EMPLOYEE_COMPANY_SCOPE_SQL = `(
   )
 )`;
 
+// ── Timesheet attribution (employee-wise Sync) ───────────────────────────────
+// "Sync Employee Work Logs" takes every active employee MAPPED to the sync BU
+// with ALL of their logs of the month (cross-BU / Centralised POs included)
+// and stamps timesheets.company_id = the SYNC BU. So:
+//   * EMPLOYEE-wise figures (hours per employee, bench %, employee billable
+//     breakdown, monthly totals/trends...) are scoped by the EMPLOYEE being
+//     mapped to the selected BU(s) — a membership IN (never a JOIN, so a
+//     multi-BU employee is counted once) — and never by t.company_id /
+//     sp.company_id (a multi-BU employee synced from BU1 still shows under BU2).
+//   * SPO-wise figures (hours per Service PO / client / project) are scoped by
+//     the Service PO's BU (sp.company_id) counting every employee's hours
+//     (cross-BU employees included), NOT by t.company_id. Exception: a
+//     Centralised/BU-less PO (company_id NULL, in the viewer's Admin tenant)
+//     only counts timesheets with t.company_id IN (:companyId) = "own BU's
+//     share" (same rule as CENTRALISED_HOURS_GUARD_SQL in reportRepository.js).
+// Both bind :companyId and need the aliases `t` (timesheets) / `sp` (service_pos).
+const TS_EMPLOYEE_SCOPE_SQL = `t.employee_id IN (
+  SELECT emp_scope.id FROM employees emp_scope
+  WHERE emp_scope.company_id IN (:companyId)
+     OR emp_scope.id IN (
+       SELECT ebu_scope.employee_id FROM employee_business_units ebu_scope
+       WHERE ebu_scope.business_unit_id IN (:companyId) AND ebu_scope.status = 'active'
+     )
+)`;
+const TS_SPO_SCOPE_SQL = `(sp.company_id IN (:companyId) OR (${buLessServicePOInTenantSql('sp', 'companyId')} AND t.company_id IN (:companyId)))`;
+// For LEFT JOIN timesheets t ... ON t.service_po_id = sp.id where sp is already
+// BU/tenant-scoped in WHERE: a Centralised PO only contributes the viewer's BU share.
+const TS_CENTRALISED_GUARD_JOIN_SQL = `AND (sp.company_id IS NOT NULL OR t.company_id IN (:companyId))`;
+
 /**
  * Total employees ever registered (regardless of status).
  * @returns {Promise<number>}
@@ -120,7 +149,7 @@ async function getCurrentMonthHoursWithOriginal(month, year, hoursSource, roleId
      FROM timesheets t
      WHERE EXTRACT(MONTH FROM timesheet_date) = :month
        AND EXTRACT(YEAR  FROM timesheet_date) = :year
-       AND t.company_id IN (:companyId)
+       AND ${TS_EMPLOYEE_SCOPE_SQL}
        ${publishGuard}`,
     {
       replacements: { month, year, companyId },
@@ -170,7 +199,7 @@ async function getCurrentMonthBillableSplit(month, year, hoursSource, roleId, co
      INNER JOIN service_pos sp ON sp.id = t.service_po_id
      WHERE EXTRACT(MONTH FROM t.timesheet_date) = :month
        AND EXTRACT(YEAR  FROM t.timesheet_date) = :year
-       AND t.company_id IN (:companyId)
+       AND ${TS_EMPLOYEE_SCOPE_SQL}
        ${publishGuard}`,
     {
       replacements: { month, year, companyId },
@@ -377,7 +406,7 @@ async function getRecentTimesheetActivity(hoursSource, roleId, companyId) {
      FROM timesheets t
      INNER JOIN employees e    ON e.id  = t.employee_id
      INNER JOIN service_pos sp ON sp.id = t.service_po_id
-     WHERE t.company_id IN (:companyId)
+     WHERE ${TS_EMPLOYEE_SCOPE_SQL}
        ${publishGuard}
      ORDER BY t.employee_id, t.timesheet_date DESC
      LIMIT 5`,
@@ -424,7 +453,7 @@ async function getRecentTimesheetActivityForPeriod(startDate, endDate, hoursSour
      INNER JOIN service_pos sp ON sp.id = t.service_po_id
      WHERE t.timesheet_date >= :startDate
        AND t.timesheet_date <= :endDate
-       AND ${TIMESHEET_COMPANY_SCOPE_SQL}
+       AND ${TS_EMPLOYEE_SCOPE_SQL}
        ${publishGuard}
      ORDER BY t.employee_id, t.timesheet_date DESC
      LIMIT 5`,
@@ -479,6 +508,7 @@ async function getTopPOsByHours(hoursSource, roleId, companyId) {
        INNER JOIN service_types st     ON st.id = sp.service_type_id
        INNER JOIN service_categories sc ON sc.id = st.service_category_id
        LEFT  JOIN timesheets t         ON t.service_po_id = sp.id
+                                       ${TS_CENTRALISED_GUARD_JOIN_SQL}
                                        ${publishGuard}
        WHERE (sp.company_id IN (:companyId) OR ${buLessServicePOInTenantSql('sp', 'companyId')})
        GROUP BY sp.id, sp.service_po_code, sp.service_po_name, c.client_name, sc.name
@@ -539,6 +569,7 @@ async function getTopPOsByHoursForPeriod(startDate, endDate, hoursSource, roleId
        LEFT  JOIN timesheets t         ON t.service_po_id = sp.id
                                        AND t.timesheet_date >= :startDate
                                        AND t.timesheet_date <= :endDate
+                                       ${TS_CENTRALISED_GUARD_JOIN_SQL}
                                        ${publishGuard}
        WHERE (sp.company_id IN (:companyId) OR ${buLessServicePOInTenantSql('sp', 'companyId')})
        GROUP BY sp.id, sp.service_po_code, sp.service_po_name, c.client_name, sc.name, sc.report_bucket_key
@@ -576,7 +607,7 @@ async function getEmployeeCountByCategory(month, year, roleId, companyId) {
      WHERE EXTRACT(MONTH FROM t.timesheet_date) = :month
        AND EXTRACT(YEAR  FROM t.timesheet_date) = :year
        AND t.hours_logged > 0
-       AND t.company_id IN (:companyId)
+       AND ${TS_EMPLOYEE_SCOPE_SQL}
        ${publishGuard}
      GROUP BY sc.name`,
     { replacements: { month, year, companyId }, type: QueryTypes.SELECT }
@@ -612,7 +643,7 @@ async function getEmployeeCountByCategoryForPeriod(startDate, endDate, roleId, c
      WHERE t.timesheet_date >= :startDate
        AND t.timesheet_date <= :endDate
        AND t.hours_logged > 0
-       AND ${TIMESHEET_COMPANY_SCOPE_SQL}
+       AND ${TS_EMPLOYEE_SCOPE_SQL}
        ${publishGuard}
      GROUP BY sc.name, sc.report_bucket_key`,
     { replacements: { startDate, endDate, companyId }, type: QueryTypes.SELECT }
@@ -638,24 +669,37 @@ async function getActiveCountsForPeriod(month, year, roleId, companyId) {
          WHERE h.id = t.timesheet_import_id AND h.is_publish = true
        )`
     : '';
+  // active_employees is EMPLOYEE-wise (mapped to the BU, cross-BU/Centralised
+  // rows included); active_clients is SPO-wise (clients of the BU's own POs
+  // with any employee's hours) — two scopes, so two queries.
   const [result] = await sequelize.query(
     `SELECT
-       COUNT(DISTINCT CASE WHEN e.status = 'active' AND e.is_deleted = 'f' THEN e.id END) AS active_employees,
-       COUNT(DISTINCT CASE WHEN c.status = 'active' THEN c.id END) AS active_clients
+       COUNT(DISTINCT CASE WHEN e.status = 'active' AND e.is_deleted = 'f' THEN e.id END) AS active_employees
      FROM timesheets t
      INNER JOIN service_pos sp ON sp.id = t.service_po_id
      INNER JOIN employees e    ON e.id  = t.employee_id
+     WHERE EXTRACT(MONTH FROM t.timesheet_date) = :month
+       AND EXTRACT(YEAR  FROM t.timesheet_date) = :year
+       AND ${TS_EMPLOYEE_SCOPE_SQL}
+       ${publishGuard}`,
+    { replacements: { month, year, companyId }, type: QueryTypes.SELECT }
+  );
+  const [clientResult] = await sequelize.query(
+    `SELECT
+       COUNT(DISTINCT CASE WHEN c.status = 'active' THEN c.id END) AS active_clients
+     FROM timesheets t
+     INNER JOIN service_pos sp ON sp.id = t.service_po_id
      INNER JOIN clients c      ON c.id  = sp.client_id
      WHERE EXTRACT(MONTH FROM t.timesheet_date) = :month
        AND EXTRACT(YEAR  FROM t.timesheet_date) = :year
-       AND t.company_id IN (:companyId)
+       AND ${TS_SPO_SCOPE_SQL}
        ${publishGuard}`,
     { replacements: { month, year, companyId }, type: QueryTypes.SELECT }
   );
 
   return {
     active_employees: parseInt(result.active_employees, 10),
-    active_clients: parseInt(result.active_clients, 10),
+    active_clients: parseInt(clientResult.active_clients, 10),
   };
 }
 
@@ -690,7 +734,7 @@ async function getMonthlyHoursTrend(hoursSource, roleId, companyId) {
        ROUND(SUM(${ORIGINAL_HOURS_COL})::numeric, 2)   AS original_total_hours
      FROM timesheets t
      WHERE timesheet_date >= (CURRENT_DATE - INTERVAL '6 months')
-       AND t.company_id IN (:companyId)
+       AND ${TS_EMPLOYEE_SCOPE_SQL}
        ${publishGuard}
      GROUP BY year, month, label
      ORDER BY year ASC, month ASC`,
@@ -740,7 +784,7 @@ async function getEmployeeBillableBreakdown(filters) {
       AND EXTRACT(YEAR  FROM t.timesheet_date) = :year
       AND e.is_deleted = false
       AND e.status = 'active'
-      AND t.company_id IN (:companyId)
+      AND ${TS_EMPLOYEE_SCOPE_SQL}
       ${searchCondition}
       ${publishGuard}
   `;
@@ -754,7 +798,7 @@ async function getEmployeeBillableBreakdown(filters) {
         AND EXTRACT(YEAR  FROM t.timesheet_date) = :year
         AND e.is_deleted = false
         AND e.status = 'active'
-        AND t.company_id IN (:companyId)
+        AND ${TS_EMPLOYEE_SCOPE_SQL}
         ${searchCondition}
         ${publishGuard}
       ORDER BY e.full_name
@@ -782,7 +826,7 @@ async function getEmployeeBillableBreakdown(filters) {
     LEFT  JOIN service_categories sc ON sc.id = st.service_category_id
     WHERE EXTRACT(MONTH FROM t.timesheet_date) = :month
       AND EXTRACT(YEAR  FROM t.timesheet_date) = :year
-      AND t.company_id IN (:companyId)
+      AND ${TS_EMPLOYEE_SCOPE_SQL}
       ${publishGuard}
     GROUP BY e.id, e.employee_code, e.full_name, e.designation,
              sp.id, sp.service_po_code, sp.service_po_name, sp.is_billable, st.service_type_name, sc.name, sc.report_bucket_key
@@ -869,6 +913,7 @@ async function getPOBillableBreakdown(filters) {
       ON  t.service_po_id = sp.id
       AND EXTRACT(MONTH FROM t.timesheet_date) = :month
       AND EXTRACT(YEAR  FROM t.timesheet_date) = :year
+      ${TS_CENTRALISED_GUARD_JOIN_SQL}
       ${publishGuard}
     ${whereClause}
     GROUP BY sp.id, sp.service_po_code, sp.service_po_name, sp.is_billable, sp.status,
@@ -911,7 +956,7 @@ async function getTopEmployeesByPO(filters) {
   const conditions = [
     'EXTRACT(MONTH FROM t.timesheet_date) = :month',
     'EXTRACT(YEAR  FROM t.timesheet_date) = :year',
-    't.company_id IN (:companyId)',
+    TS_EMPLOYEE_SCOPE_SQL,
   ];
 
   if (search) {
@@ -992,7 +1037,7 @@ async function getTopEmployeesByPO(filters) {
       INNER JOIN employees e       ON e.id  = t.employee_id
       WHERE EXTRACT(MONTH FROM t.timesheet_date) = :month
         AND EXTRACT(YEAR  FROM t.timesheet_date) = :year
-        AND t.company_id IN (:companyId)
+        AND ${TS_EMPLOYEE_SCOPE_SQL}
         ${publishGuard ? `AND ${publishGuard}` : ''}
       GROUP BY sp.id, sp.service_po_code, sp.service_po_name, sp.is_billable, c.client_name,
                st.service_type_name, sc.name, e.id, e.employee_code, e.full_name
@@ -1009,29 +1054,6 @@ async function getTopEmployeesByPO(filters) {
 
   return { rows, count: parseInt(countResult[0].total, 10) };
 }
-
-/**
- * BU scope for a timesheet row (`t` joined to `sp`), bound to :companyId.
- *
- * A row counts for the scope when it was logged under one of those BUs
- * (t.company_id) or is against a Service PO of one of those BUs
- * (sp.company_id) — both needed, see buildAnalyticsFilters()'s comment on
- * cross-BU resourcing.
- *
- * A Centralised/BU-less Service PO (sp.company_id IS NULL — Leaves, On
- * Bench, HR & Admin, ...) belongs to no BU, so its rows only count when the
- * EMPLOYEE belongs to the scope. It used to be a bare `OR sp.company_id IS
- * NULL`, which pulled in every such row from EVERY BU: narrowing
- * /dashboard/analytics to a 5-person Sub-BU still reported tiles.
- * active_employees = 72 (everyone org-wide who logged leave/bench time).
- * Unfiltered (full reach) results are unchanged.
- */
-const TIMESHEET_COMPANY_SCOPE_SQL = `(t.company_id IN (:companyId) OR sp.company_id IN (:companyId) OR (sp.company_id IS NULL AND EXISTS (
-      SELECT 1 FROM employee_business_units ebu_scope
-      WHERE ebu_scope.employee_id = t.employee_id
-        AND ebu_scope.status = 'active'
-        AND ebu_scope.business_unit_id IN (:companyId)
-    )))`;
 
 /**
  * Billable vs non-billable hours per Service PO, per calendar month, across a
@@ -1076,7 +1098,7 @@ async function getBillableTrendDetail(filters) {
      INNER JOIN service_types st ON st.id = sp.service_type_id
      WHERE t.timesheet_date >= :windowStart
        AND t.timesheet_date <= :windowEnd
-       AND t.company_id IN (:companyId)
+       AND ${TS_EMPLOYEE_SCOPE_SQL}
        ${publishGuard}
      GROUP BY year, month, sp.id, sp.service_po_name, sp.is_billable, st.service_type_name
      ORDER BY year, month`,
@@ -1096,26 +1118,16 @@ async function getBillableTrendDetail(filters) {
 // WHERE clause via buildAnalyticsFilters() so every widget applies filters
 // identically. serviceTypeId requires the caller's query to have joined
 // service_types AS st (not every caller does).
-function buildAnalyticsFilters(filters, replacements) {
+function buildAnalyticsFilters(filters, replacements, scope = 'employee') {
   const { startDate, endDate, employeeId, clientId, poId, serviceTypeId, roleId, companyId } = filters;
   const conditions = [
     't.timesheet_date >= :startDate',
     't.timesheet_date <= :endDate',
-    // t.company_id ALONE is not reliable: confirmed cross-BU-resourcing
-    // paths (timesheetService.confirmImport()/createTimesheet() stamp the
-    // IMPORTING/logging actor's own companyId onto the row, not the
-    // referenced Service PO's) and Centralised/BU-less POs (sp.company_id
-    // IS NULL by design, yet the timesheet row itself still carries a real
-    // company_id) both produce a real timesheet row whose t.company_id
-    // does not equal its own sp.company_id — see docs/rbac-redesign/
-    // TESTING_SUMMARY.md's stray-DEFAULT note and servicePOService.js's
-    // belongsToCompanyOrUnassigned() for the BU-less-PO precedent. Every
-    // caller of this function already INNER JOINs service_pos AS sp, so
-    // widening via sp.company_id (same "IN (...) OR IS NULL" convention
-    // used everywhere else in this file) recovers those rows instead of
-    // silently zeroing out tiles/charts for an otherwise-correctly-scoped
-    // actor.
-    TIMESHEET_COMPANY_SCOPE_SQL,
+    // Scope: employee-wise (default) = the EMPLOYEE is mapped to the BU(s); SPO-wise =
+    // the Service PO belongs to the BU(s). Neither filters by t.company_id (the sync
+    // BU) — see TS_EMPLOYEE_SCOPE_SQL / TS_SPO_SCOPE_SQL at the top of this file.
+    // Employee-wise (default) vs SPO-wise attribution — see TS_EMPLOYEE_SCOPE_SQL.
+    scope === 'spo' ? TS_SPO_SCOPE_SQL : TS_EMPLOYEE_SCOPE_SQL,
   ];
   replacements.startDate = startDate;
   replacements.endDate = endDate;
@@ -1278,7 +1290,7 @@ async function getAnalyticsMonthlyTrend(filters) {
  */
 async function getAnalyticsHoursByClient(filters) {
   const replacements = {};
-  const whereClause = buildAnalyticsFilters(filters, replacements);
+  const whereClause = buildAnalyticsFilters(filters, replacements, 'spo');
   // hoursSource = 'O' -> original hours_logged. Anything else/default
   // (including no roleId, or roleId != 5) -> modified_hours. roleId plays no
   // part in this selection — only hoursSource does.
@@ -1348,7 +1360,7 @@ async function getAnalyticsHoursByEmployee(filters) {
  */
 async function getAnalyticsClientByPO(filters) {
   const replacements = {};
-  const whereClause = buildAnalyticsFilters(filters, replacements);
+  const whereClause = buildAnalyticsFilters(filters, replacements, 'spo');
   // hoursSource = 'O' -> original hours_logged. Anything else/default
   // (including no roleId, or roleId != 5) -> modified_hours. roleId plays no
   // part in this selection — only hoursSource does.
@@ -1933,6 +1945,30 @@ async function getAnalyticsTiles(filters) {
     }
   );
 
+  // Client / Service PO counts are SPO-wise (the BU's own POs, any employee's
+  // hours) while hours / employee counts above are employee-wise — so they
+  // come from a second query under the SPO scope.
+  const spoReplacements = {};
+  const spoWhereClause = buildAnalyticsFilters(filters, spoReplacements, 'spo');
+  const [spoResult] = await sequelize.query(
+    `SELECT
+        COUNT(DISTINCT CASE WHEN c.status = 'active' THEN c.id END) AS active_clients,
+        COUNT(DISTINCT CASE WHEN c.status = 'inactive' THEN c.id END) AS inactive_clients,
+        COUNT(DISTINCT CASE WHEN sp.status IN('in-progress', 'on-hold') AND sp.is_deleted = 'f' THEN sp.id END) AS active_service_pos,
+        COUNT(DISTINCT CASE WHEN sp.status = 'inactive' THEN sp.id END) AS inactive_service_pos
+     FROM timesheets t
+     INNER JOIN service_pos sp ON sp.id = t.service_po_id
+     INNER JOIN clients c      ON c.id = sp.client_id
+     WHERE ${spoWhereClause}`,
+    { replacements: spoReplacements, type: QueryTypes.SELECT }
+  );
+  Object.assign(result, {
+    active_clients: spoResult.active_clients,
+    inactive_clients: spoResult.inactive_clients,
+    active_service_pos: spoResult.active_service_pos,
+    inactive_service_pos: spoResult.inactive_service_pos,
+  });
+
   const costReplacements = {};
   const costWhereClause = buildInvoiceMasterFilters(filters, costReplacements);
   const [costResult] = await sequelize.query(
@@ -2006,7 +2042,7 @@ async function getClientWiseCostAnalytics(hoursSource, roleId, companyId) {
      FROM timesheets t
      INNER JOIN service_pos sp ON sp.id = t.service_po_id
      INNER JOIN clients c      ON c.id  = sp.client_id
-     WHERE ${TIMESHEET_COMPANY_SCOPE_SQL}
+     WHERE ${TS_SPO_SCOPE_SQL}
      GROUP BY c.id, c.client_name`,
     { replacements: { companyId }, type: QueryTypes.SELECT }
   );
@@ -2095,7 +2131,7 @@ async function getClientCategoryCostMatrix(hoursSource, roleId, companyId) {
  */
 async function getClientWiseAnalytics(filters) {
   const hoursReplacements = {};
-  const hoursWhereClause = buildAnalyticsFilters(filters, hoursReplacements);
+  const hoursWhereClause = buildAnalyticsFilters(filters, hoursReplacements, 'spo');
   const hoursCol = (filters.hoursSource === 'O')
     ? 'COALESCE(t.original_hours, t.hours_logged)'
     : 'COALESCE(t.modified_hours, t.hours_logged)';

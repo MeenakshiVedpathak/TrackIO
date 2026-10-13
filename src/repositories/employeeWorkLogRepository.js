@@ -590,6 +590,63 @@ const findForSync = async (companyId, month, year) => {
 };
 
 /**
+ * Employee-wise Sync scope: the active, non-deleted Employees mapped to the selected BU / Sub-BU —
+ * an active employee_business_units grant, or the legacy employees.company_id. This replaces
+ * scoping a Sync by the Service PO's BU (see findForSync), which split a multi-BU employee's month
+ * across several syncs and applied the monthly cap to each fragment instead of to the employee.
+ *
+ * @param {number} companyId - the BU / Sub-BU being synced
+ * @returns {Promise<number[]>} employee ids
+ */
+const resolveSyncEmployeeIds = async (companyId) => {
+  const rows = await sequelize.query(
+    `SELECT DISTINCT e.id
+       FROM employees e
+      WHERE e.status = 'active'
+        AND e.is_deleted = false
+        AND (
+          e.company_id = :companyId
+          OR EXISTS (
+            SELECT 1 FROM employee_business_units ebu
+             WHERE ebu.employee_id = e.id AND ebu.business_unit_id = :companyId AND ebu.status = 'active'
+          )
+        )`,
+    { replacements: { companyId }, type: QueryTypes.SELECT }
+  );
+  return rows.map((r) => r.id);
+};
+
+/**
+ * Every work log (any Service PO, including cross-BU / Centralised ones) the given Employees logged
+ * in the month, excluding 'pending' ones — the employee-wise counterpart of findForSync(). The BU of
+ * the Service PO a log was made against is deliberately NOT a filter: an employee's month is synced
+ * as a whole, so the monthly cap applies to everything they logged.
+ *
+ * @param {number[]} employeeIds
+ * @param {number} month
+ * @param {number} year
+ * @returns {Promise<EmployeeWorkLog[]>}
+ */
+const findForSyncByEmployees = async (employeeIds, month, year) => {
+  if (!employeeIds || employeeIds.length === 0) return [];
+  const monthNum = parseInt(month, 10);
+  const yearNum = parseInt(year, 10);
+
+  return EmployeeWorkLog.findAll({
+    where: {
+      [Op.and]: [
+        literal(`EXTRACT(MONTH FROM work_date) = ${monthNum}`),
+        literal(`EXTRACT(YEAR  FROM work_date) = ${yearNum}`),
+      ],
+      employee_id: { [Op.in]: employeeIds },
+      status: { [Op.ne]: 'pending' },
+    },
+    include: buildIncludes(),
+    order: [['id', 'ASC']],
+  });
+};
+
+/**
  * Mark every work log row matching one of the given (employeeId, poId, date)
  * tuples as 'synced', linked to the resulting import batch — regardless of
  * its CURRENT status, since a repeat sync must re-affirm already-synced,
@@ -603,7 +660,7 @@ const findForSync = async (companyId, month, year) => {
  * @param {object} [transaction]
  * @returns {Promise<number>} rows updated
  */
-const markSyncedByTuples = async (companyId, tuples, timesheetImportId, transaction = null) => {
+const markSyncedByTuples = async (companyId, tuples, timesheetImportId, transaction = null, { ignoreCompany = false } = {}) => {
   if (!tuples || tuples.length === 0) return 0;
 
   const orConditions = tuples.map((t) => ({
@@ -611,8 +668,12 @@ const markSyncedByTuples = async (companyId, tuples, timesheetImportId, transact
     service_po_id: t.poId,
     work_date: t.date,
   }));
-  // A Sub-BU sync can also have pulled Parent-stamped logs (see resolveSyncScope) — mark those too.
-  const { companyIds } = await resolveSyncScope(companyId);
+  // Employee-wise sync (ignoreCompany): the logs were fetched per Employee across every Service PO
+  // (incl. cross-BU ones), so they are matched by employee + PO + date only. The legacy BU-scoped
+  // mode also covers Parent-stamped logs of a Sub-BU sync (see resolveSyncScope).
+  const companyFilter = ignoreCompany
+    ? {}
+    : { company_id: { [Op.in]: (await resolveSyncScope(companyId)).companyIds } };
 
   const [count] = await EmployeeWorkLog.update(
     {
@@ -622,7 +683,7 @@ const markSyncedByTuples = async (companyId, tuples, timesheetImportId, transact
     },
     {
       where: {
-        company_id: { [Op.in]: companyIds },
+        ...companyFilter,
         [Op.or]: orConditions,
       },
       ...(transaction ? { transaction } : {}),
@@ -669,6 +730,34 @@ const revertSyncStatusByImportIds = async (importIds, transaction = null) => {
 };
 
 /**
+ * Re-open the work logs of imports a month-replace is about to retire, EXCEPT the employees whose
+ * timesheets are being kept (preserveEmployeeIds). confirmImport() re-marks every row it re-inserts as
+ * 'synced' right afterwards, so only rows that were wiped and NOT re-created (failed re-validation,
+ * employee/PO no longer eligible) stay 'approved' — visible and re-syncable instead of silently
+ * 'synced' with no timesheet behind them.
+ *
+ * @param {number[]} importIds
+ * @param {number[]} preserveEmployeeIds
+ * @param {object} [transaction]
+ * @returns {Promise<number>} rows re-opened
+ */
+const revertOrphanedSyncStatus = async (importIds, preserveEmployeeIds = [], transaction = null) => {
+  if (!importIds || importIds.length === 0) return 0;
+  const [count] = await EmployeeWorkLog.update(
+    { status: 'approved', synced_at: null, timesheet_import_id: null },
+    {
+      where: {
+        timesheet_import_id: { [Op.in]: importIds },
+        status: 'synced',
+        ...(preserveEmployeeIds.length ? { employee_id: { [Op.notIn]: preserveEmployeeIds } } : {}),
+      },
+      ...(transaction ? { transaction } : {}),
+    }
+  );
+  return count;
+};
+
+/**
  * Revert the single work log row matching (employeeId, poId, date) back to
  * 'approved' if — and only if — it's currently sitting at status='synced'.
  * Called when an Admin deletes one official Timesheet row
@@ -695,7 +784,8 @@ const revertSyncStatusByTuple = async (companyId, employeeId, poId, date, transa
     { status: 'approved', synced_at: null, timesheet_import_id: null },
     {
       where: {
-        company_id: companyId,
+        // No company_id filter: with employee-wise sync the timesheet's company is the SYNC BU, while the
+        // work log keeps the company of the Service PO it was logged against (cross-BU / Centralised).
         employee_id: employeeId,
         service_po_id: poId,
         work_date: date,
@@ -1544,9 +1634,10 @@ const hasSyncedEntriesInRange = async (employeeId, startDate, endDate, companyId
   const row = await EmployeeWorkLog.findOne({
     where: {
       employee_id: employeeId,
-      // An Admin/Entity Admin carries no Business Unit of their own (companyId undefined/null
-      // here) — Sequelize rejects `company_id: undefined`, so they check across every BU.
-      ...(companyId != null && { company_id: companyId }),
+      // Per-EMPLOYEE, deliberately not BU-scoped (companyId is accepted but unused): Sync is employee-wise,
+      // so once ANY of an employee's logs in the range is synced — whichever BU ran the sync, and whichever
+      // BU's (cross-BU / Centralised) Service PO the log is against — the employee's records for that range
+      // are locked. A BU filter here would let an employee edit/re-add a month that another BU's sync already took.
       work_date: { [Op.gte]: startDate, [Op.lte]: endDate },
       status: 'synced',
     },
@@ -1747,9 +1838,12 @@ module.exports = {
   getMonthEntryModeSummary,
   findForSync,
   resolveSyncScope,
+  resolveSyncEmployeeIds,
+  findForSyncByEmployees,
   resolveApprovalLogScope,
   markSyncedByTuples,
   revertSyncStatusByImportIds,
+  revertOrphanedSyncStatus,
   revertSyncStatusByTuple,
   getReportRows,
   getWorkLogTimeReportRows,

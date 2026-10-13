@@ -137,6 +137,7 @@ const bulkUpdateImportHoursSchema = Joi.object({
 const bulkIdsSchema = Joi.object({
   ids: idsField,
   id: Joi.number().integer().positive().optional(),
+  reason: Joi.string().trim().max(500).allow("").optional(),
 })
   .or('ids', 'id')
   .messages({

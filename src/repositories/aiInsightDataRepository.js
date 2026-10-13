@@ -27,6 +27,24 @@ const DATE_FMT = 'YYYY-MM-DD';
 
 // ── shared helpers ──────────────────────────────────────────────────────────
 
+// Timesheet attribution after the employee-wise "Sync Employee Work Logs"
+// (timesheets.company_id = the employee's SYNC BU, rows may sit on cross-BU /
+// Centralised Service POs):
+//   * EMPLOYEE-wise (bench %, utilisation/cost summary): the EMPLOYEE is mapped
+//     to :companyId — an IN-subquery, never a JOIN, so nobody is counted twice.
+//   * SPO-wise (sole-contributor risk, top clients): the Service PO belongs to
+//     :companyId, counting every employee's hours; a Centralised PO only counts
+//     rows with t.company_id = :companyId (this BU's own share).
+const AI_TS_EMPLOYEE_SCOPE_SQL = `t.employee_id IN (
+         SELECT emp_scope.id FROM employees emp_scope
+         WHERE emp_scope.company_id = :companyId
+            OR emp_scope.id IN (
+              SELECT ebu_scope.employee_id FROM employee_business_units ebu_scope
+              WHERE ebu_scope.business_unit_id = :companyId AND ebu_scope.status = 'active'
+            )
+       )`;
+const AI_TS_SPO_SCOPE_SQL = `(sp.company_id = :companyId OR (${buLessServicePOInTenantSql('sp', 'companyId')} AND t.company_id = :companyId))`;
+
 /**
  * Sole Contributor Risk rows for an arbitrary date window: every
  * in-progress Service PO where one employee logged >= 90% of the hours,
@@ -54,7 +72,7 @@ async function getSoleContributorRiskRows(startDate, endDate, companyId) {
      INNER JOIN clients c      ON c.id = sp.client_id
      INNER JOIN employees e    ON e.id = t.employee_id
      WHERE t.timesheet_date BETWEEN :startDate AND :endDate
-       AND t.company_id = :companyId
+       AND ${AI_TS_SPO_SCOPE_SQL}
      GROUP BY sp.id, sp.service_po_name, c.client_name, t.employee_id, e.full_name`,
     { replacements: { startDate, endDate, companyId }, type: QueryTypes.SELECT }
   );
@@ -103,7 +121,7 @@ async function getBenchPctRows(startDate, endDate, companyId) {
      INNER JOIN employees e   ON e.id = t.employee_id AND e.is_deleted = false AND e.status = 'active'
      INNER JOIN service_pos sp ON sp.id = t.service_po_id
      WHERE t.timesheet_date BETWEEN :startDate AND :endDate
-       AND t.company_id = :companyId
+       AND ${AI_TS_EMPLOYEE_SCOPE_SQL}
      GROUP BY e.id, e.full_name, e.designation
      HAVING SUM(t.hours_logged) > 0`,
     { replacements: { startDate, endDate, benchNames: BENCH_PO_NAMES, companyId }, type: QueryTypes.SELECT }
@@ -170,7 +188,7 @@ async function getUtilizationAndCostSummary(startDate, endDate, companyId) {
        ON mc.employee_id = t.employee_id
       AND mc.month_year = TO_CHAR(t.timesheet_date, 'YYYY-MM')
      WHERE t.timesheet_date BETWEEN :startDate AND :endDate
-       AND t.company_id = :companyId`,
+       AND ${AI_TS_EMPLOYEE_SCOPE_SQL}`,
     { replacements: { startDate, endDate, companyId }, type: QueryTypes.SELECT }
   );
 
@@ -207,7 +225,7 @@ async function getTopClientsByCostForPeriod(startDate, endDate, limit = 5, compa
        ON mc.employee_id = t.employee_id
       AND mc.month_year = TO_CHAR(t.timesheet_date, 'YYYY-MM')
      WHERE t.timesheet_date BETWEEN :startDate AND :endDate
-       AND t.company_id = :companyId
+       AND ${AI_TS_SPO_SCOPE_SQL}
      GROUP BY c.id, c.client_name
      ORDER BY cost DESC
      LIMIT :limit`,
@@ -371,9 +389,8 @@ async function getBenchEscalationData(companyId) {
        FROM timesheets t
        INNER JOIN service_pos sp ON sp.id = t.service_po_id
        WHERE t.employee_id IN (:employeeIds) AND LOWER(sp.service_po_name) NOT IN (:benchNames)
-         AND t.company_id = :companyId
        ORDER BY t.employee_id, t.timesheet_date DESC`,
-      { replacements: { employeeIds, benchNames: BENCH_PO_NAMES, companyId }, type: QueryTypes.SELECT }
+      { replacements: { employeeIds, benchNames: BENCH_PO_NAMES }, type: QueryTypes.SELECT }
     );
     lastProjectByEmployee = new Map(lastProjectRows.map((r) => [r.employee_id, r]));
   }

@@ -56,6 +56,8 @@ const ACTION_LABELS = {
   LOGIN_FAILED: 'Failed login',
   ACCESS_DENIED: 'Access denied',
   IMPORT: 'Imported',
+  RESYNC: 'Re-synced',
+  REIMPORT: 'Re-imported',
 };
 
 // Never worth showing in a change summary.
@@ -126,13 +128,19 @@ function buildSummary(row, changes) {
       }
       return `Deleted ${what}`;
     }
-    case 'IMPORT': {
+    case 'IMPORT':
+    case 'RESYNC':
+    case 'REIMPORT': {
       const n = row.new_values || {};
+      const verb = { IMPORT: 'Imported', RESYNC: 'Re-synced', REIMPORT: 'Re-imported' }[row.action];
       if (n.month && n.year) {
-        const detail = joinParts([monthYear(n.month, n.year), SHEET_SOURCE[n.source] || n.source, n.insertedRows != null ? `${n.insertedRows} rows` : null, n.file_name]);
-        return `Imported monthly sheet — ${detail}`;
+        const detail = joinParts([
+          monthYear(n.month, n.year), SHEET_SOURCE[n.source] || n.source, n.insertedRows != null ? `${n.insertedRows} rows` : null,
+          n.replaced_rows != null ? `replaced ${n.replaced_rows} existing rows` : null, n.file_name,
+        ]);
+        return `${verb} monthly sheet — ${detail}`;
       }
-      return `Imported ${what}`;
+      return `${verb} ${what}`;
     }
     case 'LOGIN_FAILED': {
       const v = row.new_values || {};

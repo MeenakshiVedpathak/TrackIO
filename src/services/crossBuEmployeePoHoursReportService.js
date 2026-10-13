@@ -131,6 +131,8 @@ function toRecord(row) {
     po_sub_bu: row.po_sub_bu,
     is_centralised: row.is_centralised === true,
     logged_hours: num(row.hours),
+    // After the monthly-cap adjustment; null while none of the row's work has been synced yet.
+    adjusted_hours: row.adjusted_hours == null ? null : num(row.adjusted_hours),
     days_logged: row.days_logged,
     month: row.month,
     year: row.year,
@@ -146,6 +148,7 @@ function toTotals(t) {
   return {
     total_employees: t.employee_count,
     total_hours: total,
+    adjusted_total_hours: num(t.adjusted_total_hours),
     own_bu_hours: own,
     cross_bu_hours: cross,
     unclassified_hours: num(t.unclassified_hours),
@@ -235,6 +238,7 @@ const DETAIL_COLUMNS = [
   { key: 'po_bu', label: 'PO BU', width: 22 },
   { key: 'po_sub_bu', label: 'PO Sub-BU', width: 22 },
   { key: 'logged_hours', label: 'Logged Hours', width: 13, numFmt: '0.00' },
+  { key: 'adjusted_hours', label: 'Adjusted Hours', width: 15, numFmt: '0.00' },
   { key: 'work_type_label', label: 'Work Type', width: 15 },
   { key: 'month', label: 'Month', width: 8 },
   { key: 'year', label: 'Year', width: 8 },

@@ -1217,6 +1217,8 @@ async function getResourseProjectUtilizationReport(query, companyIds) {
       billableAmount: row.is_billable
         ? Math.round(hrs * rate * 100) / 100
         : 0,
+      // true when the project's (Service PO's) Business Unit differs from the employee's own BU(s)
+      is_cross_bu: row.is_cross_bu === true,
     });
   }
 
@@ -1779,7 +1781,10 @@ async function getEmployeeBenchPercentage(query, companyIds) {
     roleId: query.roleId,
   };
 
-  const rows = await reportRepo.getEmployeeBenchDetailReport(filters);
+  const [rows, roster] = await Promise.all([
+    reportRepo.getEmployeeBenchDetailReport(filters),
+    reportRepo.getEmployeeBenchRoster(filters),
+  ]);
 
   const empMap = new Map();
   for (const row of rows) {
@@ -1805,17 +1810,39 @@ async function getEmployeeBenchPercentage(query, companyIds) {
     }
   }
 
-  const shaped = Array.from(empMap.values()).map((emp) => ({
-    employee_id: emp.employee_id,
-    employee_code: emp.employee_code,
-    full_name: emp.full_name,
-    bench_hours: round2(emp.bench_hours),
-    total_hours: round2(emp.total_hours),
-    bench_pct: emp.total_hours > 0 ? round2((emp.bench_hours / emp.total_hours) * 100) : 0,
-    original_bench_hours: round2(emp.original_bench_hours),
-    original_total_hours: round2(emp.original_total_hours),
-    original_bench_pct: emp.original_total_hours > 0 ? round2((emp.original_bench_hours / emp.original_total_hours) * 100) : 0,
-  }));
+  // Employees in scope who logged NOTHING in the period never show up in the timesheet rows above — but
+  // an employee with no hours is the clearest bench case, so they are listed too (0 hours, 100% bench).
+  const noHoursLogged = new Set();
+  for (const person of roster) {
+    if (empMap.has(person.employee_id)) continue;
+    empMap.set(person.employee_id, {
+      employee_id: person.employee_id,
+      employee_code: person.employee_code,
+      full_name: person.full_name,
+      bench_hours: 0,
+      total_hours: 0,
+      original_bench_hours: 0,
+      original_total_hours: 0,
+    });
+    noHoursLogged.add(person.employee_id);
+  }
+
+  const shaped = Array.from(empMap.values()).map((emp) => {
+    const noHours = noHoursLogged.has(emp.employee_id);
+    return {
+      employee_id: emp.employee_id,
+      employee_code: emp.employee_code,
+      full_name: emp.full_name,
+      bench_hours: round2(emp.bench_hours),
+      total_hours: round2(emp.total_hours),
+      bench_pct: noHours ? 100 : (emp.total_hours > 0 ? round2((emp.bench_hours / emp.total_hours) * 100) : 0),
+      original_bench_hours: round2(emp.original_bench_hours),
+      original_total_hours: round2(emp.original_total_hours),
+      original_bench_pct: noHours ? 100 : (emp.original_total_hours > 0 ? round2((emp.original_bench_hours / emp.original_total_hours) * 100) : 0),
+      // true when the employee has no timesheet hours at all in the period (listed only because they are in scope)
+      no_hours_logged: noHours,
+    };
+  });
 
   const allowedSort = ['bench_pct', 'bench_hours', 'total_hours'];
   const sortBy = allowedSort.includes(query.sortBy) ? query.sortBy : 'bench_pct';

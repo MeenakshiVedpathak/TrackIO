@@ -12,6 +12,7 @@ const {
   Company,
   sequelize,
 } = require('../models');
+const { buLessServicePOInTenantSql } = require('../utils/servicePOTenantSql');
 
 /**
  * Timesheet Repository
@@ -350,7 +351,9 @@ const checkDuplicate = async (employeeId, poId, date, excludeId = null, companyI
     employee_id: employeeId,
     service_po_id: poId,
     timesheet_date: date,
-    company_id: companyId,
+    // No company_id filter (companyId is accepted but unused): the DB's unique index is on
+    // (employee, service PO, date) across ALL Business Units, and an employee's rows may be stamped with
+    // whichever BU synced them — a BU filter turned a duplicate into a raw constraint error instead of this check.
   };
 
   if (excludeId) {
@@ -453,6 +456,44 @@ const deleteByImportIds = async (importIds, transaction = null, companyId) => {
 };
 
 /**
+ * Timesheet attribution after the employee-wise "Sync Employee Work Logs"
+ * (timesheets.company_id = the SYNC BU; rows may sit on cross-BU / Centralised
+ * Service POs). Raw literals (bound to the "Timesheet" / "servicePO" aliases of
+ * the aggregate queries below), ids are parseInt-ed so they are safe to inline.
+ *   - employee-wise: the EMPLOYEE is mapped to the BU(s) — IN-subquery, a
+ *     multi-BU employee is never counted twice and not hidden because the sync
+ *     BU was a different one.
+ *   - SPO-wise: the Service PO belongs to the BU(s) (every employee's hours);
+ *     a Centralised/BU-less PO only counts rows stamped with the BU's own id.
+ */
+function scopeIdList(companyId) {
+  return [].concat(companyId === undefined || companyId === null ? [] : companyId)
+    .map((v) => parseInt(v, 10))
+    .filter((v) => Number.isInteger(v));
+}
+function employeeScopeLiteral(companyId) {
+  const ids = scopeIdList(companyId);
+  if (ids.length === 0) return literal('1 = 0');
+  const list = ids.join(',');
+  return literal(
+    '"Timesheet"."employee_id" IN (SELECT emp_scope.id FROM employees emp_scope ' +
+    'WHERE emp_scope.company_id IN (' + list + ') OR emp_scope.id IN (' +
+    'SELECT ebu_scope.employee_id FROM employee_business_units ebu_scope ' +
+    "WHERE ebu_scope.business_unit_id IN (" + list + ") AND ebu_scope.status = 'active'))"
+  );
+}
+function servicePOScopeLiteral(companyId) {
+  const ids = scopeIdList(companyId);
+  if (ids.length === 0) return literal('1 = 0');
+  const list = ids.join(',');
+  const tenant = buLessServicePOInTenantSql('"servicePO"', 'companyIds').split(':companyIds').join(list);
+  return literal(
+    '("servicePO"."company_id" IN (' + list + ') OR (' + tenant +
+    ' AND "Timesheet"."company_id" IN (' + list + ')))'
+  );
+}
+
+/**
  * Aggregate total hours grouped by employee for the given filters.
  *
  * @param {object} filters - { startDate, endDate, employeeId, poId }
@@ -461,7 +502,7 @@ const deleteByImportIds = async (importIds, transaction = null, companyId) => {
 const getSummaryByEmployee = async (filters = {}) => {
   const { startDate, endDate, employeeId, poId, companyId } = filters;
 
-  const where = { company_id: companyId };
+  const where = { [Op.and]: [employeeScopeLiteral(companyId)] };
   if (startDate) where.timesheet_date = { ...where.timesheet_date, [Op.gte]: startDate };
   if (endDate)   where.timesheet_date = { ...where.timesheet_date, [Op.lte]: endDate };
   if (employeeId) where.employee_id = parseInt(employeeId, 10);
@@ -504,7 +545,7 @@ const getSummaryByEmployee = async (filters = {}) => {
 const getSummaryByPO = async (filters = {}) => {
   const { startDate, endDate, employeeId, poId, companyId } = filters;
 
-  const where = { company_id: companyId };
+  const where = { [Op.and]: [servicePOScopeLiteral(companyId)] };
   if (startDate) where.timesheet_date = { ...where.timesheet_date, [Op.gte]: startDate };
   if (endDate)   where.timesheet_date = { ...where.timesheet_date, [Op.lte]: endDate };
   if (employeeId) where.employee_id = parseInt(employeeId, 10);
@@ -575,12 +616,16 @@ const getMonthlyHours = async (month, year, employeeId = null, excludeId = null,
       literal(`EXTRACT(MONTH FROM timesheet_date) = ${monthNum}`),
       literal(`EXTRACT(YEAR  FROM timesheet_date) = ${yearNum}`),
     ],
-    company_id: companyId,
   };
 
   if (employeeId) {
     where.employee_id = parseInt(employeeId, 10);
+  } else {
+    // Monthly total across all employees stays BU-wise (the sync BU).
+    where.company_id = companyId;
   }
+  // With an employee given the cap check sums ALL of that employee's rows of
+  // the month, whichever BU the (employee-wise) sync stamped them with.
   if (excludeId) {
     where.id = { [Op.ne]: parseInt(excludeId, 10) };
   }
@@ -663,17 +708,89 @@ const getImportIdsByMonth = async (month, year, transaction = null, companyId) =
  * @param {number} companyId
  * @returns {Promise<number>} number of deleted rows
  */
-const deleteByMonth = async (month, year, transaction = null, companyId) => {
+const deleteByMonth = async (month, year, transaction = null, companyId, { excludeEmployeeIds = [] } = {}) => {
   return Timesheet.destroy({
     where: {
       [Op.and]: [
         literal(`EXTRACT(MONTH FROM timesheet_date) = ${parseInt(month, 10)}`),
         literal(`EXTRACT(YEAR  FROM timesheet_date) = ${parseInt(year, 10)}`),
       ],
+      // Employees whose month is owned by ANOTHER sync (see findEmployeesSyncedElsewhere) keep their rows here.
+      ...(excludeEmployeeIds.length ? { employee_id: { [Op.notIn]: excludeEmployeeIds } } : {}),
       ...companyScope(companyId),
     },
     ...(transaction ? { transaction } : {}),
   });
+};
+
+/**
+ * Employees (of `employeeIds`) that already have timesheets for the month under a DIFFERENT
+ * Business Unit's sync/import than `companyId` — i.e. their month was already synced from another
+ * BU they are mapped to. Such an employee must be skipped by this sync (no duplicates; the
+ * (employee, PO, date) unique constraint would reject them anyway).
+ *
+ * `hasOwnRows` is true when the employee ALSO still has rows under `companyId` itself (a month
+ * synced the old BU-by-BU way): those rows must be preserved, not wiped by the full-replace.
+ *
+ * @returns {Promise<Array<{ employeeId, syncedCompanyId, syncedCompanyName, importId, hasOwnRows }>>}
+ */
+const findEmployeesSyncedElsewhere = async (employeeIds, month, year, companyId) => {
+  if (!employeeIds || employeeIds.length === 0) return [];
+  const replacements = { employeeIds, month: parseInt(month, 10), year: parseInt(year, 10), companyId };
+  const rows = await sequelize.query(
+    `SELECT o.employee_id,
+            o.company_id                AS synced_company_id,
+            c.company_name              AS synced_company_name,
+            o.timesheet_import_id       AS import_id,
+            EXISTS (
+              SELECT 1 FROM timesheets x
+               WHERE x.employee_id = o.employee_id
+                 AND EXTRACT(MONTH FROM x.timesheet_date) = :month
+                 AND EXTRACT(YEAR  FROM x.timesheet_date) = :year
+                 AND x.company_id = :companyId
+            )                           AS has_own_rows
+       FROM (
+         SELECT DISTINCT ON (t.employee_id) t.employee_id, t.company_id, t.timesheet_import_id
+           FROM timesheets t
+          WHERE t.employee_id IN (:employeeIds)
+            AND EXTRACT(MONTH FROM t.timesheet_date) = :month
+            AND EXTRACT(YEAR  FROM t.timesheet_date) = :year
+            AND t.company_id IS DISTINCT FROM :companyId
+          ORDER BY t.employee_id, t.company_id
+       ) o
+       LEFT JOIN companies c ON c.id = o.company_id`,
+    { replacements, type: sequelize.QueryTypes.SELECT }
+  );
+  return rows.map((r) => ({
+    employeeId: r.employee_id,
+    syncedCompanyId: r.synced_company_id,
+    syncedCompanyName: r.synced_company_name,
+    importId: r.import_id,
+    hasOwnRows: !!r.has_own_rows,
+  }));
+};
+
+/**
+ * Re-point the given Employees' timesheets of the month under `companyId` at a new import — used
+ * when a re-sync preserves rows it did not regenerate (see findEmployeesSyncedElsewhere.hasOwnRows).
+ */
+const reassignEmployeesToImport = async (employeeIds, month, year, companyId, importId, transaction = null) => {
+  if (!employeeIds || employeeIds.length === 0) return 0;
+  const [count] = await Timesheet.update(
+    { timesheet_import_id: importId },
+    {
+      where: {
+        employee_id: { [Op.in]: employeeIds },
+        [Op.and]: [
+          literal(`EXTRACT(MONTH FROM timesheet_date) = ${parseInt(month, 10)}`),
+          literal(`EXTRACT(YEAR  FROM timesheet_date) = ${parseInt(year, 10)}`),
+        ],
+        ...companyScope(companyId),
+      },
+      ...(transaction ? { transaction } : {}),
+    }
+  );
+  return count;
 };
 
 /**
@@ -724,6 +841,8 @@ module.exports = {
   bulkCreate,
   getImportIdsByMonth,
   deleteByMonth,
+  findEmployeesSyncedElsewhere,
+  reassignEmployeesToImport,
   update,
   publishByImportId,
   deleteById,

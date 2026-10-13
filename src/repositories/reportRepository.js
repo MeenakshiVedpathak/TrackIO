@@ -17,6 +17,43 @@ const monthlyCapService = require('../services/monthlyCapService');
 // figures). NULL original_hours on legacy rows falls back to hours_logged.
 const ORIGINAL_HOURS_SQL = 'COALESCE(t.original_hours, t.hours_logged)';
 
+// Hours on a Centralised Service PO (company_id NULL + is_centralised) are logged by employees of MANY
+// Business Units, but every BU admin of the tenant can see that PO. A BU's report must only count its OWN
+// BU's timesheets against it (employee of BU "Rohit" logs 10h Leave -> only Rohit's report shows them, not
+// MSD's). Any other PO keeps every row (cross-BU staffing on a BU's own PO is intentional).
+// Needs the timesheets alias `t` and the :companyIds replacement (the caller's BU scope).
+const CENTRALISED_HOURS_GUARD_SQL =
+  '(t.company_id IN (:companyIds) OR NOT EXISTS (SELECT 1 FROM service_pos spc WHERE spc.id = t.service_po_id AND spc.is_centralised = true))';
+
+// Sync Employee Work Logs is EMPLOYEE-WISE: a sync of BU X takes every employee MAPPED to X with ALL of their
+// logs of the month (cross-BU and Centralised Service POs included) and stamps timesheets.company_id with the
+// SYNC BU (older rows carry the Service PO's BU instead). So:
+//  - EMPLOYEE-WISE reports scope by "the employee is mapped to the selected BU(s)" and never by t.company_id /
+//    sp.company_id: this predicate (alias `t` = timesheets, needs :companyIds) is an EXISTS, so a multi-BU
+//    employee is neither duplicated nor dropped from the second BU's report.
+//  - SPO-WISE reports scope by "the Service PO belongs to the selected BU(s)" (+ the tenant's Centralised POs)
+//    and count every employee's hours on it; only a Centralised PO is narrowed to the scope's own BU share
+//    (CENTRALISED_HOURS_GUARD_SQL).
+//  - BU-WISE reports group hours by t.company_id (the sync BU) — see the managementReport/utilisationReport repos.
+const TIMESHEET_EMPLOYEE_IN_SCOPE_SQL = `EXISTS (
+  SELECT 1 FROM employees scope_e
+  WHERE scope_e.id = t.employee_id
+    AND (
+      scope_e.company_id IN (:companyIds)
+      OR EXISTS (
+        SELECT 1 FROM employee_business_units scope_ebu
+        WHERE scope_ebu.employee_id = scope_e.id
+          AND scope_ebu.business_unit_id IN (:companyIds)
+          AND scope_ebu.status = 'active'
+      )
+    )
+)`;
+
+// SPO-wise timesheet scope (aliases `t`, `sp`; needs :companyIds): the Service PO is the scope's own (or one of the
+// tenant's BU-less Centralised POs) and, for a Centralised PO, only the scope's own BU's timesheets count.
+const TIMESHEET_SERVICE_PO_IN_SCOPE_SQL =
+  `((sp.company_id IN (:companyIds) OR ${buLessServicePOInTenantSql('sp', 'companyIds')}) AND ${CENTRALISED_HOURS_GUARD_SQL})`;
+
 const formatMonthYear = (month, year) => (
   `${parseInt(year, 10)}-${String(parseInt(month, 10)).padStart(2, '0')}`
 );
@@ -70,6 +107,31 @@ const EMPLOYEE_COMPANY_SCOPE_SQL = `(
 // (not a shared rewrite of EMPLOYEE_COMPANY_SCOPE_SQL) because
 // getEmployeeHourlyRate/getEmployeeUtilizationSummary still bind a single
 // scalar :companyId and are NOT part of that conversion.
+// "Cross BU" flag for a Service PO row seen from an employee's side (Resource Project Utilization drawer).
+// The PO's BU is service_pos.company_id — the BU of whoever created the PO (a Centralised / BU-less PO has none,
+// so it is never cross-BU). The employee's own BUs are their active employee_business_units grants plus the
+// legacy employees.company_id. A BU counts as "the same" when it shares the root of the BU hierarchy (a Parent
+// BU and its Sub-BUs are one family), and an employee with no BU at all is never flagged. Needs aliases `e`
+// (employees) and `sp` (service_pos), both grouped by their primary key in the calling query.
+const IS_CROSS_BU_SQL = `CASE
+    WHEN sp.company_id IS NULL THEN false
+    WHEN NOT EXISTS (
+      SELECT 1 FROM employee_business_units xb WHERE xb.employee_id = e.id AND xb.status = 'active'
+    ) AND e.company_id IS NULL THEN false
+    ELSE NOT EXISTS (
+      SELECT 1
+        FROM (
+          SELECT xb.business_unit_id AS bu_id FROM employee_business_units xb
+           WHERE xb.employee_id = e.id AND xb.status = 'active'
+          UNION
+          SELECT e.company_id WHERE e.company_id IS NOT NULL
+        ) emp_bu
+        JOIN companies ec ON ec.id = emp_bu.bu_id
+        JOIN companies pc ON pc.id = sp.company_id
+       WHERE COALESCE(ec.parent_business_unit_id, ec.id) = COALESCE(pc.parent_business_unit_id, pc.id)
+    )
+  END`;
+
 const EMPLOYEE_COMPANY_SCOPE_SQL_MULTI = `(
   e.company_id IN (:companyIds)
   OR EXISTS (
@@ -350,7 +412,8 @@ async function getTimesheetSummary(filters) {
   const safeOrder = sortOrder.toUpperCase() === 'DESC' ? 'DESC' : 'ASC';
 
   const replacements = { limit, offset, companyIds: filters.companyIds };
-  const conditions = ['t.company_id IN (:companyIds)'];
+  // Employee-wise: the employee is mapped to the selected BU(s); ALL their rows show (cross-BU / Centralised too).
+  const conditions = [EMPLOYEE_COMPANY_SCOPE_SQL_MULTI];
 
   if (startDate) {
     conditions.push('t.timesheet_date >= :startDate');
@@ -538,7 +601,7 @@ async function getServicePOUtilisation(filters) {
     FROM service_pos sp
     INNER JOIN clients c       ON c.id  = sp.client_id
     INNER JOIN service_types st ON st.id = sp.service_type_id
-    LEFT  JOIN timesheets t    ON t.service_po_id = sp.id
+    LEFT  JOIN timesheets t    ON t.service_po_id = sp.id AND ${CENTRALISED_HOURS_GUARD_SQL}
     ${whereClause}
     GROUP BY sp.id, sp.service_po_code, sp.service_po_name, sp.status,
              sp.is_billable, sp.start_date, sp.end_date, sp.po_value,
@@ -663,7 +726,7 @@ async function getSubProjectHours(filters) {
     FROM sub_projects subp
     INNER JOIN service_pos sp ON sp.id = subp.service_po_id
     INNER JOIN clients c      ON c.id  = sp.client_id
-    LEFT  JOIN timesheets t   ON t.sub_project_id = subp.id
+    LEFT  JOIN timesheets t   ON t.sub_project_id = subp.id AND ${CENTRALISED_HOURS_GUARD_SQL}
     ${whereClause}
     GROUP BY subp.id, subp.sub_project_code, subp.sub_project_name,
              subp.description, subp.status, subp.start_date, subp.end_date,
@@ -1416,6 +1479,7 @@ async function getServicePOSummary(filters) {
              SUM(${ORIGINAL_HOURS_SQL}) AS original_hours_delivered
       FROM timesheets t
       WHERE timesheet_date < MAKE_DATE(:yearNum, :monthNum, 1)
+        AND ${CENTRALISED_HOURS_GUARD_SQL}
         ${publishGuard}
       GROUP BY service_po_id
     ) prev ON prev.service_po_id = sp.id
@@ -1429,6 +1493,7 @@ async function getServicePOSummary(filters) {
             AND mc.month_year  = :monthYear
       WHERE EXTRACT(MONTH FROM t.timesheet_date) = :monthNum
         AND EXTRACT(YEAR  FROM t.timesheet_date) = :yearNum
+        AND ${CENTRALISED_HOURS_GUARD_SQL}
         ${publishGuard}
       GROUP BY t.service_po_id
     ) curr ON curr.service_po_id = sp.id
@@ -1663,6 +1728,7 @@ async function getInvoicePOSummary(filters) {
              SUM(${ORIGINAL_HOURS_SQL}) AS original_hours_delivered
       FROM timesheets t
       WHERE timesheet_date < MAKE_DATE(:yearNum, :monthNum, 1)
+        AND ${CENTRALISED_HOURS_GUARD_SQL}
         ${publishGuard}
       GROUP BY service_po_id
     ) prev ON prev.service_po_id = sp.id
@@ -1678,6 +1744,7 @@ async function getInvoicePOSummary(filters) {
             AND mc.month_year  = :monthYear
       WHERE EXTRACT(MONTH FROM t.timesheet_date) = :monthNum
         AND EXTRACT(YEAR  FROM t.timesheet_date) = :yearNum
+        AND ${CENTRALISED_HOURS_GUARD_SQL}
         ${publishGuard}
       GROUP BY t.service_po_id
     ) curr ON curr.service_po_id = sp.id
@@ -1776,7 +1843,7 @@ async function getResourceUtilization(filters) {
     JOIN service_categories sc ON sc.id  = st.service_category_id AND sc.is_deleted = false
     WHERE EXTRACT(MONTH FROM t.timesheet_date) = :month
       AND EXTRACT(YEAR  FROM t.timesheet_date) = :year
-      AND t.company_id IN (:companyIds)
+      AND ${TIMESHEET_EMPLOYEE_IN_SCOPE_SQL}
       ${publishGuard}
     ORDER BY sc.name, st.service_type_name
   `;
@@ -1791,7 +1858,7 @@ async function getResourceUtilization(filters) {
     JOIN service_categories sc ON sc.id = st.service_category_id AND sc.is_deleted = false
     WHERE EXTRACT(MONTH FROM t.timesheet_date) = :month
       AND EXTRACT(YEAR  FROM t.timesheet_date) = :year
-      AND t.company_id IN (:companyIds)
+      AND ${TIMESHEET_EMPLOYEE_IN_SCOPE_SQL}
       ${empFilter}
       ${publishGuard}
   `;
@@ -1807,7 +1874,7 @@ async function getResourceUtilization(filters) {
       JOIN service_categories sc ON sc.id = st.service_category_id AND sc.is_deleted = false
       WHERE EXTRACT(MONTH FROM t.timesheet_date) = :month
         AND EXTRACT(YEAR  FROM t.timesheet_date) = :year
-        AND t.company_id IN (:companyIds)
+        AND ${TIMESHEET_EMPLOYEE_IN_SCOPE_SQL}
         ${empFilter}
         ${publishGuard}
       ORDER BY e.full_name
@@ -1832,7 +1899,7 @@ async function getResourceUtilization(filters) {
     JOIN emp_page ep           ON ep.employee_id = e.id
     WHERE EXTRACT(MONTH FROM t.timesheet_date) = :month
       AND EXTRACT(YEAR  FROM t.timesheet_date) = :year
-      AND t.company_id IN (:companyIds)
+      AND ${TIMESHEET_EMPLOYEE_IN_SCOPE_SQL}
       ${publishGuard}
     GROUP BY e.id, e.employee_code, e.full_name, e.designation, st.id, st.service_type_name, sc.id, sc.name
     ORDER BY e.full_name, sc.name, st.service_type_name
@@ -1896,7 +1963,7 @@ async function getMonthlyResourceUtilization(filters) {
   const conditions = [
     "EXTRACT(MONTH FROM t.timesheet_date) = :month",
     "EXTRACT(YEAR  FROM t.timesheet_date) = :year",
-    "t.company_id IN (:companyIds)",
+    TIMESHEET_EMPLOYEE_IN_SCOPE_SQL,
     "e.is_deleted = false",
     "e.status = 'active'",
     "sp.is_deleted = false",
@@ -2116,7 +2183,7 @@ async function getResourceMonthlyUtilization(filters) {
   const conditions = [
     "EXTRACT(MONTH FROM t.timesheet_date) = :month",
     "EXTRACT(YEAR  FROM t.timesheet_date) = :year",
-    "t.company_id IN (:companyIds)",
+    TIMESHEET_EMPLOYEE_IN_SCOPE_SQL,
     "e.is_deleted = false",
     "e.status = 'active'",
     "sp.is_deleted = false",
@@ -2382,7 +2449,7 @@ async function getResourseProjectUtilizationReport(filters) {
   const monthYearBlock = `
     AND EXTRACT(MONTH FROM t.timesheet_date) = :month
     AND EXTRACT(YEAR FROM t.timesheet_date) = :year
-    AND t.company_id IN (:companyIds)
+    AND ${TIMESHEET_EMPLOYEE_IN_SCOPE_SQL}
     ${publishGuard}
   `;
 
@@ -2448,6 +2515,7 @@ async function getResourseProjectUtilizationReport(filters) {
       subp.sub_project_name AS project_sub_type,
       sc.name AS category,
       c.client_name AS client,
+      ${IS_CROSS_BU_SQL} AS is_cross_bu,
       ROUND(SUM(${hoursCol})::numeric, 2) AS project_hours,
       ROUND(SUM(${ORIGINAL_HOURS_SQL})::numeric, 2) AS original_project_hours
     FROM timesheets t
@@ -2471,9 +2539,11 @@ async function getResourseProjectUtilizationReport(filters) {
     GROUP BY
       e.id,
       e.full_name,
+      e.company_id,
       sp.id,
       sp.service_po_name,
       sp.is_billable,
+      sp.company_id,
       st.service_type_name,
       subp.sub_project_name,
       sc.name,
@@ -2563,8 +2633,10 @@ async function getClientServicePOHours(filters) {
     : 'COALESCE(t.modified_hours, t.hours_logged)';
 
   const replacements = { companyIds, startDate, endDate };
+  // SPO-wise: the Service PO belongs to the selected BU(s) (or is the tenant's Centralised PO, then only the
+  // scope's own BU share counts); every employee's hours on it are summed, cross-BU employees included.
   const conditions = [
-    't.company_id IN (:companyIds)',
+    TIMESHEET_SERVICE_PO_IN_SCOPE_SQL,
     't.timesheet_date >= :startDate',
     't.timesheet_date <= :endDate',
   ];
@@ -2647,7 +2719,7 @@ function periodKey(dateStr) {
  * @param {object} replacements - mutated in place with the bind values this clause needs
  * @returns {string} SQL WHERE clause (without the WHERE keyword)
  */
-function buildTrendFilters(filters, replacements) {
+function buildTrendFilters(filters, replacements, scopeMode = 'employee') {
   const { companyIds, startDate, endDate, employeeId, clientId, poId, serviceTypeId, roleId } = filters;
   const conditions = [
     // An empty companyIds array is a legitimate value (every entityIds/
@@ -2657,7 +2729,9 @@ function buildTrendFilters(filters, replacements) {
     // turns an empty array into a literal `IN ()`, a Postgres syntax error
     // (see isEmptyCompanyScope()'s own doc comment). '1=0' safely matches
     // nothing instead.
-    isEmptyCompanyScope(companyIds) ? '1=0' : 't.company_id IN (:companyIds)',
+    // 'employee' (default): employee-wise — the employee is mapped to the selected BU(s), all their rows count.
+    // 'po': SPO-wise — the Service PO belongs to the selected BU(s) (needs the `sp` alias in the caller's FROM).
+    isEmptyCompanyScope(companyIds) ? '1=0' : (scopeMode === 'po' ? TIMESHEET_SERVICE_PO_IN_SCOPE_SQL : TIMESHEET_EMPLOYEE_IN_SCOPE_SQL),
     't.timesheet_date >= :startDate',
     't.timesheet_date <= :endDate',
   ];
@@ -2714,6 +2788,8 @@ async function getClientCostAnalyticsHours(filters) {
   // own company_id while cost used the PO's, so a BU / Sub-BU filter could split them apart).
   const replacements = { companyIds };
   const conditions = ['(sp.company_id IN (:companyIds) OR ' + buLessServicePOInTenantSql('sp', 'companyIds') + ')'];
+  // A Centralised PO is in scope for the whole tenant, but only THIS scope's BUs' hours count against it.
+  conditions.push(CENTRALISED_HOURS_GUARD_SQL);
   if (startDate && endDate) {
     conditions.push('t.timesheet_date >= :startDate AND t.timesheet_date <= :endDate');
     replacements.startDate = startDate;
@@ -2826,7 +2902,7 @@ async function getClientCategoryCostMatrixReport(filters) {
  */
 async function getClientWiseAnalyticsHours(filters) {
   const replacements = {};
-  const whereClause = buildTrendFilters(filters, replacements);
+  const whereClause = buildTrendFilters(filters, replacements, 'po');
   const hoursCol = (filters.hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
 
   return sequelize.query(
@@ -3136,7 +3212,7 @@ async function getResourceUtilizationTrend(filters) {
  */
 async function getServicePOHoursTrend(filters) {
   const replacements = {};
-  const whereClause = buildTrendFilters(filters, replacements);
+  const whereClause = buildTrendFilters(filters, replacements, 'po');
   const hoursCol = (filters.hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
 
   return sequelize.query(
@@ -3249,6 +3325,37 @@ async function getEmployeeBenchDetailReport(filters) {
 }
 
 /**
+ * Employee Bench Percentage — the roster side: every active employee mapped to the selected BU(s), so
+ * the report can list people who logged NO hours at all in the period. getEmployeeBenchDetailReport()
+ * is driven by timesheets, so such an employee never appears in it — yet an employee with nothing
+ * logged is exactly who a bench report is meant to surface.
+ *
+ * A client / Service PO filter means "people who worked on that client/PO", so no roster is returned
+ * then (adding unrelated zero-hour employees would be noise). An employeeId filter still applies.
+ *
+ * @param {object} filters - { companyIds, employeeId, clientId, poId }
+ * @returns {Promise<Array<{ employee_id, employee_code, full_name }>>}
+ */
+async function getEmployeeBenchRoster(filters) {
+  const { companyIds, employeeId, clientId, poId } = filters;
+  if (isEmptyCompanyScope(companyIds) || clientId || poId) return [];
+
+  const replacements = { companyIds };
+  const conditions = ["e.status = 'active'", 'e.is_deleted = false', EMPLOYEE_COMPANY_SCOPE_SQL_MULTI];
+  if (employeeId) {
+    conditions.push('e.id = :employeeId');
+    replacements.employeeId = employeeId;
+  }
+
+  return sequelize.query(
+    `SELECT e.id AS employee_id, e.employee_code, e.full_name
+       FROM employees e
+      WHERE ${conditions.join(' AND ')}`,
+    { replacements, type: QueryTypes.SELECT }
+  );
+}
+
+/**
  * Budget vs Billed Report — Budget Cost (cost_budget_master.invoice_amount)
  * vs Actual Billed Amount (service_po_monthly_budgets.billed_amount), one
  * row per (service_po_id, month, year) present in EITHER table for the
@@ -3338,6 +3445,7 @@ module.exports = {
   getLeaveHoursTrendReport,
   getNoWorkTrendReport,
   getEmployeeBenchDetailReport,
+  getEmployeeBenchRoster,
   getBudgetVsBilled,
   getResourseProjectUtilizationReport,
   getClientServicePOHours,

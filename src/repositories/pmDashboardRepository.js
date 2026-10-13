@@ -541,6 +541,9 @@ async function getAtRiskProjectCount({ companyIds, monthNum, yearNum, asOfDate, 
        FROM timesheets t
        WHERE EXTRACT(MONTH FROM t.timesheet_date) = :monthNum AND EXTRACT(YEAR FROM t.timesheet_date) = :yearNum
          AND t.service_po_id IN (SELECT id FROM po_scope)
+         -- SPO-wise: every employee's hours on the PO (cross-BU employees included, so no
+         -- t.company_id filter); a Centralised/BU-less PO only counts this scope's own BU share.
+         AND (t.company_id IN (:companyIds) OR NOT EXISTS (SELECT 1 FROM service_pos spc WHERE spc.id = t.service_po_id AND spc.company_id IS NULL))
        GROUP BY t.service_po_id
      ),
      flagged AS (

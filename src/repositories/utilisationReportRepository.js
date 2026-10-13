@@ -27,11 +27,23 @@ const EXCLUDED_PO_SQL = `(
   OR st.service_type_name ILIKE '%leave%'
 )`;
 
+// Non-Billable = the BU's own non-billable POs PLUS Centralised non-billable POs (Leaves, On Bench, ...),
+// even though those are in EXCLUDED_PO_SQL; Billable/Customer Non-Billable still exclude them.
 const CAT_BILLABLE_SQL = `LOWER(TRIM(sc.name)) = 'billable'`;
 const CAT_CUSTOMER_NB_SQL = `LOWER(TRIM(sc.name)) = 'customer non-billable'`;
 const CAT_NON_BILLABLE_SQL = `LOWER(TRIM(sc.name)) = 'non-billable'`;
 
 const isEmptyScope = (ids) => !ids || ids.length === 0;
+
+// "The employee (alias e) is mapped to one of :companyIds" — employee_business_units or the legacy
+// employees.company_id. An EXISTS so a multi-BU employee is never multiplied.
+const EMPLOYEE_BU_SCOPE_SQL = `(
+  e.company_id IN (:companyIds)
+  OR EXISTS (
+    SELECT 1 FROM employee_business_units sebu
+    WHERE sebu.employee_id = e.id AND sebu.business_unit_id IN (:companyIds) AND sebu.status = 'active'
+  )
+)`;
 
 // What the employee actually logged (before the monthly-cap adjustment) — independent of hoursSource.
 const ORIGINAL_HOURS_SQL = 'COALESCE(t.original_hours, t.hours_logged)';
@@ -181,10 +193,10 @@ async function getBuWiseUtilisation(f) {
         t.company_id AS bu_id,
         COALESCE(SUM(CASE WHEN NOT ${EXCLUDED_PO_SQL} AND ${CAT_BILLABLE_SQL} THEN ${hoursCol} ELSE 0 END), 0) AS billable_hours,
         COALESCE(SUM(CASE WHEN NOT ${EXCLUDED_PO_SQL} AND ${CAT_CUSTOMER_NB_SQL} THEN ${hoursCol} ELSE 0 END), 0) AS customer_non_billable_hours,
-        COALESCE(SUM(CASE WHEN NOT ${EXCLUDED_PO_SQL} AND ${CAT_NON_BILLABLE_SQL} THEN ${hoursCol} ELSE 0 END), 0) AS non_billable_hours,
+        COALESCE(SUM(CASE WHEN (NOT ${EXCLUDED_PO_SQL} OR sp.is_centralised = true) AND ${CAT_NON_BILLABLE_SQL} THEN ${hoursCol} ELSE 0 END), 0) AS non_billable_hours,
         COALESCE(SUM(CASE WHEN NOT ${EXCLUDED_PO_SQL} AND ${CAT_BILLABLE_SQL} THEN ${ORIGINAL_HOURS_SQL} ELSE 0 END), 0) AS original_billable_hours,
         COALESCE(SUM(CASE WHEN NOT ${EXCLUDED_PO_SQL} AND ${CAT_CUSTOMER_NB_SQL} THEN ${ORIGINAL_HOURS_SQL} ELSE 0 END), 0) AS original_customer_non_billable_hours,
-        COALESCE(SUM(CASE WHEN NOT ${EXCLUDED_PO_SQL} AND ${CAT_NON_BILLABLE_SQL} THEN ${ORIGINAL_HOURS_SQL} ELSE 0 END), 0) AS original_non_billable_hours
+        COALESCE(SUM(CASE WHEN (NOT ${EXCLUDED_PO_SQL} OR sp.is_centralised = true) AND ${CAT_NON_BILLABLE_SQL} THEN ${ORIGINAL_HOURS_SQL} ELSE 0 END), 0) AS original_non_billable_hours
       FROM timesheets t
       JOIN employees e           ON e.id  = t.employee_id
       JOIN service_pos sp        ON sp.id = t.service_po_id
@@ -283,7 +295,10 @@ async function getEmployeeProjectUtilisation(f) {
   // Scope shared by both the per-employee totals and the detail rows.
   const scope = [
     't.timesheet_date BETWEEN :startDate AND :endDate',
-    't.company_id IN (:companyIds)',
+    // EMPLOYEE-wise: the EMPLOYEE is mapped to the selected BU/Sub-BU (EXISTS, never a JOIN, so a multi-BU
+    // employee is counted once). NOT t.company_id (= the employee's SYNC BU) nor sp.company_id, so every row of
+    // the employee — cross-BU and Centralised Service POs included — shows, also under their other mapped BUs.
+    EMPLOYEE_BU_SCOPE_SQL,
     'e.is_deleted = false',
     "e.status = 'active'",
     'sp.is_deleted = false',

@@ -26,6 +26,11 @@ function handleError(next, err, context) {
   next(err);
 }
 
+// Who did what, for the sync / delete trail (console + log file). One line per request, always with the actor and BU.
+function actorOf(req) {
+  return { userId: req.userId, employeeId: req.employeeId || null, role: req.userRoleName || null, ip: getIpAddress(req) };
+}
+
 // ── Import Handlers ───────────────────────────────────────────────────────────
 
 /**
@@ -99,17 +104,32 @@ const syncEmployeeWorkLogs = async (req, res, next) => {
       return sendError(res, 'year is required and must be 2000 or later.', 422);
     }
 
+    logger.info('[SYNC] request received', { ...actorOf(req), businessUnitId: req.companyId, month, year });
     const result = await timesheetService.previewPmsImport(month, year, userId, req.companyId);
+    const ctx = result.syncContext || {};
+    logger.info(`[${ctx.mode || 'SYNC'}] preview OK`, {
+      ...actorOf(req), businessUnitId: req.companyId, businessUnitName: ctx.businessUnitName,
+      parentBusinessUnitId: ctx.parentBusinessUnitId, isSubBusinessUnit: ctx.isSubBusinessUnit,
+      month, year, importId: result.importId, validRows: result.validRows, errorRows: result.errorRows,
+      skippedEmployees: result.skippedCount, willReplaceImportIds: ctx.previousImportIds,
+    });
+
+    // Employees already synced from another Business Unit they are mapped to are skipped (never duplicated);
+    // say so explicitly — the full list (name, code, BU) is in result.skippedEmployees.
+    const skippedNote = result.skippedCount > 0
+      ? ` ${result.skippedCount} employee(s) already synced from another Business Unit were skipped.`
+      : '';
 
     return sendSuccess(
       res,
       result,
-      result.canConfirm
+      (result.canConfirm
         ? `Sync preview ready. ${result.validRows} valid row(s), ${result.errorRows} error(s). Call POST /confirm/${result.importId} to import.`
-        : `No pending employee work log entries found for this month. ${result.errorRows} error(s).`,
+        : `No pending employee work log entries found for this month. ${result.errorRows} error(s).`) + skippedNote,
       200
     );
   } catch (err) {
+    logger.warn('[SYNC] preview REJECTED', { ...actorOf(req), businessUnitId: req.companyId, month: req.body && req.body.month, year: req.body && req.body.year, statusCode: err.statusCode || 500, reason: err.message });
     return handleError(next, err, 'syncEmployeeWorkLogs');
   }
 };
@@ -127,12 +147,20 @@ const confirm = async (req, res, next) => {
       return sendError(res, 'Invalid importId parameter.', 400);
     }
 
+    logger.info('[CONFIRM] request received', { ...actorOf(req), businessUnitId: req.companyId, importId });
     const result = await timesheetService.confirmImport(
       importId,
       req.userId,
       getIpAddress(req),
       req.companyId
     );
+    const ctx = result.syncContext || {};
+    logger.info(`[${ctx.mode || 'IMPORT'}] confirm SUCCESS`, {
+      ...actorOf(req), businessUnitId: req.companyId, businessUnitName: ctx.businessUnitName,
+      parentBusinessUnitId: ctx.parentBusinessUnitId, isSubBusinessUnit: ctx.isSubBusinessUnit,
+      importId, status: result.status, insertedRows: result.insertedRows, errorRows: result.errorRows,
+      replacedRows: ctx.replacedRows, reopenedWorkLogs: ctx.reopenedWorkLogs, previousImportIds: ctx.previousImportIds,
+    });
 
     return sendSuccess(
       res,
@@ -141,6 +169,7 @@ const confirm = async (req, res, next) => {
       200
     );
   } catch (err) {
+    logger.warn('[CONFIRM] REJECTED / FAILED — nothing was changed', { ...actorOf(req), businessUnitId: req.companyId, importId: req.params.importId, statusCode: err.statusCode || 500, reason: err.message });
     return handleError(next, err, 'confirm');
   }
 };
@@ -479,7 +508,9 @@ const deleteTimesheet = async (req, res, next) => {
       employeeBusinessUnits: req.employeeBusinessUnits,
     });
 
+    const reason = (req.body && typeof req.body.reason === 'string' ? req.body.reason.trim() : '').slice(0, 500) || null;
     const deleted = await timesheetService.deleteTimesheet(id, fullReachCompanyIds);
+    logger.warn('[DELETE] single timesheet deleted', { ...actorOf(req), timesheetId: id, businessUnitId: deleted && deleted.company_id, employeeId_deleted: deleted && deleted.employee_id, date: deleted && deleted.timesheet_date, importId: deleted && deleted.timesheet_import_id, reason: reason || 'not given' });
 
     // Records WHICH timesheet (employee, PO, date, hours) and the BU it belonged to.
     createAuditLog(
@@ -488,13 +519,14 @@ const deleteTimesheet = async (req, res, next) => {
       'timesheets',
       id,
       deleted,
-      null,
+      { reason: reason || 'MANUAL_SINGLE_DELETE', via: 'DELETE /timesheets/:id' },
       getIpAddress(req),
       { companyId: deleted && deleted.company_id }
     );
 
     return sendNoContent(res);
   } catch (err) {
+    logger.warn('[DELETE] single timesheet delete REJECTED', { ...actorOf(req), timesheetId: req.params.id, statusCode: err.statusCode || 500, reason: err.message });
     return handleError(next, err, 'deleteTimesheet');
   }
 };
@@ -545,7 +577,11 @@ const deleteImports = async (req, res, next) => {
       employeeBusinessUnits: req.employeeBusinessUnits,
     });
 
+    const reason = (req.body && typeof req.body.reason === 'string' ? req.body.reason.trim() : '').slice(0, 500) || null;
     const { deletedImports = [], ...result } = await timesheetService.deleteImports(ids, fullReachCompanyIds);
+    for (const sheet of deletedImports) {
+      logger.warn('[DELETE] monthly sheet deleted (Delete Monthly Sheet)', { ...actorOf(req), importId: sheet.import_id, businessUnitId: sheet.company_id, source: sheet.source, month: sheet.month, year: sheet.year, workLogsRevertedToApproved: result.revertedWorkLogs, reason: reason || 'not given' });
+    }
 
     // One audit row PER monthly sheet, so each one carries its own month, year, source and BU /
     // Sub-BU (a single batch can span several of them) and can be filtered by BU.
@@ -556,7 +592,7 @@ const deleteImports = async (req, res, next) => {
         'timesheet_import_history',
         sheet.import_id,
         sheet,
-        { deleted_in_batch: deletedImports.length, work_logs_reverted_to_approved: result.revertedWorkLogs },
+        { reason: reason || 'MANUAL_MONTHLY_SHEET_DELETE', via: 'DELETE /timesheets(/import)', deleted_in_batch: deletedImports.length, work_logs_reverted_to_approved: result.revertedWorkLogs },
         getIpAddress(req),
         { companyId: sheet.company_id }
       );
@@ -569,6 +605,7 @@ const deleteImports = async (req, res, next) => {
       200
     );
   } catch (err) {
+    logger.warn('[DELETE] monthly sheet delete REJECTED', { ...actorOf(req), importIds: req.body && (req.body.ids || req.body.id), statusCode: err.statusCode || 500, reason: err.message });
     return handleError(next, err, 'deleteImports');
   }
 };

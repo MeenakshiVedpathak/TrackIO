@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Raw-SQL tenant boundary for a BU-less (company_id NULL) Service PO — in
+ * Raw-SQL tenant boundary for a BU-less (company_id NULL) CENTRALISED Service PO — in
  * practice an Admin-created Centralised PO (Leaves, On Bench, ...).
  *
  * Dashboard/report queries used to scope Service POs as
@@ -21,7 +21,7 @@
  */
 function buLessServicePOInTenantSql(alias, param = 'companyIds') {
   const col = alias ? `${alias}.` : '';
-  return `(${col}company_id IS NULL AND ${col}created_by IN (
+  return `(${col}company_id IS NULL AND ${col}is_centralised = true AND ${col}created_by IN (
       SELECT tenant_e.created_by FROM companies tenant_c
         JOIN entities tenant_e ON tenant_e.id = tenant_c.entity_id AND tenant_e.is_deleted = false
        WHERE tenant_c.id IN (:${param}) AND tenant_c.is_deleted = false AND tenant_e.created_by IS NOT NULL
