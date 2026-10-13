@@ -248,6 +248,10 @@ router.get(
  *         schema: { type: integer }
  *         description: Manager only — must be one of the caller's own mapped Employees; omit for the whole team
  *       - in: query
+ *         name: employee_ids
+ *         schema: { type: string, example: "12,45,78" }
+ *         description: Several employees at once (comma-separated ids). Every id must be one of the caller's own mapped Employees, else 403. Takes precedence over employee_id; omit both for the whole team
+ *       - in: query
  *         name: date
  *         schema: { type: string, format: date }
  *       - in: query

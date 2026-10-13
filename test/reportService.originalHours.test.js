@@ -118,11 +118,11 @@ test('getEmployeeBenchPercentage() adds original bench/total hours and original_
 
 test('getResourceUtilizationTrendReport() adds original_* hours and original_utilization_percentage', async () => {
   reportRepo.getResourceUtilizationTrend = async () => ([
-    { year: 2026, month: 8, employee_id: 1, employee_code: 'E1', full_name: 'A', total_hours: '160', billable_hours: '80', original_total_hours: '200', original_billable_hours: '150' },
+    { year: 2026, month: 8, employee_id: 1, employee_code: 'E1', full_name: 'A', total_hours: '160', billable_hours: '80', original_total_hours: '200', original_billable_hours: '150', cap_hours: '200' },
   ]);
   const { data } = await reportService.getResourceUtilizationTrendReport({ startDate: '2026-08-01', endDate: '2026-08-31' }, [1]);
   restore();
-  assert.equal(data[0].utilization_percentage, 50);
+  assert.equal(data[0].utilization_percentage, 40);
   assert.equal(data[0].original_total_hours, 200);
   assert.equal(data[0].original_utilization_percentage, 75);
 });

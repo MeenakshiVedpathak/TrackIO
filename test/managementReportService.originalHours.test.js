@@ -40,15 +40,16 @@ test('getProjectWiseUtilization summary: original pct is 0 when no available hou
 
 test('getResourceStaffingPlanAccuracy adds original_at_risk and original summary totals', async () => {
   const restore = stub('getResourceStaffingPlanAccuracy', async () => ({
-    rows: [{ planned_hours: 100, actual_hours: 100, variance_pct: 0, original_actual_hours: 140, original_variance_pct: 40 }],
+    rows: [{ planned_hours: 100, actual_hours: 100, variance_pct: 0, original_actual_hours: 60, original_variance_pct: -40 }],
     count: 1,
   }));
   try {
     const res = await service.getResourceStaffingPlanAccuracy({ month: '8', year: '2026' }, [1]);
     assert.equal(res.data[0].at_risk, false);
     assert.equal(res.data[0].original_at_risk, true);
-    assert.equal(res.summary.total_original_actual_hours, 140);
-    assert.equal(res.summary.total_original_variance_hours, 40);
+    assert.equal(res.data[0].original_over_plan, false);
+    assert.equal(res.summary.total_original_actual_hours, 60);
+    assert.equal(res.summary.total_original_variance_hours, -40);
   } finally { restore(); }
 });
 

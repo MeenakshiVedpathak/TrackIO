@@ -34,13 +34,16 @@ async function toExcelBuffer(rows, columns, title) {
  * every data cell in that column. An empty `rows` array still produces the
  * sheet with just its header, never omits it.
  *
- * @param {Array<{ name: string, columns: Array<{ key: string, label: string, width?: number, numFmt?: string }>, rows: object[] }>} sheets
+ * A sheet may also carry `mergeGroups` (see applyMergeGroups) to merge columns across consecutive rows
+ * of the same group.
+ *
+ * @param {Array<{ name: string, columns: Array<{ key: string, label: string, width?: number, numFmt?: string }>, rows: object[], mergeGroups?: object }>} sheets
  * @returns {Promise<Buffer>}
  */
 async function toMultiSheetExcelBuffer(sheets) {
   const workbook = new ExcelJS.Workbook();
 
-  sheets.forEach(({ name, columns, rows }) => {
+  sheets.forEach(({ name, columns, rows, mergeGroups }) => {
     const sheet = workbook.addWorksheet(name.substring(0, 31) || 'Sheet');
     sheet.columns = columns.map((c) => ({ header: c.label, key: c.key, width: c.width || 20 }));
     sheet.getRow(1).font = { bold: true };
@@ -57,9 +60,74 @@ async function toMultiSheetExcelBuffer(sheets) {
         excelRow.getCell(idx).numFmt = numFmt;
       });
     });
+
+    if (mergeGroups) applyMergeGroups(sheet, columns, rows, mergeGroups);
   });
 
   return workbook.xlsx.writeBuffer();
+}
+
+/**
+ * Merges the given columns vertically across each run of CONSECUTIVE data rows that share the same
+ * `by` value (e.g. every project row of one employee), mirroring a grouped table in the UI. Rows
+ * with no `by` value (such as a Total row) are never merged. A run of one row is left untouched.
+ * The merged cell keeps the value of its top-left cell, the rest of the range is cleared by ExcelJS.
+ *
+ * Row order is preserved as given — callers must already deliver the rows grouped.
+ *
+ * @param {object} sheet - ExcelJS worksheet (header in row 1, data from row 2)
+ * @param {Array<{ key: string }>} columns
+ * @param {object[]} rows - the same rows that were added to the sheet, in order
+ * @param {{ by: string, columns: string[], nameCell?: { nameKey: string, codeKey: string, name: string } }} mergeGroups
+ *   `nameCell`: for the merged column `nameCell.name`, write `<nameKey>` and, on a second muted line, `<codeKey>`.
+ */
+function applyMergeGroups(sheet, columns, rows, { by, columns: mergeKeys, nameCell }) {
+  const colIdx = (key) => columns.findIndex((c) => c.key === key) + 1;
+  const FIRST_DATA_ROW = 2;
+
+  // Employee name + code in one cell (code on a smaller, muted second line).
+  if (nameCell) {
+    const idx = colIdx(nameCell.name);
+    rows.forEach((row, i) => {
+      if (row[by] == null || idx < 1) return;
+      const cell = sheet.getRow(FIRST_DATA_ROW + i).getCell(idx);
+      const richText = [{ text: String(row[nameCell.nameKey] ?? '') }];
+      if (row[nameCell.codeKey]) {
+        richText.push({ text: `\n${row[nameCell.codeKey]}`, font: { size: 9, color: { argb: 'FF6B7280' } } });
+      }
+      cell.value = { richText };
+    });
+  }
+
+  let start = 0;
+  while (start < rows.length) {
+    const key = rows[start][by];
+    let end = start;
+    if (key != null) {
+      while (end + 1 < rows.length && rows[end + 1][by] === key) end += 1;
+    }
+    if (end > start) {
+      mergeKeys.forEach((mergeKey) => {
+        const idx = colIdx(mergeKey);
+        if (idx < 1) return;
+        sheet.mergeCells(FIRST_DATA_ROW + start, idx, FIRST_DATA_ROW + end, idx);
+      });
+    }
+    start = end + 1;
+  }
+
+  // Merged cells: centre vertically; the name column is left-aligned and wraps, the rest right-aligned.
+  rows.forEach((row, i) => {
+    if (row[by] == null) return;
+    mergeKeys.forEach((mergeKey) => {
+      const idx = colIdx(mergeKey);
+      if (idx < 1) return;
+      const isName = nameCell && mergeKey === nameCell.name;
+      sheet.getRow(FIRST_DATA_ROW + i).getCell(idx).alignment = isName
+        ? { vertical: 'middle', horizontal: 'left', wrapText: true }
+        : { vertical: 'middle', horizontal: 'right' };
+    });
+  });
 }
 
 /**

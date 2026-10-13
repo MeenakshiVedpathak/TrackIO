@@ -88,6 +88,10 @@ const projectHoursReportQuerySchema = Joi.object({
  */
 const timesheetApprovalStatusQuerySchema = Joi.object({
   employee_id: Joi.number().integer().positive().optional(),
+  // Comma-separated positive ids, e.g. "12,45,78" — several employees at once.
+  employee_ids: Joi.string().pattern(/^\s*[1-9]\d*(\s*,\s*[1-9]\d*)*\s*$/).optional().messages({
+    'string.pattern.base': 'employee_ids must be a comma-separated list of employee ids, e.g. 12,45,78.',
+  }),
   date: Joi.date().iso().optional(),
   month: Joi.number().integer().min(1).max(12).optional(),
   year: Joi.number().integer().min(2000).optional(),

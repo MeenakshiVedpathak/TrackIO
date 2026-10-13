@@ -213,12 +213,27 @@ async function getResourceStaffingPlanAccuracy(query, companyIds) {
   // Same "at risk" formula the filter itself now applies in SQL (absolute
   // variance %, >= threshold) — kept here only to annotate each already-
   // filtered row for display, never to re-filter.
+  // At Risk = UNDER-delivery only (actual below plan by at least the threshold). Working far more
+  // than planned is not a delivery risk — it is flagged separately as over_plan so it stays
+  // visible without being labelled "At Risk".
+  const isUnder = (pct) => pct !== null && pct !== undefined && parseFloat(pct) <= -varianceThresholdPctForFlag;
+  const isOver = (pct) => pct !== null && pct !== undefined && parseFloat(pct) >= varianceThresholdPctForFlag;
+  // One label per row: at_risk | over_plan | no_plan (hours logged, nothing planned) | ok.
+  const statusOf = (pct, actual) => {
+    if (pct === null || pct === undefined) return (parseFloat(actual) || 0) > 0 ? 'no_plan' : 'ok';
+    if (isUnder(pct)) return 'at_risk';
+    if (isOver(pct)) return 'over_plan';
+    return 'ok';
+  };
   const enriched = rows.map((r) => ({
     ...r,
-    at_risk: r.variance_pct !== null && Math.abs(parseFloat(r.variance_pct)) >= varianceThresholdPctForFlag,
-    // Same flag against the ORIGINAL (un-scaled) actual hours — display only.
-    original_at_risk: r.original_variance_pct !== null && r.original_variance_pct !== undefined
-      && Math.abs(parseFloat(r.original_variance_pct)) >= varianceThresholdPctForFlag,
+    at_risk: isUnder(r.variance_pct),
+    over_plan: isOver(r.variance_pct),
+    status: statusOf(r.variance_pct, r.actual_hours),
+    // Same flags against the ORIGINAL (un-scaled) actual hours — what the Original view shows.
+    original_at_risk: isUnder(r.original_variance_pct),
+    original_over_plan: isOver(r.original_variance_pct),
+    original_status: statusOf(r.original_variance_pct, r.original_actual_hours),
   }));
 
   const meta = getPaginationMeta(count, page, limit);

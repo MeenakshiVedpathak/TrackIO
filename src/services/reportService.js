@@ -2011,6 +2011,9 @@ async function getResourceUtilizationTrendReport(query, companyIds) {
     const billableHours = parseFloat(row.billable_hours) || 0;
     const originalTotalHours = parseFloat(row.original_total_hours) || 0;
     const originalBillableHours = parseFloat(row.original_billable_hours) || 0;
+    // Utilization is measured against the month's cap (capacity), not against
+    // what the resource happened to log — 1h logged must not read as 100%.
+    const capHours = parseFloat(row.cap_hours) || 0;
     return {
       month: reportMonthLabel(row.year, row.month),
       year: row.year,
@@ -2020,10 +2023,11 @@ async function getResourceUtilizationTrendReport(query, companyIds) {
       full_name: row.full_name,
       total_hours: round2(totalHours),
       billable_hours: round2(billableHours),
-      utilization_percentage: totalHours > 0 ? round2((billableHours / totalHours) * 100) : 0,
+      cap_hours: round2(capHours),
+      utilization_percentage: capHours > 0 ? round2((billableHours / capHours) * 100) : 0,
       original_total_hours: round2(originalTotalHours),
       original_billable_hours: round2(originalBillableHours),
-      original_utilization_percentage: originalTotalHours > 0 ? round2((originalBillableHours / originalTotalHours) * 100) : 0,
+      original_utilization_percentage: capHours > 0 ? round2((originalBillableHours / capHours) * 100) : 0,
     };
   });
 

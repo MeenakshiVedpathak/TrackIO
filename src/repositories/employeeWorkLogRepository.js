@@ -1,6 +1,7 @@
 'use strict';
 
 const { Op, fn, col, literal, QueryTypes } = require('sequelize');
+const { sumHoursByMinuteSql } = require('../utils/hoursSum');
 const { sequelize, EmployeeWorkLog, Employee, ServicePO, SubProject, Project, ServicePOHierarchy, EmployeeWorkLogTimeEntry, Company, EmployeeBusinessUnit } = require('../models');
 
 /**
@@ -299,7 +300,7 @@ const getDailyHours = async (date, employeeId, excludeId = null, companyId) => {
   if (excludeId) where.id = { [Op.ne]: excludeId };
 
   const result = await EmployeeWorkLog.findOne({
-    attributes: [[fn('SUM', col('hours')), 'total_hours']],
+    attributes: [[literal(sumHoursByMinuteSql('"hours"')), 'total_hours']],
     where,
     raw: true,
   });
@@ -327,7 +328,7 @@ const getCalendarSummary = async ({ employeeId, month, year, companyId }) => {
   const rows = await EmployeeWorkLog.findAll({
     attributes: [
       'work_date',
-      [fn('SUM', col('hours')), 'total_hours'],
+      [literal(sumHoursByMinuteSql('"hours"')), 'total_hours'],
       [fn('COUNT', col('id')), 'entry_count'],
     ],
     where: {
@@ -448,7 +449,7 @@ const getHierarchyBreakdownForRange = async ({ employeeId, startDate, endDate })
     attributes: [
       'service_po_id',
       'hierarchy_node_id',
-      [fn('SUM', col('hours')), 'total_hours'],
+      [literal(sumHoursByMinuteSql('"hours"')), 'total_hours'],
       // Unlike the daily/monthly breakdowns above, a range CAN legitimately
       // span more than one row per (service_po_id, hierarchy_node_id) — e.g.
       // several Daily entries against the same PO on different dates — in

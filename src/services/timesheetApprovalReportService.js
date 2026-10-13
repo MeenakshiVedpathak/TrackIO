@@ -120,11 +120,12 @@ function resolvePeriod(query) {
  *
  * @param {number} userId - req.userId (authenticated caller)
  * @param {number|null} ownEmployeeId - req.employeeId (may be null)
- * @param {number|undefined} requestedEmployeeId - query.employee_id, honored only within the caller's own scope
+ * @param {number|number[]|undefined} requestedEmployeeIds - query.employee_id (one id) or query.employee_ids
+ *   (several), honored only within the caller's own scope; every requested id must be in scope
  * @param {number} companyId
  * @returns {Promise<number[]>} employee ids in scope
  */
-async function resolveEmployeeScope(userId, ownEmployeeId, requestedEmployeeId, companyId) {
+async function resolveEmployeeScope(userId, ownEmployeeId, requestedEmployeeIds, companyId) {
   const managedMappings = await managerEmployeeMappingRepository.findByManager(userId, companyId);
   const managedEmployeeIds = managedMappings.map((m) => m.employee_id);
 
@@ -136,14 +137,16 @@ async function resolveEmployeeScope(userId, ownEmployeeId, requestedEmployeeId, 
     throw forbiddenError('This report requires a linked Employee account.');
   }
 
-  if (requestedEmployeeId) {
-    if (!scopeEmployeeIds.includes(requestedEmployeeId)) {
-      throw forbiddenError(`Employee #${requestedEmployeeId} is not mapped to you.`);
+  const requested = [...new Set([].concat(requestedEmployeeIds ?? []).filter(Boolean))];
+  if (requested.length > 0) {
+    const notMapped = requested.find((id) => !scopeEmployeeIds.includes(id));
+    if (notMapped !== undefined) {
+      throw forbiddenError(`Employee #${notMapped} is not mapped to you.`);
     }
-    return [requestedEmployeeId];
+    return requested;
   }
 
-  // No employee_id given -> everyone in scope: own record plus, if the
+  // No employee_id / employee_ids given -> everyone in scope: own record plus, if the
   // caller is also a Manager, their whole mapped team.
   return scopeEmployeeIds;
 }
@@ -259,14 +262,18 @@ function buildHierarchyTreeWithStatus(hierarchyRows, nodeDataByKey) {
  * @param {number} userId - req.userId (authenticated caller — for the manager-scope check)
  * @param {number|null} ownEmployeeId - req.employeeId
  * @param {number} companyId
- * @param {object} query - { employee_id?, date?, month?, year?, startDate?, endDate?, log_type? }
+ * @param {object} query - { employee_ids? (comma-separated), employee_id?, date?, month?, year?, startDate?, endDate?, log_type? }
  * @returns {Promise<{ data: object[] }>}
  */
 const getReport = async (userId, ownEmployeeId, companyId, query) => {
   const { startDate, endDate, logType } = resolvePeriod(query);
-  const requestedEmployeeId = query.employee_id ? parseInt(query.employee_id, 10) : undefined;
+  // employee_ids (comma-separated, several employees) wins over the legacy single employee_id; with
+  // neither, every employee in the caller's scope is returned.
+  const requestedEmployeeIds = query.employee_ids
+    ? String(query.employee_ids).split(',').map(Number).filter(Boolean)
+    : (query.employee_id ? [parseInt(query.employee_id, 10)] : undefined);
 
-  const employeeIds = await resolveEmployeeScope(userId, ownEmployeeId, requestedEmployeeId, companyId);
+  const employeeIds = await resolveEmployeeScope(userId, ownEmployeeId, requestedEmployeeIds, companyId);
 
   const rows = await employeeWorkLogRepository.findForApprovalSummaryByEmployees({
     employeeIds, startDate, endDate,

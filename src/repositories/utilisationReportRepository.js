@@ -351,8 +351,11 @@ async function getEmployeeProjectUtilisation(f) {
   const baseCte = `
     WITH emp_totals AS (
       SELECT t.employee_id,
-        SUM(${origCol}) AS total_logged,
-        SUM(${adjCol})  AS total_adjusted,
+        -- Utilisation % counts real work only: Leaves / Idle / On Bench rows are listed in the
+        -- project breakdown but never counted toward the employee's utilisation (same
+        -- exclusion as the BU-wise report).
+        SUM(CASE WHEN NOT ${EXCLUDED_PO_SQL} THEN ${origCol} ELSE 0 END) AS total_logged,
+        SUM(CASE WHEN NOT ${EXCLUDED_PO_SQL} THEN ${adjCol} ELSE 0 END)  AS total_adjusted,
         ${employeeRangeCapacitySql('t.employee_id')} AS capacity
       ${joins}
       WHERE ${scope.join(' AND ')}

@@ -3,7 +3,7 @@
 const { sequelize } = require('../models');
 const { QueryTypes } = require('sequelize');
 const { buLessServicePOInTenantSql } = require('../utils/servicePOTenantSql');
-const { capForMonthStartSql } = require('../utils/monthlyCapSql');
+const { capForMonthStartSql, timesheetCapSql } = require('../utils/monthlyCapSql');
 const monthlyCapService = require('../services/monthlyCapService');
 
 /**
@@ -3186,7 +3186,8 @@ async function getResourceUtilizationTrend(filters) {
        ROUND(SUM(${hoursCol})::NUMERIC, 2) AS total_hours,
        ROUND(COALESCE(SUM(CASE WHEN sc.report_bucket_key = 'billable' THEN ${hoursCol} END), 0)::NUMERIC, 2) AS billable_hours,
        ROUND(SUM(${ORIGINAL_HOURS_SQL})::NUMERIC, 2) AS original_total_hours,
-       ROUND(COALESCE(SUM(CASE WHEN sc.report_bucket_key = 'billable' THEN ${ORIGINAL_HOURS_SQL} END), 0)::NUMERIC, 2) AS original_billable_hours
+       ROUND(COALESCE(SUM(CASE WHEN sc.report_bucket_key = 'billable' THEN ${ORIGINAL_HOURS_SQL} END), 0)::NUMERIC, 2) AS original_billable_hours,
+       MAX(${timesheetCapSql('t')}) AS cap_hours
      FROM timesheets t
      INNER JOIN employees e      ON e.id  = t.employee_id
      INNER JOIN service_pos sp   ON sp.id = t.service_po_id

@@ -17,11 +17,11 @@ function restore() {
   reportRepo.getResourceUtilizationTrend = ORIGINAL.getResourceUtilizationTrend;
 }
 
-test('getResourceUtilizationTrendReport() computes Utilization % = (Billable Hours / Total Hours) * 100, rounded to 2 decimals, per Month + Resource — same formula as the existing Utilization Trend', async () => {
+test('getResourceUtilizationTrendReport() computes Utilization % = (Billable Hours / Cap Hours) * 100, rounded to 2 decimals, per Month + Resource', async () => {
   reportRepo.getResourceUtilizationTrend = async () => ([
-    { year: 2026, month: 8, employee_id: 1, employee_code: 'E1', full_name: 'Employee A', total_hours: '160.00', billable_hours: '120.00' },
-    { year: 2026, month: 8, employee_id: 2, employee_code: 'E2', full_name: 'Employee B', total_hours: '150.00', billable_hours: '90.00' },
-    { year: 2026, month: 9, employee_id: 1, employee_code: 'E1', full_name: 'Employee A', total_hours: '168.00', billable_hours: '126.00' },
+    { year: 2026, month: 8, employee_id: 1, employee_code: 'E1', full_name: 'Employee A', total_hours: '160.00', billable_hours: '120.00', cap_hours: '160' },
+    { year: 2026, month: 8, employee_id: 2, employee_code: 'E2', full_name: 'Employee B', total_hours: '150.00', billable_hours: '90.00', cap_hours: '150' },
+    { year: 2026, month: 9, employee_id: 1, employee_code: 'E1', full_name: 'Employee A', total_hours: '168.00', billable_hours: '126.00', cap_hours: '168' },
   ]);
 
   const { data } = await reportService.getResourceUtilizationTrendReport(
@@ -41,6 +41,18 @@ test('getResourceUtilizationTrendReport() computes Utilization % = (Billable Hou
   assert.equal(empB_Aug.utilization_percentage, 60);
 
   assert.equal(empA_Sep.utilization_percentage, 75);
+  restore();
+});
+
+test('getResourceUtilizationTrendReport() does not read 100% for a resource who logged only 1 billable hour — the divisor is the cap, not the logged total', async () => {
+  reportRepo.getResourceUtilizationTrend = async () => ([
+    { year: 2026, month: 9, employee_id: 1, employee_code: 'E1', full_name: 'Employee A', total_hours: '1.00', billable_hours: '1.00', original_total_hours: '1.00', original_billable_hours: '1.00', cap_hours: '168' },
+  ]);
+
+  const { data } = await reportService.getResourceUtilizationTrendReport({ month: 9, year: 2026 }, [1]);
+
+  assert.equal(data[0].utilization_percentage, 0.6);
+  assert.equal(data[0].original_utilization_percentage, 0.6);
   restore();
 });
 

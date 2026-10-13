@@ -26,8 +26,20 @@ const BU_COLUMNS = [
   { key: 'originalUtilizationPercentage', label: 'Original Utilisation %', width: 20, numFmt: PCT_FMT },
 ];
 
+// Employee Code is not its own column: it sits under the name in the (merged) Employee Name cell,
+// like the table in the UI.
+// Hours basis switch (?hoursSource): the API already puts the SELECTED basis in the normal fields (Original for
+// 'O', Adjusted otherwise), so the export carries only that one set of columns — never the other basis next to it.
+// The separate "Original ..." columns would only repeat the figures (for 'O') or add the basis that was not chosen.
+const NOT_BASIS_DEPENDENT = new Set(['buName', 'subBuName', 'totalEmployees', 'expectedHours']);
+const buColumnsFor = (query) => {
+  const basis = query.hoursSource === 'O' ? 'Original' : 'Adjusted';
+  return BU_COLUMNS
+    .filter((c) => !c.key.startsWith('original'))
+    .map((c) => (NOT_BASIS_DEPENDENT.has(c.key) ? c : { ...c, label: `${c.label} (${basis})` }));
+};
+
 const EMP_PROJECT_COLUMNS = [
-  { key: 'employeeCode', label: 'Employee Code', width: 16 },
   { key: 'employeeName', label: 'Employee Name', width: 28 },
   { key: 'projectName', label: 'Project Name', width: 32 },
   { key: 'clientName', label: 'Client', width: 24 },
@@ -42,17 +54,32 @@ const periodSuffix = (period) => (
 );
 
 /**
+ * Puts every row of the same `key` next to each other, keeping the order in which each key first
+ * appears (and the order of rows within it). A sort on e.g. Logged Hrs can interleave one
+ * employee's rows with another's, which would otherwise leave nothing consecutive to merge.
+ */
+const groupConsecutive = (rows, key) => {
+  const groups = new Map();
+  rows.forEach((r) => {
+    if (!groups.has(r[key])) groups.set(r[key], []);
+    groups.get(r[key]).push(r);
+  });
+  return [...groups.values()].flat();
+};
+
+/**
  * Shared handler: format=json (default) -> one page; format=excel -> every
  * row matching the same filters (page/limit ignored), with a Total row.
  */
-const handle = ({ label, fn, message, columns, sheetName, filePrefix, totalRow }) => async (req, res, next) => {
+const handle = ({ label, fn, message, columns, sheetName, filePrefix, totalRow, mergeGroups, groupRowsBy }) => async (req, res, next) => {
   try {
     const query = { ...req.body, ...req.query };
 
     if (query.format === 'excel') {
       const { data, summary, period } = await fn(query, req.companyIds, { exportAll: true });
-      const rows = [...data, totalRow(summary)];
-      const buffer = await toMultiSheetExcelBuffer([{ name: sheetName, columns, rows }]);
+      const rows = [...(groupRowsBy ? groupConsecutive(data, groupRowsBy) : data), totalRow(summary)];
+      const sheetColumns = typeof columns === 'function' ? columns(query) : columns;
+      const buffer = await toMultiSheetExcelBuffer([{ name: sheetName, columns: sheetColumns, rows, mergeGroups }]);
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       res.setHeader('Content-Disposition', `attachment; filename="${filePrefix}_${periodSuffix(period)}.xlsx"`);
       return res.send(Buffer.from(buffer));
@@ -72,7 +99,7 @@ const getBuWiseUtilisation = handle({
   label: 'getBuWiseUtilisation',
   fn: service.getBuWiseUtilisationReport,
   message: 'BU-wise utilisation report fetched successfully.',
-  columns: BU_COLUMNS,
+  columns: buColumnsFor,
   sheetName: 'BU-wise Utilisation',
   filePrefix: 'BU_wise_Utilisation',
   totalRow: (s) => ({
@@ -101,6 +128,14 @@ const getEmployeeProjectUtilisation = handle({
   columns: EMP_PROJECT_COLUMNS,
   sheetName: 'Employee Project Utilisation',
   filePrefix: 'Employee_Project_Utilisation',
+  // One employee = a block of consecutive project rows; their name and the two per-employee %
+  // columns are merged across the block (as in the UI). Project / client / hours stay per row.
+  groupRowsBy: 'employeeId',
+  mergeGroups: {
+    by: 'employeeId',
+    columns: ['employeeName', 'originalUtilizationPercentage', 'totalUtilizationPercentage'],
+    nameCell: { name: 'employeeName', nameKey: 'employeeName', codeKey: 'employeeCode' },
+  },
   // The % columns are per-employee totals — meaningless summed/averaged, so left blank.
   totalRow: (s) => ({
     employeeName: 'Total',

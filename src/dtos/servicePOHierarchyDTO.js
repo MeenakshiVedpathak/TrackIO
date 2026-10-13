@@ -1,5 +1,7 @@
 'use strict';
 
+const { sumHoursByMinute } = require('../utils/hoursSum');
+
 /**
  * Service PO Hierarchy DTOs
  * Shapes raw ServicePOHierarchy rows into the response shapes the API and
@@ -165,8 +167,11 @@ const toHierarchyTreeWithHours = (rows, dataByNodeId) => {
  * @param {Array<object>} nodes
  * @returns {number}
  */
-const sumHierarchyHours = (nodes) =>
-  nodes.reduce((sum, node) => sum + node.hours + (node.children ? sumHierarchyHours(node.children) : 0), 0);
+const collectHierarchyHours = (nodes) =>
+  nodes.flatMap((node) => [node.hours, ...(node.children ? collectHierarchyHours(node.children) : [])]);
+
+// Summed in whole minutes (see utils/hoursSum.js) so the total matches the values it is made of.
+const sumHierarchyHours = (nodes) => sumHoursByMinute(collectHierarchyHours(nodes));
 
 module.exports = {
   toNodeDTO,

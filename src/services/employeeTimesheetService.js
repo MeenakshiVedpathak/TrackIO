@@ -4,6 +4,7 @@ const { sequelize } = require('../models');
 const employeeWorkLogRepository = require('../repositories/employeeWorkLogRepository');
 const employeeWorkLogTimeEntryRepository = require('../repositories/employeeWorkLogTimeEntryRepository');
 const employeeRepository = require('../repositories/employeeRepository');
+const { sumHoursByMinute, toMinutes } = require('../utils/hoursSum');
 const timesheetService = require('./timesheetService');
 const employeeServicePOMappingRepository = require('../repositories/employeeServicePOMappingRepository');
 const servicePOHierarchyRepository = require('../repositories/servicePOHierarchyRepository');
@@ -1248,7 +1249,7 @@ const buildServicePOsForDate = (mappedPOs, hierarchyRowsByPOId, hoursByPOId) => 
       service_po_name: po.service_po_name,
       hours: round2(direct.hours),
       description: direct.description,
-      po_total_hrs: round2(direct.hours + hierarchyHours),
+      po_total_hrs: round2(sumHoursByMinute([direct.hours, hierarchyHours])),
       children,
     };
   });
@@ -1348,11 +1349,12 @@ const collapseRowsAcrossDates = (rows) => {
     const key = `${row.service_po_id}|${row.hierarchy_node_id || ''}`;
     const hours = parseFloat(row.total_hours) || 0;
     if (!totals.has(key)) {
-      totals.set(key, { service_po_id: row.service_po_id, hierarchy_node_id: row.hierarchy_node_id, total_hours: 0 });
+      totals.set(key, { service_po_id: row.service_po_id, hierarchy_node_id: row.hierarchy_node_id, total_hours: 0, minutes: 0 });
     }
-    totals.get(key).total_hours += hours;
+    // Added in whole minutes (utils/hoursSum.js) so a month of 0.33h (20 min) entries adds up exactly.
+    totals.get(key).minutes += toMinutes(hours);
   }
-  return Array.from(totals.values());
+  return Array.from(totals.values()).map(({ minutes, ...rest }) => ({ ...rest, total_hours: minutes / 60 }));
 };
 
 /**
@@ -1397,7 +1399,7 @@ const getMonthlySummaryByServicePO = async (employeeId, month, year, companyId) 
     }))
     .filter((po) => po.hours > 0);
 
-  const total_hours = round2(service_pos.reduce((sum, po) => sum + po.hours, 0));
+  const total_hours = round2(sumHoursByMinute(service_pos.map((po) => po.hours)));
 
   return { service_pos, total_hours };
 };
