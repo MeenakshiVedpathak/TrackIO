@@ -20,7 +20,7 @@ const dashboardService = require('../src/services/dashboardService');
 const REPO_FN_NAMES = [
   'getAnalyticsTiles', 'getAnalyticsMonthlyTrend', 'getAnalyticsHoursByClient',
   'getAnalyticsHoursByEmployee', 'getAnalyticsClientByPO', 'getAnalyticsBenchDetail',
-  'getTotalEmployees', 'getActiveEmployees', 'getTotalClients', 'getActivePOs',
+  'getTotalEmployees', 'getActiveEmployees', 'getBuMappedActiveEmployees', 'getTotalClients', 'getActivePOs',
   'getClosedPOs', 'getTotalBudgetCost', 'getEmployeeCountByCategoryForPeriod',
   'getTopPOsByHoursForPeriod', 'getRecentTimesheetActivityForPeriod',
   'getEmployeesByPOForPeriod', 'getEmployeeBillableBreakdownForPeriod',
@@ -49,6 +49,24 @@ test('getAnalyticsDashboard: businessUnitIds narrows companyId (array) before an
   try {
     await dashboardService.getAnalyticsDashboard({ businessUnitIds: '2,999' }, [1, 2, 3]);
     assert.deepEqual(receivedCompanyId, [2]);
+  } finally {
+    restore();
+  }
+});
+
+test('getAnalyticsDashboard: the Employees KPI counts only active, BU-mapped employees (Sub-BU-mapped where the BU has Sub-BUs)', async () => {
+  stubAllRepoCalls({
+    getTotalEmployees: async () => 354, // everyone in scope, inactive included
+    getActiveEmployees: async () => 351,
+    getBuMappedActiveEmployees: async () => 178, // the rule
+  });
+
+  try {
+    const { workforce } = await dashboardService.getAnalyticsDashboard({}, [1]);
+    assert.equal(workforce.total_employees, 178);
+    assert.equal(workforce.active_employees, 178);
+    assert.equal(workforce.active_employees_not_counted, 351 - 178);
+    assert.equal(workforce.inactive_employees, 354 - 351);
   } finally {
     restore();
   }

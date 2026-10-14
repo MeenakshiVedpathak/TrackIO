@@ -33,6 +33,9 @@ const CAT_BILLABLE_SQL = `LOWER(TRIM(sc.name)) = 'billable'`;
 const CAT_CUSTOMER_NB_SQL = `LOWER(TRIM(sc.name)) = 'customer non-billable'`;
 const CAT_NON_BILLABLE_SQL = `LOWER(TRIM(sc.name)) = 'non-billable'`;
 
+// "this BU family has no Sub-BU in scope" — fam is the family CTE built per query.
+const NO_SUB_BUS_SQL = (rootExpr) => `NOT EXISTS (SELECT 1 FROM fam fx WHERE fx.root_id = ${rootExpr} AND fx.member_id <> fx.root_id)`;
+
 const isEmptyScope = (ids) => !ids || ids.length === 0;
 
 // "The employee (alias e) is mapped to one of :companyIds" — employee_business_units or the legacy
@@ -103,6 +106,9 @@ const ORDERABLE_EMP_PROJECT = {
  * @param {number[]} [f.serviceTypeIds]
  * @param {string} [f.search]            BU name
  * @param {string} [f.hoursSource]
+ * @param {'bu'|'partition'} [f.groupBy] 'bu' rolls each BU's Sub-BUs up into one row; 'partition' = the Sub-BU
+ *   breakdown of those BU families with every employee in exactly one node; otherwise one row per BU / Sub-BU (company)
+ * @param {number[]} [f.rootIds] restrict the one-row-per-company layout to these BU families
  * @param {string|number} [f.roleId]
  * @param {string} [f.sortBy]
  * @param {string} [f.sortOrder]
@@ -151,30 +157,108 @@ async function getBuWiseUtilisation(f) {
   }
   if (guard) tsConditions.push(guard);
 
+  // Only ACTIVE Business Units / Sub-BUs are ever reported: an inactive one (or a Sub-BU under an
+  // inactive BU) must not show up, with or without hours.
   const buConditions = [
     'c.id IN (:companyIds)',
     'c.is_deleted = false',
+    "c.status = 'active'",
+    "(p.id IS NULL OR (p.is_deleted = false AND p.status = 'active'))",
   ];
   if (f.search) {
     buConditions.push('(c.company_name ILIKE :search OR p.company_name ILIKE :search)');
     replacements.search = `%${f.search}%`;
   }
+  // Only these BU families (root BU ids) — used to fetch the Sub-BU rows of one page of BUs.
+  if (f.rootIds && f.rootIds.length) {
+    buConditions.push('COALESCE(c.parent_business_unit_id, c.id) IN (:rootIds)');
+    replacements.rootIds = f.rootIds;
+  }
 
   const orderCol = ORDERABLE_BU[f.sortBy] || 'bu_name';
   const orderDir = f.sortOrder === 'DESC' ? 'DESC' : 'ASC';
 
-  // Headcount = active Employees mapped to the BU (employee_business_units
-  // or the legacy employees.company_id). Hours = timesheet rows stamped with
-  // that BU's company_id.
-  const baseCte = `
-    WITH bus AS (
+  // groupBy 'bu'    -> one row per top-level BU, its Sub-BUs rolled up into it (employees counted once).
+  // anything else   -> one row per company: every BU and every Sub-BU on its own (the original
+  //                    layout; a Sub-BU row carries sub_bu_name, a BU row only that BU's own level).
+  const rollUp = f.groupBy === 'bu';
+  // 'partition' -> the Sub-BU breakdown of one BU family where EVERY employee sits in exactly one node
+  //                (their Sub-BU, else the BU's own level), so the nodes add up to the rolled-up BU row:
+  //                employees, hours and expected hours alike. Used for the children of the hierarchy view.
+  const partition = f.groupBy === 'partition';
+  const usesFamily = rollUp || partition;
+
+  // rollUp only: every active in-scope company mapped to the BU family it belongs to.
+  const familyCte = usesFamily ? `
+    fam AS (
+      SELECT c.id AS member_id, COALESCE(c.parent_business_unit_id, c.id) AS root_id
+      FROM companies c
+      LEFT JOIN companies p ON p.id = c.parent_business_unit_id
+      WHERE ${buConditions.filter((cond) => !cond.includes(':search')).join(' AND ')}
+    ),` : '';
+
+  const busCte = partition ? `
+    bus AS (
+      SELECT fm.member_id AS bu_id, fm.root_id, r.company_name AS bu_name,
+        CASE WHEN fm.member_id <> fm.root_id THEN c.company_name END AS sub_bu_name
+      FROM fam fm
+      JOIN companies c ON c.id = fm.member_id
+      JOIN companies r ON r.id = fm.root_id
+    )` : rollUp ? `
+    bus AS (
+      SELECT r.id AS bu_id, r.id AS root_id, r.company_name AS bu_name, NULL::text AS sub_bu_name
+      FROM companies r
+      WHERE r.id IN (SELECT root_id FROM fam)
+        ${f.search ? `AND (r.company_name ILIKE :search OR EXISTS (
+          SELECT 1 FROM fam fs JOIN companies sc2 ON sc2.id = fs.member_id
+          WHERE fs.root_id = r.id AND sc2.company_name ILIKE :search))` : ''}
+    )` : `
+    bus AS (
       SELECT c.id AS bu_id,
+        COALESCE(p.id, c.id) AS root_id,
         COALESCE(p.company_name, c.company_name) AS bu_name,
         CASE WHEN p.id IS NOT NULL THEN c.company_name END AS sub_bu_name
       FROM companies c
       LEFT JOIN companies p ON p.id = c.parent_business_unit_id
       WHERE ${buConditions.join(' AND ')}
-    ),
+    )`;
+
+  // Headcount = active Employees mapped to the BU (employee_business_units
+  // or the legacy employees.company_id) — rolled up: mapped to ANY company of the BU family, counted
+  // once. Hours = timesheet rows stamped with that BU's company_id (rolled up: any company of the family).
+  // partition only: the single node each employee is attributed to inside a family — the Sub-BU that is
+  // their primary company, else the lowest-id Sub-BU they are mapped to, else the BU's own level.
+  const empNodeCte = (partition || rollUp) ? `
+    emp_node AS (
+      SELECT e.id AS employee_id, fm.root_id,
+        COALESCE(
+          MIN(fm.member_id) FILTER (WHERE fm.member_id <> fm.root_id AND fm.member_id = e.company_id),
+          MIN(fm.member_id) FILTER (WHERE fm.member_id <> fm.root_id),
+          fm.root_id) AS node_id
+      FROM fam fm
+      JOIN employees e ON ${empConditions.join(' AND ')}
+        AND (
+          e.company_id = fm.member_id
+          OR EXISTS (
+            SELECT 1 FROM employee_business_units ebu
+            WHERE ebu.employee_id = e.id AND ebu.business_unit_id = fm.member_id AND ebu.status = 'active'
+          )
+        )
+      GROUP BY e.id, fm.root_id
+    ),` : '';
+
+  const empCountsCte = partition ? `
+    emp_counts AS (
+      SELECT node_id AS bu_id, COUNT(*) AS total_employees
+      FROM emp_node
+      GROUP BY node_id
+    )` : rollUp ? `
+    emp_counts AS (
+      SELECT en.root_id AS bu_id, COUNT(*) AS total_employees
+      FROM emp_node en
+      WHERE en.node_id <> en.root_id OR ${NO_SUB_BUS_SQL('en.root_id')}
+      GROUP BY en.root_id
+    )` : `
     emp_counts AS (
       SELECT b.bu_id, COUNT(DISTINCT e.id) AS total_employees
       FROM bus b
@@ -187,10 +271,30 @@ async function getBuWiseUtilisation(f) {
           )
         )
       GROUP BY b.bu_id
-    ),
+    )`;
+
+  // partition: hours follow the EMPLOYEE's node (not the company the timesheet was stamped with, which is
+  // usually the BU even for a Sub-BU member); an employee outside the family mapping falls to the BU level.
+  const hoursKey = partition ? 'COALESCE(en.node_id, fm.root_id)' : (rollUp ? 'fm.root_id' : 't.company_id');
+  const hoursFamilyJoin = (partition || rollUp)
+    ? 'JOIN fam fm ON fm.member_id = t.company_id LEFT JOIN emp_node en ON en.employee_id = t.employee_id AND en.root_id = fm.root_id'
+    : '';
+  // Rolled-up BU: a BU that has Sub-BUs is the total of its Sub-BUs only (every employee of such a BU is
+  // expected to be mapped to a Sub-BU); hours that sit at the BU's own level are not part of it.
+  if (rollUp) {
+    tsConditions.push(`(COALESCE(en.node_id, fm.root_id) <> fm.root_id OR ${NO_SUB_BUS_SQL('fm.root_id')})`);
+  }
+  // Expected hours use ONE capacity for a whole family (the BU's) when partitioned, so nodes add up exactly.
+  const capacityOwner = partition ? 'b.root_id' : 'b.bu_id';
+
+  const baseCte = `
+    WITH ${familyCte}
+    ${busCte},
+    ${empNodeCte}
+    ${empCountsCte},
     hours AS (
       SELECT
-        t.company_id AS bu_id,
+        ${hoursKey} AS bu_id,
         COALESCE(SUM(CASE WHEN NOT ${EXCLUDED_PO_SQL} AND ${CAT_BILLABLE_SQL} THEN ${hoursCol} ELSE 0 END), 0) AS billable_hours,
         COALESCE(SUM(CASE WHEN NOT ${EXCLUDED_PO_SQL} AND ${CAT_CUSTOMER_NB_SQL} THEN ${hoursCol} ELSE 0 END), 0) AS customer_non_billable_hours,
         COALESCE(SUM(CASE WHEN (NOT ${EXCLUDED_PO_SQL} OR sp.is_centralised = true) AND ${CAT_NON_BILLABLE_SQL} THEN ${hoursCol} ELSE 0 END), 0) AS non_billable_hours,
@@ -202,16 +306,18 @@ async function getBuWiseUtilisation(f) {
       JOIN service_pos sp        ON sp.id = t.service_po_id
       JOIN service_types st      ON st.id = sp.service_type_id
       JOIN service_categories sc ON sc.id = st.service_category_id
+      ${hoursFamilyJoin}
       WHERE ${tsConditions.join(' AND ')}
-      GROUP BY t.company_id
+      GROUP BY ${hoursKey}
     ),
     report AS (
       SELECT
         b.bu_id,
+        b.root_id,
         b.bu_name,
         b.sub_bu_name,
         COALESCE(ec.total_employees, 0)::int AS total_employees,
-        COALESCE(ec.total_employees, 0) * ${companyRangeCapacitySql('b.bu_id')} AS expected_hours,
+        COALESCE(ec.total_employees, 0) * ${companyRangeCapacitySql(capacityOwner)} AS expected_hours,
         ROUND(COALESCE(h.billable_hours, 0)::numeric, 2) AS billable_hours,
         ROUND(COALESCE(h.non_billable_hours, 0)::numeric, 2) AS non_billable_hours,
         ROUND(COALESCE(h.customer_non_billable_hours, 0)::numeric, 2) AS customer_non_billable_hours,
@@ -245,8 +351,23 @@ async function getBuWiseUtilisation(f) {
     sequelize.query(
       `${baseCte}
        SELECT
-         COUNT(*)::int AS bu_count,
-         COALESCE(SUM(total_employees), 0)::int AS total_employees,
+         COUNT(*)::int AS row_count,
+         -- Business Units and Sub-BUs are counted separately: bu_count = active top-level BUs,
+         -- sub_bu_count = active Sub-BUs under them (never one number for both).
+         COUNT(DISTINCT root_id)::int AS bu_count,
+         ${rollUp
+    ? '(SELECT COUNT(*) FROM fam WHERE member_id <> root_id AND root_id IN (SELECT bu_id FROM bus))::int'
+    : 'COUNT(*) FILTER (WHERE sub_bu_name IS NOT NULL)::int'} AS sub_bu_count,
+         -- rolled-up only: distinct employees mapped to a BU that HAS Sub-BUs but to none of its Sub-BUs.
+         -- They are left out of every BU total; this is the gap between the page's headcount and the BU total.
+         ${rollUp
+    ? "(SELECT COUNT(DISTINCT en.employee_id) FROM emp_node en WHERE en.node_id = en.root_id AND EXISTS (SELECT 1 FROM fam fx WHERE fx.root_id = en.root_id AND fx.member_id <> fx.root_id))::int"
+    : '0'} AS unassigned_employees,
+         -- Rolled-up: DISTINCT employees (one who belongs to two BUs counts once here, though each BU row counts
+         -- them). Otherwise the sum of the rows, as before.
+         ${rollUp
+    ? "(SELECT COUNT(DISTINCT en.employee_id) FROM emp_node en WHERE en.node_id <> en.root_id OR " + NO_SUB_BUS_SQL('en.root_id') + ")::int"
+    : 'COALESCE(SUM(total_employees), 0)::int'} AS total_employees,
          COALESCE(SUM(expected_hours), 0) AS expected_hours,
          COALESCE(SUM(billable_hours), 0) AS billable_hours,
          COALESCE(SUM(non_billable_hours), 0) AS non_billable_hours,
@@ -264,7 +385,7 @@ async function getBuWiseUtilisation(f) {
 
   return {
     rows,
-    count: rows.length ? parseInt(rows[0].full_count, 10) : (parseInt(totalsRows[0]?.bu_count, 10) || 0),
+    count: rows.length ? parseInt(rows[0].full_count, 10) : (parseInt(totalsRows[0]?.row_count, 10) || 0),
     totals: totalsRows[0] || null,
   };
 }

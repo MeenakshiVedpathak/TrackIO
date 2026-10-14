@@ -67,6 +67,9 @@ function commonFilters(query) {
     sortOrder: query.sortOrder && String(query.sortOrder).toUpperCase() === 'DESC' ? 'DESC' : 'ASC',
     hoursSource: query.hoursSource,
     roleId: query.roleId,
+    // 'hierarchy' = BU rows (Sub-BUs rolled up) each carrying its Sub-BU rows as `subBus`;
+    // 'bu' = just the rolled-up BU rows; omitted = the original flat one-row-per-company layout.
+    groupBy: ['bu', 'hierarchy'].includes(String(query.groupBy)) ? String(query.groupBy) : undefined,
   };
 }
 
@@ -86,41 +89,93 @@ const periodOut = (period) => ({
  * monthly-cap adjustment (original util % = original total logged / the same Expected).
  * Not Logged = Expected - Total Logged (floored at 0).
  */
+const toBuRow = (r) => ({
+  buId: r.bu_id,
+  rootBuId: r.root_id ?? r.bu_id,
+  buName: r.bu_name,
+  subBuName: r.sub_bu_name || null,
+  totalEmployees: r.total_employees,
+  expectedHours: round2(r.expected_hours),
+  billableHours: round2(r.billable_hours),
+  nonBillableHours: round2(r.non_billable_hours),
+  customerNonBillableHours: round2(r.customer_non_billable_hours),
+  totalLoggedHours: round2(r.total_logged_hours),
+  utilizationPercentage: round2(r.utilization_percentage),
+  originalBillableHours: round2(r.original_billable_hours),
+  originalNonBillableHours: round2(r.original_non_billable_hours),
+  originalCustomerNonBillableHours: round2(r.original_customer_non_billable_hours),
+  originalTotalLoggedHours: round2(r.original_total_logged_hours),
+  originalUtilizationPercentage: round2(r.original_utilization_percentage),
+  notLoggedHours: round2(r.not_logged_hours),
+});
+
+/**
+ * Hierarchy layout: each top-level BU is ONE row (its Sub-BUs rolled up, employees counted once)
+ * carrying its Sub-BU rows as `subBus`. The BU's own level — employees / hours that belong to the BU
+ * itself and to none of its Sub-BUs — is listed as one more child with `isDirect: true`
+ * (`subBuName` null), shown only when it logged hours, so the children always add up to the
+ * BU's hours. A BU without Sub-BUs has no children. Pagination, sorting, search and the summary all
+ * work on the BU rows only.
+ */
+async function attachSubBus(buRows, repoFilters) {
+  const rootIds = buRows.map((r) => r.buId);
+  const subBusByRoot = new Map(rootIds.map((id) => [id, []]));
+  const unassignedByRoot = new Map();
+  if (rootIds.length === 0) return;
+
+  const { rows } = await repo.getBuWiseUtilisation({
+    ...repoFilters, groupBy: 'partition', rootIds, search: undefined, sortBy: undefined, limit: null, offset: 0,
+  });
+
+  const familyRows = new Map(rootIds.map((id) => [id, []]));
+  rows.map(toBuRow).forEach((r) => familyRows.get(r.rootBuId)?.push(r));
+
+  for (const [rootId, members] of familyRows) {
+    const subs = members.filter((m) => m.subBuName);
+    if (subs.length === 0) continue;
+    // A BU that has Sub-BUs IS its Sub-BUs: the BU row is the total of the Sub-BU rows below it (the repository
+    // builds it that way), so there is no "BU level" row. Employees mapped to the BU but to none of its Sub-BUs
+    // are a data gap — they are left out of the BU total and only reported here so it is visible.
+    const direct = members.find((m) => !m.subBuName && m.buId === rootId);
+    unassignedByRoot.set(rootId, {
+      unassignedEmployees: direct ? direct.totalEmployees : 0,
+      unassignedLoggedHours: direct ? direct.totalLoggedHours : 0,
+    });
+    subBusByRoot.set(rootId, subs.sort((a, b) => a.subBuName.localeCompare(b.subBuName)));
+  }
+
+  buRows.forEach((r) => {
+    r.subBus = subBusByRoot.get(r.buId) || [];
+    r.hasSubBus = r.subBus.length > 0;
+    if (r.hasSubBus) Object.assign(r, unassignedByRoot.get(r.buId));
+  });
+}
+
 async function getBuWiseUtilisationReport(query, companyIds, { exportAll = false } = {}) {
   const period = resolvePeriod(query);
   const scopedCompanyIds = await resolveCompanyIds(companyIds, query);
   const { page, limit, offset } = exportAll ? EXPORT_ALL_PAGING : getPaginationParams(query);
   const filters = commonFilters(query);
+  const hierarchy = filters.groupBy === 'hierarchy';
 
   logger.info('Report: getBuWiseUtilisationReport', { period, filters, page, limit });
 
+  const repoFilters = { ...filters, ...period, companyIds: scopedCompanyIds };
   const { rows, count, totals } = await repo.getBuWiseUtilisation({
-    ...filters, ...period, companyIds: scopedCompanyIds, limit, offset,
+    ...repoFilters, groupBy: hierarchy ? 'bu' : filters.groupBy, limit, offset,
   });
 
-  const data = rows.map((r) => ({
-    buId: r.bu_id,
-    buName: r.bu_name,
-    subBuName: r.sub_bu_name || null,
-    totalEmployees: r.total_employees,
-    expectedHours: round2(r.expected_hours),
-    billableHours: round2(r.billable_hours),
-    nonBillableHours: round2(r.non_billable_hours),
-    customerNonBillableHours: round2(r.customer_non_billable_hours),
-    totalLoggedHours: round2(r.total_logged_hours),
-    utilizationPercentage: round2(r.utilization_percentage),
-    originalBillableHours: round2(r.original_billable_hours),
-    originalNonBillableHours: round2(r.original_non_billable_hours),
-    originalCustomerNonBillableHours: round2(r.original_customer_non_billable_hours),
-    originalTotalLoggedHours: round2(r.original_total_logged_hours),
-    originalUtilizationPercentage: round2(r.original_utilization_percentage),
-    notLoggedHours: round2(r.not_logged_hours),
-  }));
+  const data = rows.map(toBuRow);
+  if (hierarchy) await attachSubBus(data, repoFilters);
 
   const t = totals || {};
   const expected = parseFloat(t.expected_hours) || 0;
   const summary = {
+    // Active top-level Business Units and active Sub-BUs, counted separately.
     buCount: t.bu_count || 0,
+    subBuCount: t.sub_bu_count || 0,
+    // Distinct employees mapped to a BU that has Sub-BUs but to none of them — not part of any BU total.
+    unassignedEmployees: t.unassigned_employees || 0,
     totalEmployees: t.total_employees || 0,
     expectedHours: round2(expected),
     billableHours: round2(t.billable_hours),

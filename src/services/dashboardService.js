@@ -65,6 +65,18 @@ function resolvePeriod(query = {}) {
 function resolveFiscalYear(query = {}) {
   if (query.fiscalYear) return parseInt(query.fiscalYear, 10);
 
+  // A custom date range / month range names its own period: derive the fiscal
+  // year from where it STARTS so fiscal-year-scoped figures follow the range.
+  if (query.startDate && query.endDate) {
+    const [y, m] = query.startDate.split('-').map(Number);
+    return m >= 4 ? y : y - 1;
+  }
+  if (query.fromMonth && query.fromYear && query.toMonth && query.toYear) {
+    const m = parseInt(query.fromMonth, 10);
+    const y = parseInt(query.fromYear, 10);
+    return m >= 4 ? y : y - 1;
+  }
+
   if (query.month && query.year) {
     const month = parseInt(query.month, 10);
     const year = parseInt(query.year, 10);
@@ -119,6 +131,20 @@ function calendarMonthBounds(year, month) {
 function resolveAnalyticsPeriod(query, fiscalYear) {
   if (query.startDate && query.endDate) {
     return { start: query.startDate, end: query.endDate };
+  }
+  // Month range: first day of fromMonth/fromYear -> last day of toMonth/toYear.
+  if (query.fromMonth && query.fromYear && query.toMonth && query.toYear) {
+    return {
+      start: calendarMonthBounds(parseInt(query.fromYear, 10), parseInt(query.fromMonth, 10)).start,
+      end: calendarMonthBounds(parseInt(query.toYear, 10), parseInt(query.toMonth, 10)).end,
+    };
+  }
+  // Quarter range within the fiscal year: first day of fromQuarter -> last day of toQuarter.
+  if (query.fromQuarter && query.toQuarter) {
+    return {
+      start: fiscalQuarterBounds(fiscalYear, parseInt(query.fromQuarter, 10)).start,
+      end: fiscalQuarterBounds(fiscalYear, parseInt(query.toQuarter, 10)).end,
+    };
   }
   if (query.month && query.year) {
     return calendarMonthBounds(parseInt(query.year, 10), parseInt(query.month, 10));
@@ -855,9 +881,17 @@ async function getAnalyticsDashboard(query = {}, companyId) {
   const explicitMonth = query.month && query.year
     ? { month: parseInt(query.month, 10), year: parseInt(query.year, 10) }
     : null;
-  const trendBounds = explicitMonth
-    ? calendarMonthBounds(explicitMonth.year, explicitMonth.month)
-    : fyBounds;
+  // Any range filter (custom dates, month range, quarter range) narrows the
+  // trend to the range itself — the surrounding fiscal year would be unrelated
+  // data, especially when the range lies outside the current fiscal year.
+  const hasRange = !!(
+    (query.startDate && query.endDate)
+    || (query.fromMonth && query.fromYear && query.toMonth && query.toYear)
+    || (query.fromQuarter && query.toQuarter)
+  );
+  let trendBounds = fyBounds;
+  if (hasRange) trendBounds = period;
+  else if (explicitMonth) trendBounds = calendarMonthBounds(explicitMonth.year, explicitMonth.month);
 
   const scopedFilters = { startDate: period.start, endDate: period.end, employeeId, clientId, poId, hoursSource: query.hoursSource, roleId: query.roleId, companyId };
   const trendFilters = { startDate: trendBounds.start, endDate: trendBounds.end, employeeId, clientId, poId, hoursSource: query.hoursSource, roleId: query.roleId, companyId };
@@ -885,6 +919,7 @@ async function getAnalyticsDashboard(query = {}, companyId) {
     benchRows,
     globalTotalEmployees,
     globalActiveEmployees,
+    buMappedActiveEmployees,
     globalTotalClients,
     globalActivePOs,
     globalClosedPOs,
@@ -903,6 +938,7 @@ async function getAnalyticsDashboard(query = {}, companyId) {
     dashboardRepo.getAnalyticsBenchDetail(scopedFilters),
     dashboardRepo.getTotalEmployees(companyId),
     dashboardRepo.getActiveEmployees(companyId),
+    dashboardRepo.getBuMappedActiveEmployees(companyId),
     dashboardRepo.getTotalClients(companyId),
     dashboardRepo.getActivePOs(companyId),
     dashboardRepo.getClosedPOs(companyId),
@@ -1069,6 +1105,12 @@ async function getAnalyticsDashboard(query = {}, companyId) {
       quarter: query.quarter ? parseInt(query.quarter, 10) : null,
       month: query.month ? parseInt(query.month, 10) : null,
       year: query.year ? parseInt(query.year, 10) : null,
+      from_month: query.fromMonth ? parseInt(query.fromMonth, 10) : null,
+      from_year: query.fromYear ? parseInt(query.fromYear, 10) : null,
+      to_month: query.toMonth ? parseInt(query.toMonth, 10) : null,
+      to_year: query.toYear ? parseInt(query.toYear, 10) : null,
+      from_quarter: query.fromQuarter ? parseInt(query.fromQuarter, 10) : null,
+      to_quarter: query.toQuarter ? parseInt(query.toQuarter, 10) : null,
       period: { start_date: period.start, end_date: period.end },
       employee_id: employeeId || null,
       client_id: clientId || null,
@@ -1076,10 +1118,14 @@ async function getAnalyticsDashboard(query = {}, companyId) {
     },
 
     // ── Workforce (all-time headcounts, unaffected by the period filter) ────
+    // total_employees / active_employees = ACTIVE employees that belong to a BU (and to a Sub-BU where their
+    // BU has Sub-BUs) — see getBuMappedActiveEmployees(); the same rule as the BU-wise Utilization card.
+    // active_employees_not_counted = active employees left out (no BU, or in a BU with Sub-BUs but none of them).
     workforce: {
-      total_employees: globalTotalEmployees,
-      active_employees: globalActiveEmployees,
+      total_employees: buMappedActiveEmployees,
+      active_employees: buMappedActiveEmployees,
       inactive_employees: globalInactiveEmployees,
+      active_employees_not_counted: Math.max(0, globalActiveEmployees - buMappedActiveEmployees),
       employee_count_by_category: employeeCountByCategory,
     },
 
@@ -1698,6 +1744,7 @@ async function buildBuWiseUtilization(query, period, companyId) {
       poId: query.poId,
       serviceTypeId: query.serviceTypeId,
       roleId: query.roleId,
+      groupBy: query.groupBy,
       sortBy: 'utilizationPercentage',
       sortOrder: 'DESC',
     },
@@ -1708,6 +1755,8 @@ async function buildBuWiseUtilization(query, period, companyId) {
     period: { start_date: period.start, end_date: period.end },
     summary: {
       bu_count: summary.buCount,
+      sub_bu_count: summary.subBuCount,
+      unassigned_employees: summary.unassignedEmployees,
       total_employees: summary.totalEmployees,
       expected_hours: summary.expectedHours,
       billable_hours: summary.billableHours,
@@ -1721,23 +1770,37 @@ async function buildBuWiseUtilization(query, period, companyId) {
       original_total_logged_hours: round2(summary.originalTotalLoggedHours),
       original_utilization_percentage: round2(summary.originalUtilizationPercentage),
     },
+    // groupBy=hierarchy: each BU record also carries its Sub-BU records as `sub_bus`.
     records: data.map((row) => ({
-      bu_id: row.buId,
-      bu_name: row.buName,
-      sub_bu_name: row.subBuName,
-      total_employees: row.totalEmployees,
-      expected_hours: row.expectedHours,
-      billable_hours: row.billableHours,
-      non_billable_hours: row.nonBillableHours,
-      customer_non_billable_hours: row.customerNonBillableHours,
-      total_logged_hours: row.totalLoggedHours,
-      utilization_percentage: row.utilizationPercentage,
-      original_billable_hours: round2(row.originalBillableHours),
-      original_non_billable_hours: round2(row.originalNonBillableHours),
-      original_customer_non_billable_hours: round2(row.originalCustomerNonBillableHours),
-      original_total_logged_hours: round2(row.originalTotalLoggedHours),
-      original_utilization_percentage: round2(row.originalUtilizationPercentage),
+      ...toBuWiseRecord(row),
+      ...(row.subBus && {
+        has_sub_bus: row.hasSubBus,
+        sub_bus: row.subBus.map(toBuWiseRecord),
+        // employees / hours mapped to this BU but to none of its Sub-BUs — not part of the BU's numbers
+        ...(row.hasSubBus && { unassigned_employees: row.unassignedEmployees, unassigned_logged_hours: row.unassignedLoggedHours }),
+      }),
     })),
+  };
+}
+
+function toBuWiseRecord(row) {
+  return {
+    bu_id: row.buId,
+    bu_name: row.buName,
+    sub_bu_name: row.subBuName,
+    ...(row.isDirect && { is_direct: true }),
+    total_employees: row.totalEmployees,
+    expected_hours: row.expectedHours,
+    billable_hours: row.billableHours,
+    non_billable_hours: row.nonBillableHours,
+    customer_non_billable_hours: row.customerNonBillableHours,
+    total_logged_hours: row.totalLoggedHours,
+    utilization_percentage: row.utilizationPercentage,
+    original_billable_hours: round2(row.originalBillableHours),
+    original_non_billable_hours: round2(row.originalNonBillableHours),
+    original_customer_non_billable_hours: round2(row.originalCustomerNonBillableHours),
+    original_total_logged_hours: round2(row.originalTotalLoggedHours),
+    original_utilization_percentage: round2(row.originalUtilizationPercentage),
   };
 }
 

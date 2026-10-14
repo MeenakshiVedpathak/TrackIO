@@ -71,13 +71,27 @@ const groupConsecutive = (rows, key) => {
  * Shared handler: format=json (default) -> one page; format=excel -> every
  * row matching the same filters (page/limit ignored), with a Total row.
  */
-const handle = ({ label, fn, message, columns, sheetName, filePrefix, totalRow, mergeGroups, groupRowsBy }) => async (req, res, next) => {
+// Hierarchy layout (?groupBy=hierarchy): a BU row, then its Sub-BU rows right below it (BU name left
+// blank, Sub BU Name filled, "(BU level)" for the BU's own employees/hours). Rows without `subBus`
+// (the flat layouts) pass through untouched.
+const flattenSubBus = (rows) => rows.flatMap((row) => {
+  const { subBus, ...bu } = row;
+  const children = (subBus || []).map((c) => ({
+    ...c,
+    buName: '',
+    subBuName: c.isDirect ? '(BU level)' : c.subBuName,
+  }));
+  return [bu, ...children];
+});
+
+const handle = ({ label, fn, message, columns, sheetName, filePrefix, totalRow, mergeGroups, groupRowsBy, flatten }) => async (req, res, next) => {
   try {
     const query = { ...req.body, ...req.query };
 
     if (query.format === 'excel') {
       const { data, summary, period } = await fn(query, req.companyIds, { exportAll: true });
-      const rows = [...(groupRowsBy ? groupConsecutive(data, groupRowsBy) : data), totalRow(summary)];
+      const tableRows = groupRowsBy ? groupConsecutive(data, groupRowsBy) : data;
+      const rows = [...(flatten ? flatten(tableRows) : tableRows), totalRow(summary)];
       const sheetColumns = typeof columns === 'function' ? columns(query) : columns;
       const buffer = await toMultiSheetExcelBuffer([{ name: sheetName, columns: sheetColumns, rows, mergeGroups }]);
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -100,6 +114,7 @@ const getBuWiseUtilisation = handle({
   fn: service.getBuWiseUtilisationReport,
   message: 'BU-wise utilisation report fetched successfully.',
   columns: buColumnsFor,
+  flatten: flattenSubBus,
   sheetName: 'BU-wise Utilisation',
   filePrefix: 'BU_wise_Utilisation',
   totalRow: (s) => ({

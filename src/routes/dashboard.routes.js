@@ -105,6 +105,16 @@ const analyticsQuerySchema = Joi.object({
     .messages({ 'string.pattern.base': 'startDate must be in YYYY-MM-DD format.' }),
   endDate: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).optional()
     .messages({ 'string.pattern.base': 'endDate must be in YYYY-MM-DD format.' }),
+  // Range filters (analytics / analytics2). Precedence: startDate+endDate > month range >
+  // quarter range > month+year > quarter > whole fiscal year.
+  fromMonth: Joi.number().integer().min(1).max(12).optional(),
+  fromYear: Joi.number().integer().min(2000).max(2100).optional(),
+  toMonth: Joi.number().integer().min(1).max(12).optional(),
+  toYear: Joi.number().integer().min(2000).max(2100).optional(),
+  fromQuarter: Joi.number().integer().min(1).max(4).optional()
+    .description('Start of a fiscal quarter range (1=Apr-Jun ... 4=Jan-Mar), within fiscalYear. Requires toQuarter.'),
+  toQuarter: Joi.number().integer().min(1).max(4).optional()
+    .description('End of a fiscal quarter range. Requires fromQuarter; must be >= fromQuarter.'),
   employeeId: Joi.number().integer().positive().optional(),
   clientId: Joi.number().integer().positive().optional(),
   poId: Joi.number().integer().positive().optional(),
@@ -120,6 +130,11 @@ const analyticsQuerySchema = Joi.object({
     .description("'O' = original hours_logged, 'M' (default) = modified_hours falling back to hours_logged."),
   roleId: Joi.number().integer().positive().optional()
     .description('Sent by the frontend to identify the caller\'s role. roleId=5 (Management) gates this response to published-only data for the selected period — see publishVisibilityService.js.'),
+  // GET /dashboard/analytics2's bu_wise_utilization block only. It must be listed here: the validate
+  // middleware strips every key that is not in this schema, so without it groupBy never reaches the
+  // service and the block always comes back as the flat one-row-per-company list.
+  groupBy: Joi.string().valid('hierarchy', 'bu').optional()
+    .description("'hierarchy' = one record per top-level BU with its Sub-BUs nested in `sub_bus`; 'bu' = rolled-up BUs only; omitted = flat list (every BU / Sub-BU its own row)."),
   // Optional multi-select narrowing on top of the caller's existing BU/role
   // scope (req.companyIds) — comma-separated ids. Never widens access.
   entityIds: Joi.string().trim().optional()
@@ -128,7 +143,21 @@ const analyticsQuerySchema = Joi.object({
     .description('Optional, comma-separated Business Unit ids — narrows the caller\'s BU scope, intersected with (never replacing) it.'),
 })
   .and('startDate', 'endDate')
-  .and('month', 'year');
+  .and('month', 'year')
+  .and('fromMonth', 'fromYear', 'toMonth', 'toYear')
+  .and('fromQuarter', 'toQuarter')
+  .custom((v, helpers) => {
+    if (v.startDate && v.endDate && v.startDate > v.endDate) {
+      return helpers.message('startDate must be on or before endDate.');
+    }
+    if (v.fromMonth && v.fromYear * 12 + v.fromMonth > v.toYear * 12 + v.toMonth) {
+      return helpers.message('From month must be on or before to month.');
+    }
+    if (v.fromQuarter && v.fromQuarter > v.toQuarter) {
+      return helpers.message('fromQuarter must be <= toQuarter.');
+    }
+    return v;
+  });
 
 /**
  * @swagger

@@ -76,6 +76,51 @@ async function getTotalEmployees(companyId) {
  * Active employees count.
  * @returns {Promise<number>}
  */
+/**
+ * Headcount for the Analytics Dashboard's Employees KPI — only employees that really belong to a BU:
+ *   - ACTIVE and not deleted;
+ *   - mapped to an active in-scope BU (employees.company_id or an active employee_business_units row);
+ *   - and, when that BU has active Sub-BUs, mapped to at least one of those Sub-BUs. An employee who is
+ *     mapped to the BU but to none of its Sub-BUs is NOT counted (and neither is one with no BU at all).
+ * Each employee is counted once, however many BUs they are in. Same rule the BU-wise Utilization card uses.
+ */
+async function getBuMappedActiveEmployees(companyId) {
+  const MAPPED = (emp, bu) => `(${emp}.company_id = ${bu} OR EXISTS (
+    SELECT 1 FROM employee_business_units mb
+    WHERE mb.employee_id = ${emp}.id AND mb.business_unit_id = ${bu} AND mb.status = 'active'))`;
+
+  const [result] = await sequelize.query(
+    `WITH scope_roots AS (
+       SELECT DISTINCT COALESCE(c.parent_business_unit_id, c.id) AS root_id
+       FROM companies c
+       LEFT JOIN companies p ON p.id = c.parent_business_unit_id
+       WHERE c.id IN (:companyId) AND c.is_deleted = false AND c.status = 'active'
+         AND (p.id IS NULL OR (p.is_deleted = false AND p.status = 'active'))
+     ),
+     root_subs AS (
+       SELECT s.id AS sub_id, s.parent_business_unit_id AS root_id
+       FROM companies s
+       WHERE s.is_deleted = false AND s.status = 'active'
+         AND s.parent_business_unit_id IN (SELECT root_id FROM scope_roots)
+     )
+     SELECT COUNT(*) AS total
+     FROM employees e
+     WHERE e.status = 'active' AND e.is_deleted = false
+       AND EXISTS (
+         SELECT 1 FROM scope_roots r
+         WHERE (
+           NOT EXISTS (SELECT 1 FROM root_subs rs WHERE rs.root_id = r.root_id)
+           AND ${MAPPED('e', 'r.root_id')}
+         ) OR EXISTS (
+           SELECT 1 FROM root_subs rs
+           WHERE rs.root_id = r.root_id AND ${MAPPED('e', 'rs.sub_id')}
+         )
+       )`,
+    { replacements: { companyId }, type: QueryTypes.SELECT }
+  );
+  return parseInt(result.total, 10);
+}
+
 async function getActiveEmployees(companyId) {
   const [result] = await sequelize.query(
     `SELECT COUNT(*) AS total FROM employees WHERE status = 'active' AND is_deleted = false AND ${EMPLOYEE_COMPANY_SCOPE_SQL}`,
@@ -2410,6 +2455,7 @@ async function getEmployeeBillableBreakdownForPeriod(filters) {
 module.exports = {
   getTotalEmployees,
   getActiveEmployees,
+  getBuMappedActiveEmployees,
   getTotalClients,
   getActivePOs,
   getClosedPOs,

@@ -1995,6 +1995,7 @@ router.get(
  *       - { in: query, name: projectIds, schema: { type: string }, description: "Comma-separated Service PO ids (aliases poId, projectId)." }
  *       - { in: query, name: serviceTypeIds, schema: { type: string }, description: "Comma-separated (alias serviceTypeId)." }
  *       - { in: query, name: hoursSource, schema: { type: string, enum: [O] }, description: "O = original logged hours; default = adjusted (after sync) hours." }
+ *       - { in: query, name: groupBy, schema: { type: string, enum: [hierarchy, bu] }, description: "hierarchy = one row per top-level BU (its Sub-BUs rolled up, employees counted once) carrying its Sub-BU rows as subBus[] (plus an isDirect child for the BU's own level when it has data); bu = just the rolled-up BU rows; omitted = flat one-row-per-company layout. Pagination/sort/search/summary work on the BU rows. Inactive BUs / Sub-BUs are never returned." }
  *       - { in: query, name: page, schema: { type: integer } }
  *       - { in: query, name: limit, schema: { type: integer } }
  *       - { in: query, name: sortOrder, schema: { type: string, enum: [ASC, DESC] } }
