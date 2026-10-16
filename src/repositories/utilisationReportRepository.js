@@ -3,6 +3,7 @@
 const { sequelize } = require('../models');
 const { QueryTypes } = require('sequelize');
 const { companyRangeCapacitySql, employeeRangeCapacitySql } = require('../utils/monthlyCapSql');
+const { countableEmployeeSql } = require('../utils/countableEmployeeSql');
 
 /**
  * Utilisation report queries — (1) BU-wise Utilisation, (2) Employee × Project
@@ -135,8 +136,11 @@ async function getBuWiseUtilisation(f) {
     'e.is_deleted = false',
     "e.status = 'active'",
     'sp.is_deleted = false',
+    // HR / Finance / Attender staff: their hours are not counted
+    countableEmployeeSql('e'),
   ];
-  const empConditions = ['e.is_deleted = false', "e.status = 'active'"];
+  // ... and neither are they: headcount (and so expected hours = employees x cap) leaves them out
+  const empConditions = ['e.is_deleted = false', "e.status = 'active'", countableEmployeeSql('e')];
 
   if (f.employeeIds && f.employeeIds.length) {
     tsConditions.push('t.employee_id IN (:employeeIds)');
