@@ -309,6 +309,18 @@ const findAll = async (filters = {}, pagination = {}, sort = {}) => {
         attributes: ['id', 'employee_code', 'full_name'],
         required: false,
       },
+      // BU Name / Sub BU columns — company_id can itself be a Sub-BU's id, so the
+      // parent is embedded too. Unfiltered on status/is_deleted on purpose: an
+      // inactive Sub-BU must still resolve for POs already filed under it.
+      {
+        model: Company,
+        as: 'company',
+        attributes: ['id', 'company_name', 'entity_id', 'parent_business_unit_id'],
+        required: false,
+        include: [
+          { model: Company, as: 'parent', attributes: ['id', 'company_name'], required: false },
+        ],
+      },
       serviceTypeInclude,
     ],
     limit,

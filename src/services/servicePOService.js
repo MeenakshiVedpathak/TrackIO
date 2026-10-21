@@ -287,10 +287,19 @@ const getAll = async (query = {}, authContext, headerCompanyId = null) => {
   // "Project Manager" column — one batched lookup for exactly this page's
   // (already scoped/filtered/paginated) POs; always an array, [] when none.
   const pmByServicePO = await employeeServicePOMappingService.getProjectManagersByServicePOIds(rows.map((row) => row.id));
-  const data = rows.map((row) => ({
-    ...(typeof row.get === 'function' ? row.get({ plain: true }) : row),
-    project_managers: pmByServicePO.get(row.id) || [],
-  }));
+  const data = rows.map((row) => {
+    const plain = typeof row.get === 'function' ? row.get({ plain: true }) : row;
+    // company_id may point at a Sub-BU: BU = its parent's name, Sub BU = its
+    // own name (null when the PO sits directly on a top-level BU).
+    const company = plain.company || null;
+    const isSubBu = !!(company && company.parent_business_unit_id != null);
+    return {
+      ...plain,
+      bu_name: company ? (isSubBu && company.parent ? company.parent.company_name : company.company_name) : null,
+      sub_bu_name: isSubBu ? company.company_name : null,
+      project_managers: pmByServicePO.get(row.id) || [],
+    };
+  });
 
   return { data, meta };
 };
@@ -568,7 +577,7 @@ const create = async (data, userId, req) => {
 
 /**
  * Update an existing Service PO.
- * Cannot update a PO that is already closed or cancelled.
+ * Cannot update a PO that is cancelled (a closed PO can still be edited).
  *
  * Looks the Service PO up via resolveActorFullReach() (NOT
  * resolveActorCompanyScope(req.companyId)) — same fix already shipped for
@@ -601,7 +610,9 @@ const update = async (id, data, userId, req) => {
   }
   const currentCompanyId = existing.company_id;
 
-  if (existing.status === 'closed' || existing.status === 'cancelled') {
+  // Closed POs stay editable (corrections, reopening via status); only a
+  // cancelled PO is final.
+  if (existing.status === 'cancelled') {
     const err = new Error(`Cannot update a Service PO with status "${existing.status}".`);
     err.statusCode = 400;
     throw err;

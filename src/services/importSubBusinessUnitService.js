@@ -57,13 +57,13 @@ async function loadSubBusinessUnits(parentIds) {
 
   const children = await Company.findAll({
     where: { parent_business_unit_id: { [Op.in]: ids }, is_deleted: false },
-    attributes: ['id', 'company_name', 'parent_business_unit_id'],
+    attributes: ['id', 'company_name', 'parent_business_unit_id', 'status'],
     order: [['company_name', 'ASC'], ['id', 'ASC']],
     raw: true,
   });
   for (const child of children) {
     if (!childrenByParent.has(child.parent_business_unit_id)) childrenByParent.set(child.parent_business_unit_id, []);
-    childrenByParent.get(child.parent_business_unit_id).push({ id: child.id, company_name: child.company_name });
+    childrenByParent.get(child.parent_business_unit_id).push({ id: child.id, company_name: child.company_name, status: child.status });
   }
   return childrenByParent;
 }
@@ -86,7 +86,14 @@ function resolveRowSubBusinessUnit(businessUnit, subBuRaw, childrenByParent) {
       : { companyId: null, error: null };
   }
 
-  const children = childrenByParent.get(businessUnit.id) || [];
+  // A deactivated Sub-BU can't be picked in the manual forms, so it can't be
+  // an import target either; it is kept apart only to give a clear error.
+  const allChildren = childrenByParent.get(businessUnit.id) || [];
+  const children = allChildren.filter((c) => c.status == null || c.status === 'active');
+  if (subBuName && allChildren.some((c) => c.status != null && c.status !== 'active' && normaliseName(c.company_name) === normaliseName(subBuName))
+    && !children.some((c) => normaliseName(c.company_name) === normaliseName(subBuName))) {
+    return { companyId: null, error: `Sub BU "${subBuName}" under Business Unit "${businessUnit.company_name}" is inactive — activate it in Business Unit Master first.` };
+  }
   if (children.length === 0) {
     return subBuName
       ? { companyId: null, error: `Business Unit "${businessUnit.company_name}" has no Sub-BUs — leave "Sub BU" blank.` }
