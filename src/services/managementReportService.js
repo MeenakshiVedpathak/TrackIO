@@ -62,7 +62,8 @@ function parseCommonFilters(query) {
     month: query.month ? parseInt(query.month, 10) : undefined,
     year: query.year ? parseInt(query.year, 10) : undefined,
     poId: query.poId ? parseInt(query.poId, 10) : undefined,
-    clientId: query.clientId ? parseInt(query.clientId, 10) : undefined,
+    // Multi-select: a single id or a comma-separated list ("1,2,3"); clientIds accepted as the plural alias.
+    clientId: parseIdList(query.clientIds ?? query.clientId),
     status: query.status || undefined,
     hoursSource: query.hoursSource,
     roleId: query.roleId,

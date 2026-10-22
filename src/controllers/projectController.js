@@ -157,7 +157,7 @@ const deleteProject = async (req, res) => {
  */
 const getActiveProjects = async (req, res) => {
   try {
-    const projects = await projectService.getActiveProjects(buildAuthContext(req));
+    const projects = await projectService.getActiveProjects(buildAuthContext(req), req.query);
     return sendSuccess(res, projects, 'Active projects fetched successfully.');
   } catch (error) {
     logger.error('getActiveProjects error', { error: error.message });

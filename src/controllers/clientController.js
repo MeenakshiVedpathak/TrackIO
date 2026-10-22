@@ -185,7 +185,7 @@ const deleteClient = async (req, res) => {
  */
 const getActiveClients = async (req, res) => {
   try {
-    const clients = await clientService.getActiveClients(buildClientAuthContext(req));
+    const clients = await clientService.getActiveClients(buildClientAuthContext(req), req.query);
     return sendSuccess(res, clients, 'Active clients fetched successfully.');
   } catch (error) {
     logger.error('getActiveClients error', { error: error.message });

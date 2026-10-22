@@ -5,6 +5,9 @@ const teamLeadEmployeeProjectHoursReportRepository = require('../repositories/te
 const { getPaginationParams, getPaginationMeta } = require('../utils/pagination');
 const { parseIdList } = require('../utils/idListParser');
 const logger = require('../utils/logger');
+const { Op } = require('sequelize');
+const { Company } = require('../models');
+const { expandBusinessUnitIdsWithDescendants } = require('./companyAccessControlService');
 
 /**
  * Team Lead Employee Project Hours Report — which Employees reporting to the
@@ -140,7 +143,36 @@ async function getReport(query, managerEmployeeId) {
  */
 async function getFilterOptions(query, managerEmployeeId) {
   const { startDate, endDate } = resolveDateRange(query);
-  return teamLeadEmployeeProjectHoursReportRepository.getFilterOptions({ managerEmployeeId, startDate, endDate });
+  const entityIds = parseIdList(query.entityIds) || [];
+  const buIds = parseIdList(query.buIds) || [];
+  const subBuIds = parseIdList(query.subBuIds) || [];
+  const employeeBusinessUnitIds = await resolveEmployeeBusinessUnitIds({ entityIds, buIds, subBuIds });
+  return teamLeadEmployeeProjectHoursReportRepository.getFilterOptions({
+    managerEmployeeId, startDate, endDate, entityIds, buIds, subBuIds, employeeBusinessUnitIds,
+  });
+}
+
+/**
+ * The Business Unit ids an Employee must be mapped to for the filter-options Employee list, from the
+ * optional entityIds / buIds / subBuIds: a BU also covers its Sub-BUs; subBuIds must fall inside the
+ * selected BUs when both are sent; entityIds restricts all of it to those Entities' BUs (AND).
+ * @returns {Promise<number[]|null>} null when no BU/Entity filter was sent (Employees unfiltered)
+ */
+async function resolveEmployeeBusinessUnitIds({ entityIds, buIds, subBuIds }) {
+  if (!entityIds.length && !buIds.length && !subBuIds.length) return null;
+  let ids = null;
+  if (buIds.length) ids = await expandBusinessUnitIdsWithDescendants(buIds);
+  if (subBuIds.length) ids = ids ? ids.filter((id) => subBuIds.includes(id)) : subBuIds;
+  if (entityIds.length) {
+    const underEntities = await Company.findAll({
+      where: { entity_id: { [Op.in]: entityIds }, is_deleted: false },
+      attributes: ['id'],
+      raw: true,
+    });
+    const entityCompanyIds = underEntities.map((c) => c.id);
+    ids = ids ? ids.filter((id) => entityCompanyIds.includes(id)) : entityCompanyIds;
+  }
+  return ids;
 }
 
 /**

@@ -29,8 +29,8 @@ function parseCommonFilters(query) {
       : 'ASC',
     startDate: query.startDate || undefined,
     endDate: query.endDate || undefined,
-    employeeId: query.employeeId ? parseInt(query.employeeId, 10) : undefined,
-    poId: query.poId ? parseInt(query.poId, 10) : undefined,
+    employeeId: parseIdList(query.employeeIds ?? query.employeeId),
+    poId: parseIdList(query.poIds ?? query.poId),
     month: query.month ? parseInt(query.month, 10) : undefined,
     year: query.year ? parseInt(query.year, 10) : undefined,
     status: query.status || undefined,
@@ -520,9 +520,9 @@ async function getResourceAllocation(query, companyIds) {
   const isBillable = query.isBillable !== undefined
     ? query.isBillable === 'true' || query.isBillable === true
     : undefined;
-  const serviceCategoryId = query.serviceCategoryId ? parseInt(query.serviceCategoryId, 10) : undefined;
-  const serviceTypeId = query.serviceTypeId ? parseInt(query.serviceTypeId, 10) : undefined;
-  const clientId = query.clientId ? parseInt(query.clientId, 10) : undefined;
+  const serviceCategoryId = parseIdList(query.serviceCategoryIds ?? query.serviceCategoryId);
+  const serviceTypeId = parseIdList(query.serviceTypeIds ?? query.serviceTypeId);
+  const clientId = parseIdList(query.clientIds ?? query.clientId);
 
   logger.info('Report: getResourceAllocation', { filters, isBillable, serviceCategoryId, serviceTypeId, clientId, page, limit });
 
@@ -703,10 +703,10 @@ async function getServicePOSummary(query, companyIds) {
     ? query.is_billable === 'true' || query.is_billable === true
     : undefined;
 
-  const clientId = query.clientId ? parseInt(query.clientId, 10) : undefined;
-  const serviceCategoryId = query.serviceCategoryId ? parseInt(query.serviceCategoryId, 10) : undefined;
-  const serviceTypeId = query.serviceTypeId ? parseInt(query.serviceTypeId, 10) : undefined;
-  const poId = query.poId ? parseInt(query.poId, 10) : undefined;
+  const clientId = parseIdList(query.clientIds ?? query.clientId);
+  const serviceCategoryId = parseIdList(query.serviceCategoryIds ?? query.serviceCategoryId);
+  const serviceTypeId = parseIdList(query.serviceTypeIds ?? query.serviceTypeId);
+  const poId = parseIdList(query.poIds ?? query.poId);
 
   logger.info('Report: getServicePOSummary', { filters, page, limit });
 
@@ -805,10 +805,10 @@ async function getInvoicePOSummary(query, companyIds) {
     ? query.is_billable === 'true' || query.is_billable === true
     : undefined;
 
-  const clientId = query.clientId ? parseInt(query.clientId, 10) : undefined;
-  const serviceCategoryId = query.serviceCategoryId ? parseInt(query.serviceCategoryId, 10) : undefined;
-  const serviceTypeId = query.serviceTypeId ? parseInt(query.serviceTypeId, 10) : undefined;
-  const poId = query.poId ? parseInt(query.poId, 10) : undefined;
+  const clientId = parseIdList(query.clientIds ?? query.clientId);
+  const serviceCategoryId = parseIdList(query.serviceCategoryIds ?? query.serviceCategoryId);
+  const serviceTypeId = parseIdList(query.serviceTypeIds ?? query.serviceTypeId);
+  const poId = parseIdList(query.poIds ?? query.poId);
 
   logger.info('Report: getInvoicePOSummary', { filters, page, limit });
 
@@ -1021,13 +1021,11 @@ async function getResourceMonthlyUtilizationReport(query, companyIds) {
   // That month's Monthly Cap Hours — the same value the repository selects as monthly_capacity.
   const monthlyCapacity = await monthlyCapService.getCapForMonth(filters.month, filters.year, companyIds);
 
-  const clientId = query.clientId ? parseInt(query.clientId, 10) : undefined;
+  const clientId = parseIdList(query.clientIds ?? query.clientId);
   // poId is accepted as an alias for projectId, same convention as the
   // Resource Project Utilization report.
-  const poId = query.poId
-    ? parseInt(query.poId, 10)
-    : (query.projectId ? parseInt(query.projectId, 10) : undefined);
-  const serviceTypeId = query.serviceTypeId ? parseInt(query.serviceTypeId, 10) : undefined;
+  const poId = parseIdList(query.poIds ?? query.poId ?? query.projectId);
+  const serviceTypeId = parseIdList(query.serviceTypeIds ?? query.serviceTypeId);
 
   logger.info('Report: getResourceMonthlyUtilizationReport', {
     filters, page, limit, clientId, poId, serviceTypeId,
@@ -1157,6 +1155,8 @@ async function getResourseProjectUtilizationReport(query, companyIds) {
     projectType: query.projectType ? String(query.projectType).trim() : undefined,
 
     categoryId: query.categoryId ? parseInt(query.categoryId, 10) : undefined,
+    // serviceCategoryIds (or the singular serviceCategoryId) is multi-select — comma-separated list.
+    serviceCategoryIds: parseIdList(query.serviceCategoryIds ?? query.serviceCategoryId),
     category: query.category ? String(query.category).trim() : undefined,
 
     subProjectId: query.subProjectId ? parseInt(query.subProjectId, 10) : undefined,
@@ -1311,10 +1311,10 @@ async function getClientServicePOHoursReport(query, companyIds) {
     companyIds,
     startDate,
     endDate,
-    clientId: query.clientId ? parseInt(query.clientId, 10) : undefined,
-    poId: query.poId ? parseInt(query.poId, 10) : undefined,
-    serviceTypeId: query.serviceTypeId ? parseInt(query.serviceTypeId, 10) : undefined,
-    employeeId: query.employeeId ? parseInt(query.employeeId, 10) : undefined,
+    clientId: parseIdList(query.clientIds ?? query.clientId),
+    poId: parseIdList(query.poIds ?? query.poId),
+    serviceTypeId: parseIdList(query.serviceTypeIds ?? query.serviceTypeId),
+    employeeId: parseIdList(query.employeeIds ?? query.employeeId),
     status: query.status || undefined,
     hoursSource: query.hoursSource,
     roleId: query.roleId,
@@ -1533,10 +1533,10 @@ async function getClientWiseAnalyticsReport(query, companyIds) {
     companyIds,
     startDate,
     endDate,
-    employeeId: query.employeeId ? parseInt(query.employeeId, 10) : undefined,
-    clientId: query.clientId ? parseInt(query.clientId, 10) : undefined,
-    poId: query.poId ? parseInt(query.poId, 10) : undefined,
-    serviceTypeId: query.serviceTypeId ? parseInt(query.serviceTypeId, 10) : undefined,
+    employeeId: parseIdList(query.employeeIds ?? query.employeeId),
+    clientId: parseIdList(query.clientIds ?? query.clientId),
+    poId: parseIdList(query.poIds ?? query.poId),
+    serviceTypeId: parseIdList(query.serviceTypeIds ?? query.serviceTypeId),
     hoursSource: query.hoursSource,
     roleId: query.roleId,
   };
@@ -1632,10 +1632,10 @@ async function getMonthlyHoursTrend(query, companyIds) {
     companyIds,
     startDate,
     endDate,
-    employeeId: query.employeeId ? parseInt(query.employeeId, 10) : undefined,
-    clientId: query.clientId ? parseInt(query.clientId, 10) : undefined,
-    poId: query.poId ? parseInt(query.poId, 10) : undefined,
-    serviceTypeId: query.serviceTypeId ? parseInt(query.serviceTypeId, 10) : undefined,
+    employeeId: parseIdList(query.employeeIds ?? query.employeeId),
+    clientId: parseIdList(query.clientIds ?? query.clientId),
+    poId: parseIdList(query.poIds ?? query.poId),
+    serviceTypeId: parseIdList(query.serviceTypeIds ?? query.serviceTypeId),
     hoursSource: query.hoursSource,
     roleId: query.roleId,
   };
@@ -1774,9 +1774,9 @@ async function getEmployeeBenchPercentage(query, companyIds) {
     companyIds,
     startDate,
     endDate,
-    employeeId: query.employeeId ? parseInt(query.employeeId, 10) : undefined,
-    clientId: query.clientId ? parseInt(query.clientId, 10) : undefined,
-    poId: query.poId ? parseInt(query.poId, 10) : undefined,
+    employeeId: parseIdList(query.employeeIds ?? query.employeeId),
+    clientId: parseIdList(query.clientIds ?? query.clientId),
+    poId: parseIdList(query.poIds ?? query.poId),
     hoursSource: query.hoursSource,
     roleId: query.roleId,
   };
@@ -1886,9 +1886,9 @@ async function getBudgetVsBilledReport(query, companyIds) {
     companyIds,
     startDate,
     endDate,
-    clientId: query.clientId ? parseInt(query.clientId, 10) : undefined,
-    poId: query.poId ? parseInt(query.poId, 10) : undefined,
-    serviceTypeId: query.serviceTypeId ? parseInt(query.serviceTypeId, 10) : undefined,
+    clientId: parseIdList(query.clientIds ?? query.clientId),
+    poId: parseIdList(query.poIds ?? query.poId),
+    serviceTypeId: parseIdList(query.serviceTypeIds ?? query.serviceTypeId),
   };
 
   const rows = await reportRepo.getBudgetVsBilled(filters);
@@ -1996,10 +1996,10 @@ async function getResourceUtilizationTrendReport(query, companyIds) {
     companyIds,
     startDate,
     endDate,
-    employeeId: query.employeeId ? parseInt(query.employeeId, 10) : undefined,
-    clientId: query.clientId ? parseInt(query.clientId, 10) : undefined,
-    poId: query.poId ? parseInt(query.poId, 10) : undefined,
-    serviceTypeId: query.serviceTypeId ? parseInt(query.serviceTypeId, 10) : undefined,
+    employeeId: parseIdList(query.employeeIds ?? query.employeeId),
+    clientId: parseIdList(query.clientIds ?? query.clientId),
+    poId: parseIdList(query.poIds ?? query.poId),
+    serviceTypeId: parseIdList(query.serviceTypeIds ?? query.serviceTypeId),
     hoursSource: query.hoursSource,
     roleId: query.roleId,
   };
@@ -2078,10 +2078,10 @@ async function getServicePOHoursBudgetReport(query, companyIds) {
     companyIds,
     startDate,
     endDate,
-    employeeId: query.employeeId ? parseInt(query.employeeId, 10) : undefined,
-    clientId: query.clientId ? parseInt(query.clientId, 10) : undefined,
-    poId: query.poId ? parseInt(query.poId, 10) : undefined,
-    serviceTypeId: query.serviceTypeId ? parseInt(query.serviceTypeId, 10) : undefined,
+    employeeId: parseIdList(query.employeeIds ?? query.employeeId),
+    clientId: parseIdList(query.clientIds ?? query.clientId),
+    poId: parseIdList(query.poIds ?? query.poId),
+    serviceTypeId: parseIdList(query.serviceTypeIds ?? query.serviceTypeId),
     hoursSource: query.hoursSource,
     roleId: query.roleId,
   };

@@ -219,7 +219,7 @@ const getActiveEmployees = async (req, res, next) => {
     const parsedBusinessUnitId = parseInt(req.headers['x-company-id'], 10);
     const businessUnitId = Number.isInteger(parsedBusinessUnitId) && parsedBusinessUnitId > 0 ? parsedBusinessUnitId : null;
 
-    const employees = await employeeService.getActiveEmployees(buildEmployeeAuthContext(req), servicePOId, businessUnitId);
+    const employees = await employeeService.getActiveEmployees(buildEmployeeAuthContext(req), servicePOId, businessUnitId, req.query);
     return sendSuccess(res, employees, 'Active employees fetched successfully.');
   } catch (err) {
     if (err.statusCode === 404) {

@@ -752,6 +752,36 @@ async function intersectIdsWithBuHierarchy(reachIds, requestedIds) {
 }
 
 /**
+ * Narrow a caller's already-resolved scope by the optional `entityIds` /
+ * `businessUnitIds` query filters of an option-list (dropdown) endpoint.
+ * Both given = AND: the BU must belong to one of the Entities. A Parent BU
+ * id means itself + all its Sub-BUs. Only ever NARROWS the caller's own
+ * reach — an id outside it yields no data, never an error.
+ *
+ * @param {number|number[]|{ ownedCompanyIds: number[] }|null} scope - as returned by the
+ *   resolveActor*Scope() helpers (a plain id, an id array, or the
+ *   `{ ownedCompanyIds, createdBy }` shape)
+ * @param {number[]|undefined} entityIds
+ * @param {number[]|undefined} businessUnitIds
+ * @returns {Promise<{ narrowed: boolean, scope: number[]|null }>} `narrowed` is false (scope
+ *   null) when neither filter was sent, so the caller keeps its current behaviour untouched
+ */
+async function narrowScopeByEntityAndBusinessUnit(scope, entityIds, businessUnitIds) {
+  const hasEntityFilter = Array.isArray(entityIds) && entityIds.length > 0;
+  const hasBuFilter = Array.isArray(businessUnitIds) && businessUnitIds.length > 0;
+  if (!hasEntityFilter && !hasBuFilter) return { narrowed: false, scope: null };
+
+  let reach;
+  if (Array.isArray(scope)) reach = scope;
+  else if (typeof scope === 'number') reach = [scope];
+  else reach = (scope && scope.ownedCompanyIds) || [];
+
+  reach = await intersectCompanyIdsWithEntity(reach, hasEntityFilter ? entityIds : null);
+  reach = await intersectIdsWithBuHierarchy(reach, hasBuFilter ? businessUnitIds : null);
+  return { narrowed: true, scope: reach };
+}
+
+/**
  * Resolve + validate the single explicit Business Unit id a WRITE/import
  * flow must stamp its rows with (Monthly Costs Excel import) — unlike
  * resolveActorCompanyScopeForSelectedBU()/resolveReportCompanyScope() (which
@@ -1000,6 +1030,7 @@ module.exports = {
   expandBusinessUnitIdsWithDescendants,
   expandBusinessUnitIdsToFamily,
   intersectIdsWithBuHierarchy,
+  narrowScopeByEntityAndBusinessUnit,
   areSameOrRelatedBusinessUnits,
   resolveImportBusinessUnitId,
   resolveOwningAdminIdForCompany,

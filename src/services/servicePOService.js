@@ -11,7 +11,7 @@ const servicePOHierarchyRepository = require('../repositories/servicePOHierarchy
 const timesheetRepository = require('../repositories/timesheetRepository');
 const employeeWorkLogRepository = require('../repositories/employeeWorkLogRepository');
 const employeeServicePOMappingService = require('./employeeServicePOMappingService');
-const { resolveActorCompanyScope, resolveCreateCompanyIdForActor, resolveActorCompanyScopeForSelectedBU, resolveActorFullReach, resolveCentralisedOwnerCreatorIds, resolveCentralisedServicePOTenant, intersectCompanyIdsWithEntity, intersectIdsWithBuHierarchy, areSameOrRelatedBusinessUnits } = require('./companyAccessControlService');
+const { resolveActorCompanyScope, resolveCreateCompanyIdForActor, resolveActorCompanyScopeForSelectedBU, resolveActorFullReach, resolveCentralisedOwnerCreatorIds, resolveCentralisedServicePOTenant, intersectCompanyIdsWithEntity, intersectIdsWithBuHierarchy, narrowScopeByEntityAndBusinessUnit, areSameOrRelatedBusinessUnits } = require('./companyAccessControlService');
 const { Employee, Company, sequelize } = require('../models');
 const { Op } = require('sequelize');
 const { createAuditLog, getIpAddress } = require('../middlewares/auditLog');
@@ -1010,8 +1010,17 @@ const getUtilisation = async (poId, authContext) => {
  * @param {number|null} [headerCompanyId] - parsed X-Company-Id header, if any
  * @returns {Promise<ServicePO[]>}
  */
-const getActivePOs = async (authContext, headerCompanyId = null) => {
+const getActivePOs = async (authContext, headerCompanyId = null, query = {}) => {
   const companyId = await resolveActorCompanyScopeForSelectedBU(authContext, headerCompanyId);
+
+  // Optional entityIds/businessUnitIds (comma-separated): a strict company_id IN (selected) match,
+  // so BU-less POs (Centralised / "No Business Unit" / the actor's own unassigned ones) are not
+  // mixed in — same rule as GET /service-pos with a BU filter. Absent/empty = unchanged.
+  const narrowing = await narrowScopeByEntityAndBusinessUnit(companyId, parseIdList(query.entityIds), parseIdList(query.businessUnitIds));
+  if (narrowing.narrowed) {
+    return servicePORepository.getActivePOs(narrowing.scope, null, null, null);
+  }
+
   const centralisedOwnerIds = await resolveCentralisedOwnerIds(companyId);
   const centralisedTenant = await resolveCentralisedServicePOTenant(companyId, authContext.employeeId);
   return servicePORepository.getActivePOs(companyId, authContext.employeeId, centralisedOwnerIds, centralisedTenant);

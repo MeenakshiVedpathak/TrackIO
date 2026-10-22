@@ -105,11 +105,27 @@ async function getAllTeamLeadEmployeeProjectHours(filters) {
  * Projects / SPOs / BUs / Sub-BUs: only those actually present in the mapped
  * Employees' entries within the optional date range.
  *
- * @param {{ managerEmployeeId: number, startDate?: string, endDate?: string }} filters
+ * entityIds / buIds / subBuIds (all optional) narrow the Clients/Projects/SPOs/BUs (rows whose Service PO
+ * belongs to them) and, through `employeeBusinessUnitIds`, the Employees (those mapped to any of those BUs).
+ *
+ * @param {{ managerEmployeeId: number, startDate?: string, endDate?: string, entityIds?: number[], buIds?: number[], subBuIds?: number[], employeeBusinessUnitIds?: number[]|null }} filters
  * @returns {Promise<{ employees: object[], clients: object[], projects: object[], servicePos: object[], businessUnits: object[], subBusinessUnits: object[] }>}
  */
-async function getFilterOptions({ managerEmployeeId, startDate, endDate }) {
-  const { base, replacements } = buildBaseQuery({ managerEmployeeId, startDate, endDate });
+async function getFilterOptions({ managerEmployeeId, startDate, endDate, entityIds, buIds, subBuIds, employeeBusinessUnitIds = null }) {
+  const { base, replacements } = buildBaseQuery({ managerEmployeeId, startDate, endDate, entityIds, buIds, subBuIds });
+
+  // Employees stay "every mapped Employee" unless a BU/Entity filter is sent — then only those
+  // actively mapped to one of the resulting BUs (an empty resulting set matches nobody).
+  let employeeBuFilter = '';
+  const employeeReplacements = { managerEmployeeId };
+  if (employeeBusinessUnitIds !== null) {
+    if (employeeBusinessUnitIds.length === 0) {
+      employeeBuFilter = 'AND 1 = 0';
+    } else {
+      employeeBuFilter = "AND e.id IN (SELECT ebu.employee_id FROM employee_business_units ebu WHERE ebu.status = 'active' AND ebu.business_unit_id IN (:employeeBusinessUnitIds))";
+      employeeReplacements.employeeBusinessUnitIds = employeeBusinessUnitIds;
+    }
+  }
 
   const [employees, combos] = await Promise.all([
     sequelize.query(`
@@ -121,8 +137,9 @@ async function getFilterOptions({ managerEmployeeId, startDate, endDate }) {
         AND mem.status = 'active'
         AND mem.mapping_type IN ('PRIMARY', 'SECONDARY')
         AND mem.employee_id <> :managerEmployeeId
+        ${employeeBuFilter}
       GROUP BY e.id, e.employee_code, e.full_name
-      ORDER BY e.full_name`, { replacements: { managerEmployeeId }, type: QueryTypes.SELECT }),
+      ORDER BY e.full_name`, { replacements: employeeReplacements, type: QueryTypes.SELECT }),
     sequelize.query(`
       SELECT DISTINCT client_id, client_name, project_id, project_name, service_po_id, service_po_code, spo_name,
                       bu_id, bu_name, sub_bu_id, sub_bu_name
@@ -157,7 +174,7 @@ async function getFilterOptions({ managerEmployeeId, startDate, endDate }) {
 function buildBaseQuery(filters) {
   const {
     managerEmployeeId, startDate, endDate, employeeIds, clientIds, projectIds, servicePoIds,
-    buIds, subBuIds, statuses, search,
+    entityIds, buIds, subBuIds, statuses, search,
   } = filters;
 
   const replacements = { managerEmployeeId };
@@ -170,6 +187,7 @@ function buildBaseQuery(filters) {
   if (clientIds && clientIds.length) add('sp.client_id IN (:clientIds)', 'clientIds', clientIds);
   if (projectIds && projectIds.length) add('sp.project_id IN (:projectIds)', 'projectIds', projectIds);
   if (servicePoIds && servicePoIds.length) add('wl.service_po_id IN (:servicePoIds)', 'servicePoIds', servicePoIds);
+  if (entityIds && entityIds.length) add('bu_unit.entity_id IN (:entityIds)', 'entityIds', entityIds);
   if (buIds && buIds.length) add('COALESCE(bu_parent.id, bu_unit.id) IN (:buIds)', 'buIds', buIds);
   if (subBuIds && subBuIds.length) add('bu_parent.id IS NOT NULL AND bu_unit.id IN (:subBuIds)', 'subBuIds', subBuIds);
   if (statuses && statuses.length) add('wl.status IN (:statuses)', 'statuses', statuses);

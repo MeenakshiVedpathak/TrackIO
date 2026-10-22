@@ -1296,7 +1296,14 @@ const deleteEmployee = async (id, userId, ipAddress = null, authContext) => {
  * @returns {Promise<Employee[]>}
  * @throws {{ statusCode: 404 }} servicePOId given but not found in the caller's tenant scope
  */
-const getActiveEmployees = async (authContext, servicePOId, businessUnitId = null) => {
+const getActiveEmployees = async (authContext, servicePOId, businessUnitId = null, query = {}) => {
+  // Optional entityIds/businessUnitIds (comma-separated) — employees mapped to any of those
+  // BUs (a Parent BU also covers its Sub-BUs); when both are sent the BU must belong to one of
+  // the Entities. Supersedes the single X-Company-Id BU, same as GET /employees. Only narrows:
+  // the caller's own accessWhere/scope below is still applied. Absent/empty = unchanged.
+  const multiBusinessUnitIds = await resolveMultiBusinessUnitFilter(query);
+  if (multiBusinessUnitIds) businessUnitId = multiBusinessUnitIds;
+
   if (!servicePOId) {
     const accessWhere = await employeeAccessControlService.resolveEmployeeAccessWhere(authContext);
     const employees = await employeeRepository.getActiveEmployees(authContext.companyId, accessWhere, businessUnitId);
@@ -1325,6 +1332,38 @@ const getActiveEmployees = async (authContext, servicePOId, businessUnitId = nul
   const employees = await employeeRepository.getActiveEmployees(employeeScopeId, employeeAccessWhere, businessUnitId);
   return attachBusinessUnitInfo(employees.map(toPlain));
 };
+
+/**
+ * Resolve the optional `entityIds` / `businessUnitIds` (comma-separated) query filters of an
+ * Employee option list into the Business Unit ids employees must be mapped to.
+ * - businessUnitIds: a Parent BU also pulls in its Sub-BUs; a Sub-BU / childless BU stays as is.
+ * - entityIds: the Companies under those Entities; with businessUnitIds too, the BU must belong
+ *   to one of them (AND).
+ * Same rule GET /employees applies inline (see getAll()).
+ *
+ * @param {object} query - req.query
+ * @returns {Promise<number[]|null>} null when neither filter is sent (caller keeps its current behaviour)
+ */
+async function resolveMultiBusinessUnitFilter(query = {}) {
+  const requestedEntityIds = parseIdList(query.entityIds);
+  const requestedBusinessUnitIds = parseIdList(query.businessUnitIds);
+  if (!requestedEntityIds && !requestedBusinessUnitIds) return null;
+
+  let businessUnitIds = requestedBusinessUnitIds
+    ? await companyAccessControlService.expandBusinessUnitIdsWithDescendants(requestedBusinessUnitIds)
+    : null;
+  if (requestedEntityIds) {
+    const companiesUnderEntities = await Company.findAll({
+      where: { entity_id: { [Op.in]: requestedEntityIds }, is_deleted: false },
+      attributes: ['id'],
+    });
+    const entityCompanyIds = companiesUnderEntities.map((c) => c.id);
+    businessUnitIds = businessUnitIds
+      ? businessUnitIds.filter((id) => entityCompanyIds.includes(id))
+      : entityCompanyIds;
+  }
+  return businessUnitIds;
+}
 
 /**
  * Return eligible candidates for Primary/Secondary Manager selection — the

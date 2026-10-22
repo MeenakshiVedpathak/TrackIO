@@ -31,7 +31,7 @@ const logger = require('../utils/logger');
  * created_by = them`).
  */
 
-const { resolveActorRecordAccessScope, resolveOptionalCreateCompanyId, resolveActorFullReach, intersectCompanyIdsWithEntity, intersectIdsWithBuHierarchy, expandBusinessUnitIdsToFamily, resolveCreateCompanyIdForActor } = companyAccessControlService;
+const { resolveActorRecordAccessScope, resolveOptionalCreateCompanyId, resolveActorFullReach, intersectCompanyIdsWithEntity, intersectIdsWithBuHierarchy, expandBusinessUnitIdsToFamily, resolveCreateCompanyIdForActor, narrowScopeByEntityAndBusinessUnit } = companyAccessControlService;
 
 /**
  * Retrieve a paginated list of clients with optional filters.
@@ -422,9 +422,14 @@ const deleteClient = async (id, userId, req) => {
  * @param {object} authContext - { companyId, hierarchyRank, employeeId }
  * @returns {Promise<Client[]>}
  */
-const getActiveClients = async (authContext) => {
+const getActiveClients = async (authContext, query = {}) => {
   const companyId = await resolveActorRecordAccessScope(authContext);
-  return clientRepository.getActiveClients(companyId);
+
+  // Optional entityIds/businessUnitIds (comma-separated) narrow the dropdown to clients whose
+  // company_id is in those BUs/Entities; absent/empty = unchanged, role-scoped list. An explicit
+  // filter drops the actor's own BU-less clients, same as GET /clients does.
+  const narrowing = await narrowScopeByEntityAndBusinessUnit(companyId, parseIdList(query.entityIds), parseIdList(query.businessUnitIds));
+  return clientRepository.getActiveClients(narrowing.narrowed ? narrowing.scope : companyId);
 };
 
 module.exports = {

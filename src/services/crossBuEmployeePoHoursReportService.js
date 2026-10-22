@@ -7,6 +7,7 @@ const { resolveAuthorizedEmployeeIds } = require('./employeeWorkLogHoursSummaryS
 const { expandBusinessUnitIdsWithDescendants } = require('./companyAccessControlService');
 const dateHelper = require('../helpers/dateHelper');
 const { parseIdList } = require('../utils/idListParser');
+const { resolveApprovalStatuses } = require('../utils/approvalStatusFilter');
 const { getPaginationMeta } = require('../utils/pagination');
 
 /**
@@ -34,12 +35,6 @@ const MAX_RANGE_DAYS = 366;
 const MAX_EXPORT_ROWS = 50000;
 
 const WORK_TYPE_LABELS = { own: 'Own BU', cross: 'Cross BU', na: 'Not Applicable' };
-const STATUS_FILTER = {
-  all: null,
-  pending: ['pending'],
-  approved: ['approved', 'synced'],
-  rejected: ['rejected'],
-};
 
 function badRequest(message) {
   const err = new Error(message);
@@ -105,7 +100,7 @@ async function buildFilters(query, authContext, companyIds) {
       projectIds: parseIdList(query.project_ids),
       servicePoIds: parseIdList(query.service_po_ids),
       poBuIds: poBuIds ? await expandBusinessUnitIdsWithDescendants(poBuIds) : null,
-      statuses: STATUS_FILTER[query.approval_status || 'all'],
+      statuses: resolveApprovalStatuses(query.approval_status),
       workType: query.work_type && query.work_type !== 'all' ? query.work_type : null,
       search: query.search || null,
     },

@@ -43,3 +43,4 @@ coverage/
 *.zip
 
 changes
+*.md

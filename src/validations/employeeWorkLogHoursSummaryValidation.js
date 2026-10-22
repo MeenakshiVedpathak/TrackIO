@@ -37,6 +37,9 @@ const employeeWorkLogHoursSummaryQuerySchema = Joi.object({
   ...periodFields,
   company_id: Joi.number().integer().positive().optional(),
   employeeId: Joi.number().integer().positive().optional(),
+  // Multi-select: comma-separated employee ids ("12,15"). Empty/absent = all.
+  employee_ids: Joi.string().trim().pattern(/^\d+(\s*,\s*\d+)*$/).optional().allow('')
+    .messages({ 'string.pattern.base': '"employee_ids" must be a comma-separated list of ids.' }),
   // Optional further narrowing on top of the caller's BU/role scope — see
   // companyAccessControlService.intersectCompanyIdsWithEntity().
   entityId: Joi.number().integer().positive().optional(),

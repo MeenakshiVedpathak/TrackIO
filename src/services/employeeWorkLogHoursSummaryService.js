@@ -72,8 +72,10 @@ async function getSummary(query, authContext, companyIds) {
   companyIds = await applyEntityBuFilters(companyIds, query);
   let employeeIds = await resolveAuthorizedEmployeeIds(authContext, companyIds);
 
-  if (query.employeeId) {
-    employeeIds = employeeIds.filter((id) => id === query.employeeId);
+  // employee_ids (comma-separated) is the multi-select form; singular employeeId kept as an alias.
+  const requestedEmployeeIds = parseIdList(query.employee_ids ?? query.employeeId);
+  if (requestedEmployeeIds) {
+    employeeIds = employeeIds.filter((id) => requestedEmployeeIds.includes(id));
   }
 
   const { page, limit, offset } = getPaginationParams(query);

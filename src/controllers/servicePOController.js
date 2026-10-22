@@ -66,7 +66,7 @@ const getAllServicePOs = async (req, res) => {
  */
 const getActivePOs = async (req, res) => {
   try {
-    const pos = await servicePOService.getActivePOs(buildAuthContext(req));
+    const pos = await servicePOService.getActivePOs(buildAuthContext(req), null, req.query);
     return sendSuccess(res, pos, 'Active Service POs fetched successfully.');
   } catch (error) {
     logger.error('getActivePOs error', { error: error.message });

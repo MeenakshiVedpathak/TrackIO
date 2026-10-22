@@ -5,6 +5,7 @@ const employeeServicePOMappingService = require('./employeeServicePOMappingServi
 const { resolveAuthorizedEmployeeIds, applyEntityBuFilters } = require('./employeeWorkLogHoursSummaryService');
 const dateHelper = require('../helpers/dateHelper');
 const { parseIdList } = require('../utils/idListParser');
+const { resolveApprovalStatuses } = require('../utils/approvalStatusFilter');
 const { getPaginationMeta } = require('../utils/pagination');
 
 /**
@@ -33,12 +34,6 @@ const STATUS_LABELS = {
 };
 
 // approval_status filter -> work-log statuses
-const STATUS_FILTER = {
-  all: null,
-  pending: ['pending'],
-  approved: ['approved', 'synced'],
-  rejected: ['rejected'],
-};
 
 function badRequest(message) {
   const err = new Error(message);
@@ -92,7 +87,7 @@ async function buildFilters(query, authContext, companyIds) {
       servicePoIds,
       clientIds: parseIdList(query.client_ids),
       filterEmployeeIds: parseIdList(query.employee_ids),
-      statuses: STATUS_FILTER[query.approval_status || 'all'],
+      statuses: resolveApprovalStatuses(query.approval_status),
       includeLeave: query.include_leave !== false,
       search: query.search || null,
     },

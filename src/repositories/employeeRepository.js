@@ -326,8 +326,12 @@ const getActiveEmployees = async (companyId, accessWhere = null, businessUnitId 
     : { status: 'active', is_deleted: false, ...(await employeeScope(companyId)) };
 
   if (businessUnitId) {
+    // A single id (X-Company-Id) or an array (entityIds/businessUnitIds multi-select).
     const buRows = await EmployeeBusinessUnit.findAll({
-      where: { business_unit_id: businessUnitId, status: 'active' },
+      where: {
+        business_unit_id: Array.isArray(businessUnitId) ? { [Op.in]: businessUnitId } : businessUnitId,
+        status: 'active',
+      },
       attributes: ['employee_id'],
       raw: true,
     });

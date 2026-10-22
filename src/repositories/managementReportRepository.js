@@ -125,7 +125,7 @@ async function getServicePOProfitability(filters) {
   const replacements = { monthNum, yearNum, limit, offset, companyIds };
   const conditions = ['(sp.company_id IN (:companyIds) OR ' + buLessServicePOInTenantSql('sp', 'companyIds') + ')', 'sp.is_billable = true'];
 
-  if (clientId) { conditions.push('sp.client_id = :clientId'); replacements.clientId = clientId; }
+  if (clientId) { conditions.push('sp.client_id IN (:clientId)'); replacements.clientId = [].concat(clientId); }
   if (poId) { conditions.push('sp.id = :poId'); replacements.poId = poId; }
   if (status && status !== 'all') { conditions.push('sp.status = :status'); replacements.status = status; }
   if (isBillable !== undefined) { conditions.push('sp.is_billable = :isBillable'); replacements.isBillable = isBillable; }
@@ -230,7 +230,7 @@ async function getBudgetedMarginForecast(filters) {
   const replacements = { monthNum, yearNum, monthYear, limit, offset, companyIds };
   const conditions = ["(cbm.company_id IN (:companyIds) OR cbm.company_id IS NULL)", "cbm.status = 'active'", 'cbm.month = :monthNum', 'cbm.year = :yearNum'];
 
-  if (clientId) { conditions.push('sp.client_id = :clientId'); replacements.clientId = clientId; }
+  if (clientId) { conditions.push('sp.client_id IN (:clientId)'); replacements.clientId = [].concat(clientId); }
   if (poId) { conditions.push('sp.id = :poId'); replacements.poId = poId; }
   if (status && status !== 'all') { conditions.push('sp.status = :status'); replacements.status = status; }
   if (search) {
@@ -826,7 +826,7 @@ async function getServicePOTimelineRiskRaw(filters) {
   ];
 
   if (status && status !== 'all') { conditions.push('sp.status = :status'); replacements.status = status; }
-  if (clientId) { conditions.push('sp.client_id = :clientId'); replacements.clientId = clientId; }
+  if (clientId) { conditions.push('sp.client_id IN (:clientId)'); replacements.clientId = [].concat(clientId); }
   if (poId) { conditions.push('sp.id = :poId'); replacements.poId = poId; }
   if (search) {
     conditions.push('(c.client_name ILIKE :search OR sp.service_po_name ILIKE :search OR sp.service_po_code ILIKE :search)');
@@ -1036,7 +1036,7 @@ async function getInvoiceRealizationTrend(filters) {
   };
 
   const conditions = ['(sp.company_id IN (:companyIds) OR ' + buLessServicePOInTenantSql('sp', 'companyIds') + ')', '(spmb.year * 100 + spmb.month) BETWEEN :startPeriod AND :endPeriod'];
-  if (clientId) { conditions.push('sp.client_id = :clientId'); replacements.clientId = clientId; }
+  if (clientId) { conditions.push('sp.client_id IN (:clientId)'); replacements.clientId = [].concat(clientId); }
   if (poId) { conditions.push('sp.id = :poId'); replacements.poId = poId; }
   if (search) {
     conditions.push('(c.client_name ILIKE :search OR sp.service_po_name ILIKE :search)');

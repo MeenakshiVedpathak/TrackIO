@@ -12,6 +12,32 @@ const monthlyCapService = require('../services/monthlyCapService');
  * and JOINs that are cumbersome to express cleanly through the ORM.
  */
 
+// Multi-select filters (employeeId / clientId / poId / serviceTypeId /
+// serviceCategoryId / status) reach this layer as a scalar, a comma-separated
+// string or an array, and are always bound as `IN (:param)`. Sequelize expands
+// an array replacement into a comma list; a scalar is wrapped first.
+function toIdArray(value) {
+  const raw = Array.isArray(value) ? value : String(value).split(',');
+  const ids = raw.map((v) => parseInt(String(v).trim(), 10)).filter((n) => !Number.isNaN(n));
+  return ids.length > 0 ? ids : [0]; // [0] matches nothing; `IN ()` is invalid SQL
+}
+
+function statusList(value) {
+  if (value === undefined || value === null) return [];
+  const raw = Array.isArray(value) ? value : String(value).split(',');
+  return raw.map((v) => String(v).trim()).filter(Boolean);
+}
+
+// No status filter when absent, or when "all" is among the selected values.
+function hasStatusFilter(value) {
+  const list = statusList(value);
+  return list.length > 0 && !list.includes('all');
+}
+
+function toStatusArray(value) {
+  return statusList(value);
+}
+
 // ORIGINAL (pre-cap-scaling) hours the employee actually logged. Always this
 // expression, independent of hoursSource (which only drives the synced/adjusted
 // figures). NULL original_hours on legacy rows falls back to hours_logged.
@@ -188,7 +214,7 @@ async function getEmployeeHourlyRate(filters) {
   const conditions = ["e.status = 'active'", EMPLOYEE_COMPANY_SCOPE_SQL_MULTI];
 
   if (employeeId) {
-    conditions.push('e.id = :employeeId');
+    conditions.push('e.id IN (:employeeId)');
     replacements.employeeId = employeeId;
   }
   if (search) {
@@ -424,11 +450,11 @@ async function getTimesheetSummary(filters) {
     replacements.endDate = endDate;
   }
   if (employeeId) {
-    conditions.push('t.employee_id = :employeeId');
+    conditions.push('t.employee_id IN (:employeeId)');
     replacements.employeeId = employeeId;
   }
   if (poId) {
-    conditions.push('t.service_po_id = :poId');
+    conditions.push('t.service_po_id IN (:poId)');
     replacements.poId = poId;
   }
   if (search) {
@@ -546,11 +572,11 @@ async function getServicePOUtilisation(filters) {
   const conditions = ['(sp.company_id IN (:companyIds) OR ' + buLessServicePOInTenantSql('sp', 'companyIds') + ')'];
 
   if (poId) {
-    conditions.push('sp.id = :poId');
+    conditions.push('sp.id IN (:poId)');
     replacements.poId = poId;
   }
-  if (status && status !== 'all') {
-    conditions.push('sp.status = :status');
+  if (hasStatusFilter(status)) {
+    conditions.push('sp.status IN (:status)');
     replacements.status = status;
   }
   if (search) {
@@ -673,11 +699,11 @@ async function getSubProjectHours(filters) {
   const conditions = ['(subp.company_id IN (:companyIds) OR subp.company_id IS NULL)'];
 
   if (poId) {
-    conditions.push('subp.service_po_id = :poId');
+    conditions.push('subp.service_po_id IN (:poId)');
     replacements.poId = poId;
   }
-  if (status && status !== 'all') {
-    conditions.push('subp.status = :status');
+  if (hasStatusFilter(status)) {
+    conditions.push('subp.status IN (:status)');
     replacements.status = status;
   }
   if (search) {
@@ -814,19 +840,19 @@ async function getResourceAllocation(filters) {
   const conditions = ["e.status = 'active'", EMPLOYEE_COMPANY_SCOPE_SQL_MULTI];
 
   if (employeeId) {
-    conditions.push('e.id = :employeeId');
+    conditions.push('e.id IN (:employeeId)');
     replacements.employeeId = employeeId;
   }
   if (poId) {
-    conditions.push('sp.id = :poId');
+    conditions.push('sp.id IN (:poId)');
     replacements.poId = poId;
   }
   if (clientId) {
-    conditions.push('c.id = :clientId');
+    conditions.push('c.id IN (:clientId)');
     replacements.clientId = clientId;
   }
-  if (status && status !== 'all') {
-    conditions.push('sp.status = :status');
+  if (hasStatusFilter(status)) {
+    conditions.push('sp.status IN (:status)');
     replacements.status = status;
   }
   if (isBillable !== undefined) {
@@ -834,11 +860,11 @@ async function getResourceAllocation(filters) {
     replacements.isBillable = isBillable;
   }
   if (serviceTypeId) {
-    conditions.push('st.id = :serviceTypeId');
+    conditions.push('st.id IN (:serviceTypeId)');
     replacements.serviceTypeId = serviceTypeId;
   }
   if (serviceCategoryId) {
-    conditions.push('sc.id = :serviceCategoryId');
+    conditions.push('sc.id IN (:serviceCategoryId)');
     replacements.serviceCategoryId = serviceCategoryId;
   }
   if (search) {
@@ -990,7 +1016,7 @@ async function getOperationalCostBreakdown(filters) {
     replacements.month = month;
   }
   if (employeeId) {
-    conditions.push('e.id = :employeeId');
+    conditions.push('e.id IN (:employeeId)');
     replacements.employeeId = employeeId;
   }
   if (search) {
@@ -1153,7 +1179,7 @@ async function getEmployeeUtilizationSummary(filters) {
 
   const empConditions = ["e.status = 'active'", EMPLOYEE_COMPANY_SCOPE_SQL_MULTI];
   if (employeeId) {
-    empConditions.push('e.id = :employeeId');
+    empConditions.push('e.id IN (:employeeId)');
     replacements.employeeId = employeeId;
   }
   if (search) {
@@ -1395,12 +1421,12 @@ async function getServicePOSummary(filters) {
   }
   const conditions = [`(${scopeCondition})`];
 
-  if (status && status !== 'all') {
-    conditions.push('sp.status = :status');
+  if (hasStatusFilter(status)) {
+    conditions.push('sp.status IN (:status)');
     replacements.status = status;
   }
   if (clientId) {
-    conditions.push('sp.client_id = :clientId');
+    conditions.push('sp.client_id IN (:clientId)');
     replacements.clientId = clientId;
   }
   if (isBillable !== undefined) {
@@ -1408,15 +1434,15 @@ async function getServicePOSummary(filters) {
     replacements.isBillable = isBillable;
   }
   if (serviceTypeId) {
-    conditions.push('st.id = :serviceTypeId');
+    conditions.push('st.id IN (:serviceTypeId)');
     replacements.serviceTypeId = serviceTypeId;
   }
   if (serviceCategoryId) {
-    conditions.push('sc.id = :serviceCategoryId');
+    conditions.push('sc.id IN (:serviceCategoryId)');
     replacements.serviceCategoryId = serviceCategoryId;
   }
   if (poId) {
-    conditions.push('sp.id = :poId');
+    conditions.push('sp.id IN (:poId)');
     replacements.poId = poId;
   }
   if (startDate) {
@@ -1618,12 +1644,12 @@ async function getInvoicePOSummary(filters) {
   }
   const conditions = [`(${scopeCondition})`];
 
-  if (status && status !== 'all') {
-    conditions.push('sp.status = :status');
+  if (hasStatusFilter(status)) {
+    conditions.push('sp.status IN (:status)');
     replacements.status = status;
   }
   if (clientId) {
-    conditions.push('sp.client_id = :clientId');
+    conditions.push('sp.client_id IN (:clientId)');
     replacements.clientId = clientId;
   }
   if (isBillable !== undefined) {
@@ -1631,15 +1657,15 @@ async function getInvoicePOSummary(filters) {
     replacements.isBillable = isBillable;
   }
   if (serviceTypeId) {
-    conditions.push('st.id = :serviceTypeId');
+    conditions.push('st.id IN (:serviceTypeId)');
     replacements.serviceTypeId = serviceTypeId;
   }
   if (serviceCategoryId) {
-    conditions.push('sc.id = :serviceCategoryId');
+    conditions.push('sc.id IN (:serviceCategoryId)');
     replacements.serviceCategoryId = serviceCategoryId;
   }
   if (poId) {
-    conditions.push('sp.id = :poId');
+    conditions.push('sp.id IN (:poId)');
     replacements.poId = poId;
   }
   if (startDate) {
@@ -1814,7 +1840,7 @@ async function getResourceUtilization(filters) {
 
   const empConditions = [];
   if (employeeId) {
-    empConditions.push('e.id = :employeeId');
+    empConditions.push('e.id IN (:employeeId)');
     replacements.employeeId = parseInt(employeeId, 10);
   }
   if (search) {
@@ -1972,7 +1998,7 @@ async function getMonthlyResourceUtilization(filters) {
   ];
 
   if (employeeId) {
-    conditions.push('e.id = :employeeId');
+    conditions.push('e.id IN (:employeeId)');
     replacements.employeeId = parseInt(employeeId, 10);
   }
   if (search) {
@@ -2192,19 +2218,19 @@ async function getResourceMonthlyUtilization(filters) {
   ];
 
   if (employeeId) {
-    conditions.push('e.id = :employeeId');
+    conditions.push('e.id IN (:employeeId)');
     replacements.employeeId = parseInt(employeeId, 10);
   }
   if (clientId) {
-    conditions.push('c.id = :clientId');
+    conditions.push('c.id IN (:clientId)');
     replacements.clientId = parseInt(clientId, 10);
   }
   if (poId) {
-    conditions.push('sp.id = :poId');
+    conditions.push('sp.id IN (:poId)');
     replacements.poId = parseInt(poId, 10);
   }
   if (serviceTypeId) {
-    conditions.push('st.id = :serviceTypeId');
+    conditions.push('st.id IN (:serviceTypeId)');
     replacements.serviceTypeId = parseInt(serviceTypeId, 10);
   }
   if (search) {
@@ -2352,6 +2378,7 @@ async function getResourseProjectUtilizationReport(filters) {
     serviceTypeIds,
     projectType,
     categoryId,
+    serviceCategoryIds,
     category,
     subProjectId,
     projectSubType,
@@ -2408,6 +2435,10 @@ async function getResourseProjectUtilizationReport(filters) {
   if (serviceTypeIds && serviceTypeIds.length > 0) {
     multiSelectConditions.push('st.id IN (:serviceTypeIds)');
     replacements.serviceTypeIds = serviceTypeIds;
+  }
+  if (serviceCategoryIds && serviceCategoryIds.length > 0) {
+    multiSelectConditions.push('sc.id IN (:serviceCategoryIds)');
+    replacements.serviceCategoryIds = serviceCategoryIds;
   }
   const multiSelectBlock = multiSelectConditions.map((c) => `AND ${c}`).join('\n    ');
 
@@ -2642,23 +2673,23 @@ async function getClientServicePOHours(filters) {
   ];
 
   if (clientId) {
-    conditions.push('sp.client_id = :clientId');
+    conditions.push('sp.client_id IN (:clientId)');
     replacements.clientId = clientId;
   }
   if (poId) {
-    conditions.push('sp.id = :poId');
+    conditions.push('sp.id IN (:poId)');
     replacements.poId = poId;
   }
   if (serviceTypeId) {
-    conditions.push('st.id = :serviceTypeId');
+    conditions.push('st.id IN (:serviceTypeId)');
     replacements.serviceTypeId = serviceTypeId;
   }
   if (employeeId) {
-    conditions.push('t.employee_id = :employeeId');
+    conditions.push('t.employee_id IN (:employeeId)');
     replacements.employeeId = employeeId;
   }
-  if (status && status !== 'all') {
-    conditions.push('sp.status = :status');
+  if (hasStatusFilter(status)) {
+    conditions.push('sp.status IN (:status)');
     replacements.status = status;
   }
   // Role ID 5 only: exclude unpublished timesheet rows — same guard used
@@ -2740,19 +2771,19 @@ function buildTrendFilters(filters, replacements, scopeMode = 'employee') {
   replacements.endDate = endDate;
 
   if (employeeId) {
-    conditions.push('t.employee_id = :employeeId');
+    conditions.push('t.employee_id IN (:employeeId)');
     replacements.employeeId = employeeId;
   }
   if (clientId) {
-    conditions.push('sp.client_id = :clientId');
+    conditions.push('sp.client_id IN (:clientId)');
     replacements.clientId = clientId;
   }
   if (poId) {
-    conditions.push('t.service_po_id = :poId');
+    conditions.push('t.service_po_id IN (:poId)');
     replacements.poId = poId;
   }
   if (serviceTypeId) {
-    conditions.push('st.id = :serviceTypeId');
+    conditions.push('st.id IN (:serviceTypeId)');
     replacements.serviceTypeId = serviceTypeId;
   }
   // Role ID 5 only: exclude unpublished timesheet rows — same guard used
@@ -2942,20 +2973,20 @@ async function getClientWiseAnalyticsCost(filters) {
   ];
 
   if (clientId) {
-    conditions.push('sp.client_id = :clientId');
+    conditions.push('sp.client_id IN (:clientId)');
     replacements.clientId = clientId;
   }
   if (poId) {
-    conditions.push('sp.id = :poId');
+    conditions.push('sp.id IN (:poId)');
     replacements.poId = poId;
   }
   if (serviceTypeId) {
-    conditions.push('st.id = :serviceTypeId');
+    conditions.push('st.id IN (:serviceTypeId)');
     replacements.serviceTypeId = serviceTypeId;
   }
   if (employeeId) {
     conditions.push(
-      'EXISTS (SELECT 1 FROM timesheets et WHERE et.service_po_id = sp.id AND et.employee_id = :employeeId ' +
+      'EXISTS (SELECT 1 FROM timesheets et WHERE et.service_po_id = sp.id AND et.employee_id IN (:employeeId) ' +
       'AND et.timesheet_date >= :empStartDate AND et.timesheet_date <= :empEndDate)'
     );
     replacements.employeeId = employeeId;
@@ -2998,15 +3029,15 @@ async function getMonthlyCostByCategory(filters) {
   ];
 
   if (clientId) {
-    conditions.push('sp.client_id = :clientId');
+    conditions.push('sp.client_id IN (:clientId)');
     replacements.clientId = clientId;
   }
   if (poId) {
-    conditions.push('sp.id = :poId');
+    conditions.push('sp.id IN (:poId)');
     replacements.poId = poId;
   }
   if (serviceTypeId) {
-    conditions.push('st.id = :serviceTypeId');
+    conditions.push('st.id IN (:serviceTypeId)');
     replacements.serviceTypeId = serviceTypeId;
   }
 
@@ -3151,6 +3182,7 @@ async function getNoWorkTrendReport(filters) {
        ROUND(SUM(${ORIGINAL_HOURS_SQL})::NUMERIC, 2) AS original_no_work_hours
      FROM timesheets t
      INNER JOIN service_pos sp ON sp.id = t.service_po_id
+     LEFT JOIN service_types st ON st.id = sp.service_type_id
      WHERE ${whereClause}
        AND LOWER(sp.service_po_name) IN ('idle', 'on bench')
      GROUP BY year, month
@@ -3261,15 +3293,15 @@ async function getServicePOCostBudgetByMonth(filters) {
   ];
 
   if (clientId) {
-    conditions.push('sp.client_id = :clientId');
+    conditions.push('sp.client_id IN (:clientId)');
     replacements.clientId = clientId;
   }
   if (poId) {
-    conditions.push('sp.id = :poId');
+    conditions.push('sp.id IN (:poId)');
     replacements.poId = poId;
   }
   if (serviceTypeId) {
-    conditions.push('st.id = :serviceTypeId');
+    conditions.push('st.id IN (:serviceTypeId)');
     replacements.serviceTypeId = serviceTypeId;
   }
 
@@ -3344,7 +3376,7 @@ async function getEmployeeBenchRoster(filters) {
   const replacements = { companyIds };
   const conditions = ["e.status = 'active'", 'e.is_deleted = false', EMPLOYEE_COMPANY_SCOPE_SQL_MULTI];
   if (employeeId) {
-    conditions.push('e.id = :employeeId');
+    conditions.push('e.id IN (:employeeId)');
     replacements.employeeId = employeeId;
   }
 
@@ -3381,15 +3413,15 @@ async function getBudgetVsBilled(filters) {
   ];
 
   if (clientId) {
-    conditions.push('sp.client_id = :clientId');
+    conditions.push('sp.client_id IN (:clientId)');
     replacements.clientId = clientId;
   }
   if (poId) {
-    conditions.push('sp.id = :poId');
+    conditions.push('sp.id IN (:poId)');
     replacements.poId = poId;
   }
   if (serviceTypeId) {
-    conditions.push('st.id = :serviceTypeId');
+    conditions.push('st.id IN (:serviceTypeId)');
     replacements.serviceTypeId = serviceTypeId;
   }
 

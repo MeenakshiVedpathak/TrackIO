@@ -4,7 +4,7 @@ const projectRepository = require('../repositories/projectRepository');
 const clientRepository = require('../repositories/clientRepository');
 const employeeBusinessUnitRepository = require('../repositories/employeeBusinessUnitRepository');
 const companyAccessControlService = require('./companyAccessControlService');
-const { resolveActorCompanyScope, resolveCreateCompanyIdForActor, resolveActorFullReach, intersectCompanyIdsWithEntity, intersectIdsWithBuHierarchy, expandBusinessUnitIdsToFamily } = companyAccessControlService;
+const { resolveActorCompanyScope, resolveCreateCompanyIdForActor, resolveActorFullReach, intersectCompanyIdsWithEntity, intersectIdsWithBuHierarchy, expandBusinessUnitIdsToFamily, narrowScopeByEntityAndBusinessUnit } = companyAccessControlService;
 const { generateProjectCode } = require('../helpers/codeGenerator');
 const { createAuditLog, getIpAddress } = require('../middlewares/auditLog');
 const { getPaginationParams, getPaginationMeta } = require('../utils/pagination');
@@ -513,8 +513,16 @@ const deleteProject = async (id, userId, req) => {
  * @param {object} authContext - { companyId, hierarchyRank, employeeId }
  * @returns {Promise<Project[]>}
  */
-const getActiveProjects = async (authContext) => {
+const getActiveProjects = async (authContext, query = {}) => {
   const companyId = await resolveActorCompanyScope(authContext);
+
+  // Optional entityIds/businessUnitIds (comma-separated) narrow the dropdown to projects whose
+  // company_id is in those BUs/Entities; absent/empty = unchanged. An explicit filter is a strict
+  // company_id match, so the actor's own BU-less projects (createdBy) are not mixed in.
+  const narrowing = await narrowScopeByEntityAndBusinessUnit(companyId, parseIdList(query.entityIds), parseIdList(query.businessUnitIds));
+  if (narrowing.narrowed) {
+    return projectRepository.getActiveProjects(narrowing.scope, null);
+  }
   return projectRepository.getActiveProjects(companyId, authContext.employeeId);
 };
 

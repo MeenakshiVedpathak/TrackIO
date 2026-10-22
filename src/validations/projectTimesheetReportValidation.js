@@ -1,6 +1,7 @@
 'use strict';
 
 const Joi = require('joi');
+const { validateApprovalStatus } = require('../utils/approvalStatusFilter');
 
 // Comma-separated id list, e.g. "12,15" — parsed by utils/idListParser.
 const idList = Joi.string().trim().pattern(/^\d+(\s*,\s*\d+)*$/).optional().allow('')
@@ -35,7 +36,8 @@ const projectTimesheetReportQuerySchema = Joi.object({
   client_ids: idList,
   employee_ids: idList,
   search: Joi.string().trim().max(100).allow('').optional(),
-  approval_status: Joi.string().valid('all', 'pending', 'approved', 'rejected').default('all'),
+  // One value or a comma-separated list ("pending,approved"); "all" = no filter.
+  approval_status: Joi.string().trim().custom(validateApprovalStatus).default('all'),
   // With a Project / Service PO / Client filter: also show those employees'
   // leave entries in the period. Without one: include/exclude leave rows.
   include_leave: Joi.boolean().default(true),

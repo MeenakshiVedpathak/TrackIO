@@ -50,12 +50,18 @@ const teamLeadEmployeeProjectHoursExportQuerySchema = Joi.object({
   .and('month', 'year')
   .oxor('month', 'startDate');
 
-/** GET /reports/team-lead-employee-project-hours/filter-options — optional period only. */
+/**
+ * GET /reports/team-lead-employee-project-hours/filter-options — optional period, plus optional
+ * entityIds / buIds / subBuIds (comma-separated) to narrow the returned employees and clients.
+ */
 const teamLeadEmployeeProjectHoursFilterOptionsQuerySchema = Joi.object({
   month: Joi.number().integer().min(1).max(12).optional(),
   year: Joi.number().integer().min(2000).max(2100).optional(),
   startDate: Joi.date().iso().optional(),
   endDate: Joi.date().iso().min(Joi.ref('startDate')).optional(),
+  entityIds: idList,
+  buIds: idList,
+  subBuIds: idList,
 })
   .and('month', 'year')
   .oxor('month', 'startDate');
