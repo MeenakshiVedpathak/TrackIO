@@ -1,0 +1,1129 @@
+'use strict';
+
+const servicePORepository = require('../repositories/servicePORepository');
+const clientRepository = require('../repositories/clientRepository');
+const projectRepository = require('../repositories/projectRepository');
+const employeeRepository = require('../repositories/employeeRepository');
+const employeeBusinessUnitRepository = require('../repositories/employeeBusinessUnitRepository');
+const employeeRoleRepository = require('../repositories/employeeRoleRepository');
+const employeeServicePOMappingRepository = require('../repositories/employeeServicePOMappingRepository');
+const servicePOHierarchyRepository = require('../repositories/servicePOHierarchyRepository');
+const timesheetRepository = require('../repositories/timesheetRepository');
+const employeeWorkLogRepository = require('../repositories/employeeWorkLogRepository');
+const employeeServicePOMappingService = require('./employeeServicePOMappingService');
+const { resolveActorCompanyScope, resolveCreateCompanyIdForActor, resolveActorCompanyScopeForSelectedBU, resolveActorFullReach, resolveCentralisedOwnerCreatorIds, resolveCentralisedServicePOTenant, intersectCompanyIdsWithEntity, intersectIdsWithBuHierarchy, narrowScopeByEntityAndBusinessUnit, areSameOrRelatedBusinessUnits } = require('./companyAccessControlService');
+const { Employee, Company, sequelize } = require('../models');
+const { Op } = require('sequelize');
+const { createAuditLog, getIpAddress } = require('../middlewares/auditLog');
+const { getPaginationParams, getPaginationMeta } = require('../utils/pagination');
+const { parseIdList } = require('../utils/idListParser');
+const logger = require('../utils/logger');
+const aiInsightService = require('./aiInsight.service');
+
+/**
+ * ServicePO Service
+ * All business logic for Service POs and resource allocation.
+ */
+
+// Valid status transitions when closing or updating
+const ALLOWED_CLOSE_FROM = ['active'];
+
+/**
+ * Resolve the `centralisedOwnerIds` a read/view/map call passes into
+ * servicePORepository's `includeCentralised`-widened calls (findAll/
+ * findById/getActivePOs) — the tenant boundary for a BU-less Centralised
+ * Service PO. `companyId` here is whatever resolveActorCompanyScope()/
+ * resolveActorCompanyScopeForSelectedBU() already resolved for this actor —
+ * a plain number OR an array (see servicePORepository.companyScope()'s doc
+ * comment on why both shapes occur in real traffic) — normalized to an
+ * array of the actor's own reachable Business Unit ids before being handed
+ * to resolveCentralisedOwnerCreatorIds(), which resolves it the rest of the
+ * way to actual employeeIds.
+ *
+ * @param {number|number[]|null} companyId
+ * @returns {Promise<number[]>}
+ */
+async function resolveCentralisedOwnerIds(companyId) {
+  const ownCompanyIds = Array.isArray(companyId) ? companyId : (companyId != null ? [companyId] : []);
+  return resolveCentralisedOwnerCreatorIds(ownCompanyIds);
+}
+
+/**
+ * Confirm a Project belongs to the given Client — the cross-check the
+ * Client -> Project -> Service PO flow needs on top of each FK's own
+ * existence/active/same-company validation (both of which are already
+ * enforced by clientRepository.findById()/projectRepository.findById()
+ * being company-scoped). Shared by create() and update() so the rule is
+ * never duplicated.
+ *
+ * @param {Project} project - already resolved via projectRepository.findById()
+ * @param {number} clientId
+ */
+function assertProjectBelongsToClient(project, clientId) {
+  if (project.client_id !== clientId) {
+    const err = new Error('The selected Project does not belong to the selected Client.');
+    err.statusCode = 400;
+    throw err;
+  }
+}
+
+/**
+ * Confirm a candidate Client/Project belongs to this Service PO's company —
+ * matched two ways: its own company_id equals the PO's companyId, OR it has
+ * no company_id at all yet (an Admin/Entity Admin may create a Client or
+ * Project before assigning either to a Business Unit at all — see
+ * clientService.js/projectService.js's resolveOptionalCreateCompanyId()
+ * usage). A strict companyId-scoped findById() alone would 404 that record
+ * here even though it's genuinely available to attach — the exact
+ * "Client not found" a company-less Admin hits picking their own
+ * not-yet-assigned Client. Same idiom as assertValidDeliveryHead() above:
+ * fetched UNSCOPED (clientRepository/projectRepository's findByIdUnscoped)
+ * and checked after, so an unrelated company's record still simply resolves
+ * "not found" below, never leaking cross-company existence.
+ *
+ * BU Hierarchy / Sub-BU support: also true when `candidate.company_id` and
+ * `companyId` are the same tenant one hop apart in the hierarchy (a Sub-BU
+ * referencing its Parent's shared Client/Project, or vice versa) — see
+ * companyAccessControlService.areSameOrRelatedBusinessUnits().
+ *
+ * @param {{company_id: number|null}|null} candidate
+ * @param {number} companyId
+ * @returns {Promise<boolean>}
+ */
+async function belongsToCompanyOrUnassigned(candidate, companyId) {
+  if (!candidate) return false;
+  if (candidate.company_id === null || candidate.company_id === companyId) return true;
+  return areSameOrRelatedBusinessUnits(candidate.company_id, companyId);
+}
+
+/**
+ * Confirm a candidate Delivery Head: exists, belongs to the same Company
+ * as the Service PO, is active, and is not soft-deleted. Always an
+ * Employee Master id — never a User Master id (see ServicePO.js's model
+ * doc comment on the `deliveryHead` association).
+ *
+ * "Belongs to the Company" is checked two ways, since the Employee Identity
+ * redesign left both live: the legacy single `employees.company_id`
+ * column (still populated for BU-scoped-created employees) OR a row in
+ * `employee_business_units` (the multi-BU membership table — see
+ * models/index.js's Employee<->Company belongsToMany doc comment). An
+ * Admin-created Employee with no home `company_id` but a BU grant for
+ * this exact company must still be a valid pick here. Fetched unscoped by
+ * company and checked after, not via employeeRepository.findById()'s
+ * strict single-column companyScope(), so that BU-membership case isn't
+ * missed; an employee from another company entirely, or a deleted one,
+ * still simply resolves as "not found" below — the same branch as a
+ * genuinely missing id, which is deliberate (never leak cross-company
+ * existence).
+ *
+ * `companyId` may itself be `null` — a Business Unit is mandatory for a
+ * NEW Service PO (see servicePOService.create()'s resolveCreateCompanyId()
+ * usage), but this is also called from update() with `existing.company_id`,
+ * which can still be `null` on a Service PO created before that requirement
+ * existed. There is then no target company to check membership against, so
+ * this only confirms the employee exists and is active; company-membership
+ * reconciles once a Business Unit is actually assigned. (Deliberately NOT
+ * treated as "`employee.company_id ===
+ * null` counts as belonging" — that would match almost every Employee post-
+ * redesign, since employees.company_id is left NULL in favor of
+ * employee_business_units — an unrelated employee would wrongly pass.)
+ *
+ * @param {number} employeeId
+ * @param {number|null} companyId
+ * @returns {Promise<Employee>}
+ */
+async function assertValidDeliveryHead(employeeId, companyId) {
+  const employee = await employeeRepository.findById(employeeId, null);
+  const belongsToCompany = companyId == null
+    ? !!employee
+    : !!employee &&
+      (employee.company_id === companyId || (await employeeBusinessUnitRepository.exists(employeeId, companyId)));
+
+  if (!belongsToCompany) {
+    const err = new Error('Delivery Head employee not found.');
+    err.statusCode = 404;
+    throw err;
+  }
+  if (employee.status !== 'active') {
+    const err = new Error('Cannot assign an inactive employee as Delivery Head.');
+    err.statusCode = 400;
+    throw err;
+  }
+  return employee;
+}
+
+/**
+ * Project Manager / Delivery Head see ONLY Service POs individually mapped
+ * to them (employee_servicepo_mapping, an active row) — NOT every PO in
+ * their own mapped Business Unit(s). A PO mapped to them shows even when its
+ * own BU isn't one of theirs; just as importantly, a PO in their own mapped
+ * BU that ISN'T individually mapped to them stays hidden — visibility is
+ * driven entirely by the mapping, never by BU membership, for these two
+ * roles. Every other role stays strictly BU-scoped, completely unaffected.
+ *
+ * Role-Based Login (auth.js) scopes a session to the ONE role picked at
+ * login — a multi-role Employee (e.g. holds BOTH "BU Admin" and "Project
+ * Manager") who selected BU Admin for this session must get the normal
+ * BU-wide scope, not Project Manager's individually-mapped-only
+ * restriction, just because they ALSO happen to hold that role on some
+ * other login. `roleNames`, when given, is the caller's already-resolved
+ * ACTIVE-role names (req.employeeRoleNames — server-verified from the JWT's
+ * activeRoleId, never client-submitted) and is used as-is; omitted (no
+ * caller currently does, kept only so a pre-existing token issued before
+ * Role-Based Login shipped degrades the same way auth.js itself documents
+ * for that case) falls back to every role the Employee has ever held.
+ *
+ * @param {number} employeeId
+ * @param {string[]|null} [roleNames] - the caller's active-session role
+ *   names; omitted/null re-fetches every held role from the database.
+ * @returns {Promise<number[]|null>} service_po ids (possibly empty — the
+ *   role qualifies but has no active mappings yet, so it sees NO Service
+ *   POs at all) when the role qualifies; `null` when it doesn't, meaning
+ *   "not applicable, use the normal BU scope" (see
+ *   servicePORepository.companyScope()'s doc comment for how the two are
+ *   told apart downstream).
+ */
+async function resolveIndividuallyMappedServicePOIds(employeeId, roleNames = null) {
+  const names = roleNames || (await employeeRoleRepository.findRolesByEmployeeId(employeeId)).map((role) => role.role_name);
+  const qualifies = employeeServicePOMappingService.hasUnrestrictedServicePOVisibility(names);
+  if (!qualifies) return null;
+
+  const mappings = await employeeServicePOMappingRepository.findAllByEmployee(employeeId, 'active');
+  return mappings.map((mapping) => mapping.service_po_id);
+}
+
+/**
+ * Return a paginated list of Service POs.
+ *
+ * Respects an OPTIONALLY selected Global Business Unit (X-Company-Id
+ * header) for a company-less actor (Admin/Entity Admin), same as
+ * getActivePOs() below — this is the "Search Service PO..." dropdown's own
+ * list endpoint, so it must narrow the same way when a BU is selected,
+ * instead of always returning every owned Company's POs regardless of the
+ * UI's current BU selection. Falls back to the full owned set when none is
+ * selected, unchanged from before. A BU-scoped actor is unaffected either
+ * way (already limited to their own single active BU).
+ *
+ * A Project Manager/Delivery Head is scoped ENTIRELY differently: instead
+ * of the BU-based `companyId`/`centralisedOwnerIds` scoping above, they see
+ * ONLY their individually-mapped Service POs (companyScope() overrides,
+ * never unions, when `mappedServicePOIds` is non-null) — see
+ * resolveIndividuallyMappedServicePOIds()'s doc comment.
+ *
+ * @param {object} query - req.query
+ * @param {object} authContext - { companyId, hierarchyRank, employeeId }
+ * @param {number|null} [headerCompanyId] - parsed X-Company-Id header, if any
+ * @returns {Promise<{ data: ServicePO[], meta: object }>}
+ */
+const getAll = async (query = {}, authContext, headerCompanyId = null) => {
+  // Visibility scope (company / BU filter / Centralised / mapped POs) — shared with getCreators().
+  const scope = await resolveListVisibilityScope(query, authContext, headerCompanyId);
+  const { page, limit, offset } = getPaginationParams(query);
+
+  const filters = {
+    search: query.search || null,
+    status: query.status || 'active',
+    client_id: query.client_id ? parseInt(query.client_id, 10) : null,
+    service_category_id: query.service_category_id ? parseInt(query.service_category_id, 10) : null,
+    service_type_id: query.service_type_id ? parseInt(query.service_type_id, 10) : null,
+    service_po_id: query.service_po_id ? parseInt(query.service_po_id, 10) : null,
+    created_by: query.created_by ? parseInt(query.created_by, 10) : null,
+    is_billable: query.is_billable !== undefined ? query.is_billable : undefined,
+    start_date_from: query.start_date_from || null,
+    start_date_to: query.start_date_to || null,
+    // companyId / createdBy / centralisedOwnerIds / centralisedTenant / mappedServicePOIds — see resolveListVisibilityScope().
+    ...scope,
+  };
+
+  const sort = {
+    sortBy: query.sort_by || 'created_at',
+    sortOrder: query.sort_order || 'DESC',
+  };
+
+  const { rows, count } = await servicePORepository.findAll(filters, { limit, offset }, sort);
+  const meta = getPaginationMeta(count, page, limit);
+
+  // "Project Manager" column — one batched lookup for exactly this page's
+  // (already scoped/filtered/paginated) POs; always an array, [] when none.
+  const pmByServicePO = await employeeServicePOMappingService.getProjectManagersByServicePOIds(rows.map((row) => row.id));
+  const data = rows.map((row) => {
+    const plain = typeof row.get === 'function' ? row.get({ plain: true }) : row;
+    // company_id may point at a Sub-BU: BU = its parent's name, Sub BU = its
+    // own name (null when the PO sits directly on a top-level BU).
+    const company = plain.company || null;
+    const isSubBu = !!(company && company.parent_business_unit_id != null);
+    return {
+      ...plain,
+      bu_name: company ? (isSubBu && company.parent ? company.parent.company_name : company.company_name) : null,
+      sub_bu_name: isSubBu ? company.company_name : null,
+      project_managers: pmByServicePO.get(row.id) || [],
+    };
+  });
+
+  return { data, meta };
+};
+
+
+/**
+ * The visibility scope of the Service PO list, shared by getAll() and getCreators() so both always see the
+ * exact same set of POs (company scope, X-Company-Id / Admin cross-BU handling, entityIds / businessUnitIds /
+ * company_ids narrowing, Centralised tenant, Project Manager mapped-PO override).
+ *
+ * @param {object} query - req.query (only entityIds, businessUnitIds, company_ids are read)
+ * @param {object} authContext - { companyId, hierarchyRank, employeeId, roleNames }
+ * @param {number|null} [headerCompanyId]
+ * @returns {Promise<{ companyId: *, createdBy: number|null, centralisedOwnerIds: *, centralisedTenant: *, mappedServicePOIds: * }>}
+ */
+const resolveListVisibilityScope = async (query = {}, authContext, headerCompanyId = null) => {
+  let companyId = await resolveActorCompanyScopeForSelectedBU(authContext, headerCompanyId);
+  // Optional entityIds/businessUnitIds multi-select narrowing on top of the
+  // already-resolved scope — only meaningful when that scope is an array (a
+  // single already-selected companyId has nothing left to narrow). Applied
+  // BEFORE centralisedOwnerIds is derived below, so a narrowed BU selection
+  // also correctly narrows which tenant's Centralised POs are visible. For a
+  // Project Manager/Delivery Head this has no visible effect — their
+  // mappedServicePOIds override replaces companyId/centralisedOwnerIds
+  // entirely regardless (see this function's own doc comment).
+  // A specific Business Unit filter (businessUnitIds / company_ids) means a STRICT
+  // company_id IN (selected) match: BU-less rows (Centralised POs, "No Business Unit" POs, the
+  // actor's own unassigned POs) belong to no Business Unit, so they must not appear under one.
+  // They stay visible in the unfiltered "All Business Units" view.
+  const hasBuFilter = (parseIdList(query.businessUnitIds) || []).length > 0
+    || (parseIdList(query.company_ids) || []).length > 0;
+  if (Array.isArray(companyId)) {
+    // entityIds/businessUnitIds (camelCase, matching the Report endpoints'
+    // convention) and company_ids (snake_case, matching this endpoint's own
+    // client_id/service_category_id/sort_by convention — the
+    // Admin/Platform-Admin-only BU filter on the Service PO list) are
+    // accepted as equivalent narrowing filters; all compose via
+    // intersection when more than one is given.
+    companyId = await intersectCompanyIdsWithEntity(companyId, parseIdList(query.entityIds));
+    companyId = await intersectIdsWithBuHierarchy(companyId, parseIdList(query.businessUnitIds));
+    companyId = await intersectIdsWithBuHierarchy(companyId, parseIdList(query.company_ids));
+  }
+  const mappedServicePOIds = await resolveIndividuallyMappedServicePOIds(authContext.employeeId, authContext.roleNames);
+
+  return {
+    companyId,
+    // A company-less Admin/Entity Admin must still see their OWN Service
+    // PO(s) created with no Business Unit assigned yet (company_id NULL) —
+    // see servicePORepository.companyScope()'s doc comment. No-op for a
+    // BU-scoped actor (companyId a plain number there, never an array).
+    createdBy: hasBuFilter ? null : authContext.employeeId,
+    // Widens the list to this actor's own tenant's Centralised POs
+    // (company_id NULL) — see resolveCentralisedOwnerIds()'s doc comment.
+    // All three BU-less widenings are skipped under a specific BU filter (see hasBuFilter).
+    centralisedOwnerIds: hasBuFilter ? null : await resolveCentralisedOwnerIds(companyId),
+    // Centralised POs of this actor's OWN Admin tenant only — never every
+    // Centralised PO on the platform (see companyAccessControlService.
+    // resolveCentralisedServicePOTenant()).
+    centralisedTenant: hasBuFilter ? null : await resolveCentralisedServicePOTenant(companyId, authContext.employeeId),
+    // For a Project Manager/Delivery Head, REPLACES companyId/
+    // centralisedOwnerIds above entirely with this actor's own individually-
+    // mapped POs (see resolveIndividuallyMappedServicePOIds()'s doc
+    // comment) — `null` (every other role) leaves them in full effect.
+    mappedServicePOIds,
+  };
+};
+
+/**
+ * Distinct creators of the Service POs the caller can see — the "Created By" filter options of the list.
+ * Same scope as GET /service-pos (see resolveListVisibilityScope()), but NOT narrowed by status, client,
+ * search etc., so creators of closed / completed POs are included. Creators who have left still resolve.
+ *
+ * @param {object} query - req.query (entityIds, businessUnitIds, company_ids)
+ * @param {object} authContext
+ * @param {number|null} [headerCompanyId]
+ * @returns {Promise<{ id: number, employee_code: string, full_name: string }[]>}
+ */
+const getCreators = async (query = {}, authContext, headerCompanyId = null) => {
+  const scope = await resolveListVisibilityScope(query, authContext, headerCompanyId);
+  return servicePORepository.findCreators(scope);
+};
+
+/**
+ * Return the full details for a single Service PO, including resources.
+ *
+ * A Project Manager/Delivery Head reaches this ONLY for a Service PO
+ * individually mapped to them (never merely because it's in their own
+ * mapped BU) — same override rule getAll() applies, so a row it lists never
+ * 404s the moment it's opened, and a same-BU-but-unmapped PO 404s here just
+ * as it's already excluded from that list. See
+ * resolveIndividuallyMappedServicePOIds()'s doc comment.
+ *
+ * @param {number} id
+ * @param {object} authContext - { companyId, hierarchyRank, employeeId }
+ * @returns {Promise<ServicePO>}
+ */
+const getById = async (id, authContext) => {
+  const companyId = await resolveActorCompanyScope(authContext);
+  // A BU-scoped actor (BU Admin/Project Manager) must be able to VIEW a
+  // Centralised PO applicable to their own tenant, even though it never
+  // gets a BU of its own (company_id NULL). See
+  // servicePORepository.companyScope()'s doc comment.
+  const centralisedOwnerIds = await resolveCentralisedOwnerIds(companyId);
+  const mappedServicePOIds = await resolveIndividuallyMappedServicePOIds(authContext.employeeId, authContext.roleNames);
+  const po = await servicePORepository.findById(id, companyId, authContext.employeeId, centralisedOwnerIds, mappedServicePOIds);
+
+  if (!po) {
+    const err = new Error('Service PO not found.');
+    err.statusCode = 404;
+    throw err;
+  }
+
+  return po;
+};
+
+/**
+ * Resolve a single Service PO the caller may act on, by id, with exactly the
+ * same reach as GET /service-pos/:id: every Business Unit the actor can
+ * reach (all mapped/owned BUs plus their Sub-BUs — never narrowed to the
+ * currently active X-Company-Id), their tenant's Centralised POs, and, for a
+ * Project Manager/Delivery Head, their individually-mapped POs. Shared by
+ * servicePOController.getServicePOById and servicePOHierarchyService so a PO
+ * that opens in the UI never 404s on its own sub-screens.
+ *
+ * @param {number} id
+ * @param {object} req - needs hierarchyRank, employeeId, employeeBusinessUnits, employeeRoleNames
+ * @returns {Promise<ServicePO>}
+ * @throws {Error} 404 'Service PO not found.'
+ */
+const getAccessibleById = async (id, req) => {
+  const fullReachCompanyIds = await resolveActorFullReach({
+    hierarchyRank: req.hierarchyRank,
+    employeeId: req.employeeId,
+    employeeBusinessUnits: req.employeeBusinessUnits,
+  });
+  return getById(id, {
+    companyId: fullReachCompanyIds,
+    hierarchyRank: req.hierarchyRank,
+    employeeId: req.employeeId,
+    roleNames: req.employeeRoleNames,
+  });
+};
+
+/**
+ * Create a new Service PO.
+ * - Validates that start_date < end_date
+ * - Validates that client and service type exist and are active
+ *
+ * Business Unit resolution for a company-less actor (Admin/Entity Admin):
+ *   1. `company_id` in the request body (explicit picker on the frontend).
+ *   2. Normal PO only: the selected Client's BU, else the selected Project's BU.
+ *   3. None → NULL (BU-less): a "My Clients (No Business Unit)" PO, or a
+ *      centralised PO (is_centralised: true). Never defaulted to the
+ *      creator's active BU / X-Company-Id header.
+ * A BU-scoped actor's own `req.companyId` always wins — body and header
+ * are ignored for them entirely.
+ *
+ * @param {object} data   - Validated request body
+ * @param {number} userId
+ * @param {object} req
+ * @returns {Promise<ServicePO>}
+ */
+const create = async (data, userId, req) => {
+  const { company_id: bodyCompanyId, ...fields } = data;
+  const authContext = { companyId: req.companyId, hierarchyRank: req.hierarchyRank, employeeId: req.employeeId };
+
+  // For a BU-scoped actor (BU Admin/Project Manager) who doesn't explicitly
+  // override company_id, the Service PO's own Business Unit should follow
+  // whichever BU the selected Client already belongs to, rather than
+  // silently defaulting to whatever BU happens to be active in the
+  // X-Company-Id header — otherwise a multi-BU actor picking a Client under
+  // one of their OTHER mapped BUs gets a spurious "Client not found" purely
+  // because their active header BU doesn't happen to match it.
+  // resolveCreateCompanyIdForActor still fully validates this derived BU is
+  // one of the actor's own mapped Business Units below — this only changes
+  // WHERE the BU signal comes from.
+  //
+  // A company-less actor (Admin/Entity Admin/Platform Admin) creating a
+  // NON-Centralised PO with no body company_id gets the same derivation (the
+  // selected Client's BU, else the selected Project's BU). When BOTH are
+  // BU-less — the frontend's "My Clients (No Business Unit)" flow, which
+  // deliberately omits company_id — the PO is saved BU-less (company_id
+  // NULL). It is NEVER defaulted to the creator's active BU / X-Company-Id
+  // header: that silently put the PO in a BU the user never picked, and the
+  // Edit drawer then showed that BU instead of "My Clients". A derived BU is
+  // still validated as one of THEIR OWN Business Units by
+  // resolveCreateCompanyId() (403 otherwise). A Centralised PO keeps its
+  // optional-BU behaviour (stays NULL unless company_id is sent).
+  const isCompanyLessNormalPO = req.companyId == null && fields.is_centralised !== true;
+  const preFetchedClient = ((req.companyId != null || isCompanyLessNormalPO) && bodyCompanyId == null)
+    ? await clientRepository.findByIdUnscoped(fields.client_id)
+    : null;
+  let effectiveBodyCompanyId = bodyCompanyId != null
+    ? bodyCompanyId
+    : (preFetchedClient && preFetchedClient.company_id != null ? preFetchedClient.company_id : null);
+
+  if (effectiveBodyCompanyId == null && isCompanyLessNormalPO) {
+    const preFetchedProject = await projectRepository.findByIdUnscoped(fields.project_id);
+    if (preFetchedProject && preFetchedProject.company_id != null) {
+      effectiveBodyCompanyId = preFetchedProject.company_id;
+    }
+  }
+
+  // BU is optional for a company-less actor (BU-less "My Clients" PO, or a
+  // Centralised PO) — resolveCreateCompanyIdForActor(required: false) keeps
+  // it NULL when nothing was supplied/derived, and validates ownership when
+  // it was. A BU-scoped actor always gets their own BU (unchanged).
+  // For a multi-BU BU Admin, an explicit body company_id (or the selected
+  // Client's own BU) wins over the X-Company-Id header; validation is
+  // handled inside resolveCreateCompanyIdForActor.
+  const companyId = await resolveCreateCompanyIdForActor(
+    req,
+    effectiveBodyCompanyId,
+    { required: false }
+  );
+  data = fields;
+
+  // Validate client exists, is active, AND belongs to the same company (or
+  // has no company assigned yet — see belongsToCompanyOrUnassigned()) —
+  // otherwise a PO could be attached to another company's client.
+  const client = preFetchedClient || await clientRepository.findByIdUnscoped(data.client_id);
+  if (!(await belongsToCompanyOrUnassigned(client, companyId))) {
+    const err = new Error('Client not found.');
+    err.statusCode = 404;
+    throw err;
+  }
+  if (client.status !== 'active') {
+    const err = new Error('Cannot create a Service PO for an inactive client.');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  // Validate project exists, is active, AND belongs to the same company —
+  // same pattern as the client_id check above (independent grouping).
+  const project = await projectRepository.findByIdUnscoped(data.project_id);
+  if (!(await belongsToCompanyOrUnassigned(project, companyId))) {
+    const err = new Error('Project not found.');
+    err.statusCode = 404;
+    throw err;
+  }
+  if (project.status !== 'active') {
+    const err = new Error('Cannot create a Service PO for an inactive project.');
+    err.statusCode = 400;
+    throw err;
+  }
+  // Client -> Project -> Service PO: the selected Project must actually
+  // belong to the selected Client.
+  assertProjectBelongsToClient(project, data.client_id);
+
+  // Delivery Head — NULL by default on create (frontend no longer collects
+  // it at creation time; see createServicePOSchema). Only validated when a
+  // caller actually supplies one, same conditional pattern update() already
+  // uses below.
+  if (data.delivery_head_employee_id) {
+    await assertValidDeliveryHead(data.delivery_head_employee_id, companyId);
+  }
+
+  // Date ordering guard (Joi already checks, but we also enforce in service)
+  if (data.start_date && data.end_date && data.end_date < data.start_date) {
+    const err = new Error('End date must be on or after the start date.');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  // The PO number is always supplied by the frontend now (required on
+  // createServicePOSchema) — never auto-generated. Only uniqueness is
+  // enforced here; scoped to this company (uq_service_pos_company_code).
+  const service_po_code = data.service_po_code;
+
+  const existing = await servicePORepository.findByCode(service_po_code, companyId);
+  if (existing) {
+    const err = new Error(`Service PO code "${service_po_code}" already exists.`);
+    err.statusCode = 409;
+    throw err;
+  }
+
+  // Reject a duplicate service_po_name up front (case-insensitive, scoped
+  // to this company) — code uniqueness alone doesn't stop the same PO
+  // from being entered twice under two different codes.
+  const duplicateName = await servicePORepository.findByName(data.service_po_name, companyId);
+  if (duplicateName) {
+    const err = new Error(`Service PO "${data.service_po_name}" already exists.`);
+    err.statusCode = 409;
+    throw err;
+  }
+
+  const payload = {
+    ...data,
+    service_po_code,
+    company_id: companyId,
+    delivery_head_employee_id: data.delivery_head_employee_id ?? null,
+    created_by: userId,
+    updated_by: userId,
+  };
+
+  let po;
+  await sequelize.transaction(async (transaction) => {
+    po = await servicePORepository.create(payload, { transaction });
+
+    // Centralised PO -> existing Employees, the mirror (in the other
+    // direction) of employeeService.create()'s own
+    // autoMapCentralisedServicePOs() call — see
+    // employeeServicePOMappingService.autoMapExistingEmployeesToCentralisedServicePO()'s
+    // doc comment for the full ownership rule. Only Centralised POs
+    // auto-map at all; a normal PO is never auto-mapped to anyone.
+    if (payload.is_centralised === true) {
+      await employeeServicePOMappingService.autoMapExistingEmployeesToCentralisedServicePO(
+        po.id, companyId, userId, transaction
+      );
+    }
+
+    // A BU Admin/Project Manager creating a Service PO themselves must be
+    // auto-mapped to it — a Project Manager's OWN Service PO visibility
+    // (getAll()/getById() above) is driven ENTIRELY by an active
+    // employee_servicepo_mapping row, never by Business Unit membership, so
+    // without this they couldn't even see the PO they just created until
+    // someone separately mapped them to it afterward. bulkCreate's
+    // ignoreDuplicates makes this a safe no-op if a Centralised-PO auto-map
+    // above already covered this same creator/PO pair.
+    if (employeeServicePOMappingService.hasServicePOMappingAuthority(req.userRoles)) {
+      await employeeServicePOMappingRepository.bulkCreate([{
+        company_id: companyId,
+        employee_id: userId,
+        service_po_id: po.id,
+        status: 'active',
+        created_by: userId,
+        updated_by: userId,
+      }], { transaction });
+    }
+  });
+
+  await createAuditLog(
+    userId,
+    'CREATE',
+    'service_pos',
+    po.id,
+    null,
+    { service_po_code: po.service_po_code, service_po_name: po.service_po_name, client_id: po.client_id, project_id: po.project_id, delivery_head_employee_id: po.delivery_head_employee_id },
+    getIpAddress(req)
+  );
+
+  logger.info('Service PO created', { poId: po.id, service_po_code: po.service_po_code, userId });
+
+  // AI Insights: New PO Staffing Suggestion — fires on every new Service PO,
+  // fully fire-and-forget so a Claude/AI failure can never affect PO
+  // creation itself (already logged and recorded by aiInsight.service.js).
+  aiInsightService.runJob('new_po_staffing_suggestion', { referenceId: po.id }, companyId).catch((err) => {
+    logger.error('AI Insight new_po_staffing_suggestion failed', { poId: po.id, error: err.message });
+  });
+
+  return po;
+};
+
+/**
+ * Update an existing Service PO.
+ * Cannot update a PO that is cancelled (a closed PO can still be edited).
+ *
+ * Looks the Service PO up via resolveActorFullReach() (NOT
+ * resolveActorCompanyScope(req.companyId)) — same fix already shipped for
+ * Client/Project update(): req.companyId is only the caller's single
+ * CURRENTLY ACTIVE Business Unit, but GET /service-pos/:id already spans
+ * every Business Unit the caller manages. Scoping the existence check to
+ * just the active BU meant opening any Service PO from a DIFFERENT BU than
+ * whichever one happened to be currently selected 404'd on Save. Every
+ * downstream use below already reads `existing.company_id` (the PO's OWN
+ * value), never the caller's scope, so widening this lookup alone is safe.
+ *
+ * @param {number} id
+ * @param {object} data
+ * @param {number} userId
+ * @param {object} req
+ * @returns {Promise<ServicePO>}
+ */
+const update = async (id, data, userId, req) => {
+  const scope = await resolveActorFullReach({
+    hierarchyRank: req.hierarchyRank,
+    employeeId: req.employeeId,
+    employeeBusinessUnits: req.employeeBusinessUnits,
+  });
+
+  const existing = await servicePORepository.findById(id, scope, req.employeeId);
+  if (!existing) {
+    const err = new Error('Service PO not found.');
+    err.statusCode = 404;
+    throw err;
+  }
+  const currentCompanyId = existing.company_id;
+
+  // Closed POs stay editable (corrections, reopening via status); only a
+  // cancelled PO is final.
+  if (existing.status === 'cancelled') {
+    const err = new Error(`Cannot update a Service PO with status "${existing.status}".`);
+    err.statusCode = 400;
+    throw err;
+  }
+
+  // Moving the Service PO to another Business Unit — the target BU must be
+  // one the caller could CREATE a Service PO in (same 403 rules as
+  // create()). Every check below then validates against the TARGET BU, so
+  // the PO's client/project/Delivery Head/code/name must all still fit there.
+  const companyChanged = data.company_id != null && data.company_id !== currentCompanyId;
+  const companyId = companyChanged
+    ? await resolveCreateCompanyIdForActor(req, data.company_id, { required: true, resourceLabel: 'a Service PO' })
+    : currentCompanyId;
+  if (companyChanged) {
+    data = { ...data, company_id: companyId };
+  }
+
+  // If the caller is changing the service_po_code (or moving the PO to
+  // another BU), ensure it is not taken by any other PO in the target
+  // company, regardless of its status or soft-delete state.
+  const effectiveCode = data.service_po_code || existing.service_po_code;
+  if (companyChanged || effectiveCode !== existing.service_po_code) {
+    const taken = await servicePORepository.findByCode(effectiveCode, companyId);
+    if (taken && taken.id !== id) {
+      const err = new Error(`Service PO code "${effectiveCode}" is already in use.`);
+      err.statusCode = 409;
+      throw err;
+    }
+  }
+
+  // Same rule as create() — a renamed (or moved) Service PO can't collide
+  // with another Service PO's name in the target company.
+  const effectiveName = data.service_po_name || existing.service_po_name;
+  if (companyChanged || effectiveName.trim().toLowerCase() !== existing.service_po_name.toLowerCase()) {
+    const nameConflict = await servicePORepository.findByName(effectiveName, companyId);
+    if (nameConflict && nameConflict.id !== id) {
+      const err = new Error(`Service PO "${effectiveName}" already exists.`);
+      err.statusCode = 409;
+      throw err;
+    }
+  }
+
+  // If client_id is being changed (or the PO is moving BU), validate the
+  // resulting client — belongs to the target company, or has no company
+  // assigned yet (see belongsToCompanyOrUnassigned()); a client belonging to
+  // another company entirely still simply 404s.
+  const clientChanged = (data.client_id && data.client_id !== existing.client_id) || companyChanged;
+  if (clientChanged) {
+    const client = await clientRepository.findByIdUnscoped(data.client_id || existing.client_id);
+    if (!(await belongsToCompanyOrUnassigned(client, companyId))) {
+      const err = new Error('Client not found.');
+      err.statusCode = 404;
+      throw err;
+    }
+    if (client.status !== 'active') {
+      const err = new Error('Cannot reassign a Service PO to an inactive client.');
+      err.statusCode = 400;
+      throw err;
+    }
+  }
+
+  // If project_id is being changed, validate the new project — same
+  // conditional-on-change pattern as client_id above.
+  const projectChanged = (data.project_id && data.project_id !== existing.project_id) || companyChanged;
+  let projectForCrossCheck = null;
+  if (projectChanged) {
+    const project = await projectRepository.findByIdUnscoped(data.project_id || existing.project_id);
+    if (!(await belongsToCompanyOrUnassigned(project, companyId))) {
+      const err = new Error('Project not found.');
+      err.statusCode = 404;
+      throw err;
+    }
+    if (project.status !== 'active') {
+      const err = new Error('Cannot reassign a Service PO to an inactive project.');
+      err.statusCode = 400;
+      throw err;
+    }
+    projectForCrossCheck = project;
+  } else if (clientChanged) {
+    // Client is changing but project_id isn't — the EXISTING project must
+    // still belong to the NEW client, otherwise a project_id must also be
+    // supplied. Re-fetches the existing project rather than trusting the
+    // (possibly stale) `existing` include.
+    projectForCrossCheck = await projectRepository.findById(existing.project_id, companyId);
+  }
+
+  // Client -> Project -> Service PO: whichever end changed, the resulting
+  // pairing must still be consistent.
+  if (projectForCrossCheck) {
+    assertProjectBelongsToClient(projectForCrossCheck, data.client_id || existing.client_id);
+  }
+
+  // Delivery Head — optional on update (a pre-existing Service PO without
+  // one must not be broken; see database/migrations/
+  // 20260849_add_service_pos_delivery_head.sql), but validated the same
+  // way as create() whenever it IS being set/changed.
+  const deliveryHeadToCheck = data.delivery_head_employee_id
+    || (companyChanged ? existing.delivery_head_employee_id : null);
+  if (deliveryHeadToCheck) {
+    await assertValidDeliveryHead(deliveryHeadToCheck, companyId);
+  }
+
+  // Cross-field date validation when one or both dates are being changed
+  const newStartDate = data.start_date || existing.start_date;
+  const newEndDate = data.end_date || existing.end_date;
+  if (newStartDate && newEndDate && newEndDate < newStartDate) {
+    const err = new Error('End date must be on or after the start date.');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const oldValues = {
+    company_id:          existing.company_id,
+    service_po_name:     existing.service_po_name,
+    client_id:           existing.client_id,
+    project_id:          existing.project_id,
+    delivery_head_employee_id: existing.delivery_head_employee_id,
+    service_type_id:     existing.service_type_id,
+    po_value:            existing.po_value,
+    start_date:          existing.start_date,
+    end_date:            existing.end_date,
+    status:              existing.status,
+    account_manager:     existing.account_manager,
+    service_description: existing.service_description,
+    invoice_frequency:   existing.invoice_frequency,
+    is_centralised:      existing.is_centralised,
+  };
+
+  const payload = { ...data, updated_by: userId };
+  // WHERE uses the PO's CURRENT BU — the row still lives there until this
+  // update moves it. Its Employee mappings move with it (same transaction),
+  // since they're read back company-scoped.
+  let updated;
+  if (companyChanged && currentCompanyId != null) {
+    await sequelize.transaction(async (transaction) => {
+      updated = await servicePORepository.update(id, payload, currentCompanyId, { transaction });
+      await employeeServicePOMappingRepository.moveServicePOToCompany(
+        id, currentCompanyId, companyId, userId, { transaction }
+      );
+    });
+  } else {
+    updated = await servicePORepository.update(id, payload, currentCompanyId);
+  }
+
+  await createAuditLog(
+    userId,
+    'UPDATE',
+    'service_pos',
+    id,
+    oldValues,
+    payload,
+    getIpAddress(req)
+  );
+
+  logger.info('Service PO updated', { poId: id, userId });
+
+  return updated;
+};
+
+/**
+ * Close a Service PO.
+ * Only an 'active' PO can be closed.
+ *
+ * @param {number} id
+ * @param {number} userId
+ * @param {object} req
+ * @returns {Promise<void>}
+ */
+const close = async (id, userId, req) => {
+  const scope = await resolveActorFullReach({
+    hierarchyRank: req.hierarchyRank,
+    employeeId: req.employeeId,
+    employeeBusinessUnits: req.employeeBusinessUnits,
+  });
+
+  const existing = await servicePORepository.findById(id, scope, req.employeeId);
+  if (!existing) {
+    const err = new Error('Service PO not found.');
+    err.statusCode = 404;
+    throw err;
+  }
+  const companyId = existing.company_id;
+
+  if (!ALLOWED_CLOSE_FROM.includes(existing.status)) {
+    const err = new Error(
+      `Cannot close a Service PO with status "${existing.status}". ` +
+      `Only POs with status "active" can be closed.`
+    );
+    err.statusCode = 400;
+    throw err;
+  }
+
+  await servicePORepository.close(id, userId, companyId);
+
+  await createAuditLog(
+    userId,
+    'CLOSE',
+    'service_pos',
+    id,
+    { status: existing.status },
+    { status: 'closed' },
+    getIpAddress(req)
+  );
+
+  logger.info('Service PO closed', { poId: id, userId });
+};
+
+/**
+ * Allocate one or more employees to a Service PO.
+ * - Validates that the PO is active
+ * - Validates that all provided employee IDs are active employees
+ *
+ * @param {number} poId
+ * @param {number[]} employeeIds
+ * @param {number} userId
+ * @param {object} req
+ * @returns {Promise<void>}
+ */
+const allocateResources = async (poId, employeeIds, userId, req) => {
+  const scope = await resolveActorFullReach({
+    hierarchyRank: req.hierarchyRank,
+    employeeId: req.employeeId,
+    employeeBusinessUnits: req.employeeBusinessUnits,
+  });
+
+  // A BU-scoped actor must be able to map employees onto a Centralised PO
+  // applicable to their own tenant. See servicePORepository.companyScope()'s
+  // doc comment.
+  const centralisedOwnerIds = await resolveCentralisedOwnerIds(scope);
+  const po = await servicePORepository.findById(poId, scope, req.employeeId, centralisedOwnerIds);
+  if (!po) {
+    const err = new Error('Service PO not found.');
+    err.statusCode = 404;
+    throw err;
+  }
+  const companyId = po.company_id;
+
+  if (po.status !== 'active') {
+    const err = new Error(`Cannot allocate resources to a Service PO with status "${po.status}".`);
+    err.statusCode = 400;
+    throw err;
+  }
+
+  // Validate all employees exist, are active, AND belong to this company —
+  // an id from another company simply resolves as "not found" below, the
+  // same branch as a genuinely missing id. "Belongs to this company" is
+  // checked the same two ways as assertValidDeliveryHead() above: the
+  // legacy `company_id` column OR an `employee_business_units` grant, so
+  // an Admin-created employee with only a BU grant for this company isn't
+  // wrongly rejected. When this PO has no company assigned at all (a
+  // legacy row from before a Business Unit became mandatory at create
+  // time — companyId null), there is no target company to check
+  // membership against, so the filter is skipped
+  // entirely — deliberately NOT `{ company_id: null }`, which would wrongly
+  // match almost every Employee post-redesign (employees.company_id is left
+  // NULL in favor of employee_business_units).
+  const employeeWhere = { id: employeeIds };
+  if (companyId != null) {
+    employeeWhere[Op.or] = [{ company_id: companyId }, { '$businessUnits.id$': companyId }];
+  }
+  const employees = await Employee.findAll({
+    where: employeeWhere,
+    include: [{ model: Company, as: 'businessUnits', attributes: [], through: { attributes: [] } }],
+    attributes: ['id', 'full_name', 'status'],
+    distinct: true,
+    subQuery: false,
+  });
+
+  if (employees.length !== employeeIds.length) {
+    const foundIds = employees.map((e) => e.id);
+    const missing = employeeIds.filter((id) => !foundIds.includes(id));
+    const err = new Error(`Employee(s) not found: ${missing.join(', ')}.`);
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const inactiveEmployees = employees.filter((e) => e.status !== 'active');
+  if (inactiveEmployees.length > 0) {
+    const names = inactiveEmployees.map((e) => `${e.full_name} (ID: ${e.id})`).join(', ');
+    const err = new Error(`Cannot allocate inactive employee(s): ${names}.`);
+    err.statusCode = 400;
+    throw err;
+  }
+
+  await servicePORepository.allocateResources(poId, employeeIds, companyId);
+
+  await createAuditLog(
+    userId,
+    'ALLOCATE_RESOURCES',
+    'service_pos',
+    poId,
+    null,
+    { employee_ids: employeeIds },
+    getIpAddress(req)
+  );
+
+  logger.info('Resources allocated to Service PO', { poId, employeeIds, userId });
+};
+
+/**
+ * Remove a single employee from a Service PO.
+ *
+ * @param {number} poId
+ * @param {number} employeeId
+ * @param {number} userId
+ * @param {object} req
+ * @returns {Promise<void>}
+ */
+const deallocateResource = async (poId, employeeId, userId, req) => {
+  const scope = await resolveActorFullReach({
+    hierarchyRank: req.hierarchyRank,
+    employeeId: req.employeeId,
+    employeeBusinessUnits: req.employeeBusinessUnits,
+  });
+
+  // A BU-scoped actor must be able to unmap an employee from a Centralised
+  // PO applicable to their own tenant. See
+  // servicePORepository.companyScope()'s doc comment.
+  const centralisedOwnerIds = await resolveCentralisedOwnerIds(scope);
+  const po = await servicePORepository.findById(poId, scope, req.employeeId, centralisedOwnerIds);
+  if (!po) {
+    const err = new Error('Service PO not found.');
+    err.statusCode = 404;
+    throw err;
+  }
+  const companyId = po.company_id;
+
+  const deleted = await servicePORepository.deallocateResource(poId, employeeId, companyId);
+
+  if (deleted === 0) {
+    const err = new Error('Employee is not allocated to this Service PO.');
+    err.statusCode = 404;
+    throw err;
+  }
+
+  await createAuditLog(
+    userId,
+    'DEALLOCATE_RESOURCE',
+    'service_pos',
+    poId,
+    { employee_id: employeeId },
+    null,
+    getIpAddress(req)
+  );
+
+  logger.info('Resource deallocated from Service PO', { poId, employeeId, userId });
+};
+
+/**
+ * Get hours-logged data for a Service PO. Used to just also report
+ * expected-hours-derived metrics (utilisation %, remaining hours,
+ * over-utilised flag) — those all required an expected_man_hours target,
+ * which no longer exists on Service PO, so this now returns only the raw
+ * hours logged.
+ *
+ * @param {number} poId
+ * @param {object} authContext - { companyId, hierarchyRank, employeeId }
+ * @returns {Promise<object>}
+ */
+const getUtilisation = async (poId, authContext) => {
+  const companyId = await resolveActorCompanyScope(authContext);
+  // A BU-scoped actor must be able to view utilisation for a Centralised PO
+  // applicable to their own tenant. See servicePORepository.companyScope()'s
+  // doc comment.
+  const centralisedOwnerIds = await resolveCentralisedOwnerIds(companyId);
+  const po = await servicePORepository.findById(poId, companyId, authContext.employeeId, centralisedOwnerIds);
+  if (!po) {
+    const err = new Error('Service PO not found.');
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const raw = await servicePORepository.getUtilisation(poId, companyId);
+
+  return {
+    service_po_id: poId,
+    service_po_code: po.service_po_code,
+    service_po_name: po.service_po_name,
+    total_hours_logged: raw ? raw.total_hours_logged : 0,
+  };
+};
+
+/**
+ * Return a lightweight list of active POs — the Service PO dropdown data
+ * source for BU-dependent screens (e.g. Cost Budget Master's "select a
+ * Service PO" picker). Respects an OPTIONALLY selected Global Business Unit
+ * (X-Company-Id header) for a company-less actor (Admin/Entity Admin): when
+ * one is selected, the list narrows to just that BU's active POs; when none
+ * is selected, it falls back to every owned Company's active POs, same as
+ * before this narrowing existed — see resolveActorCompanyScopeForSelectedBU's
+ * doc comment. A BU-scoped actor is unaffected either way (already limited
+ * to their own single active BU).
+ *
+ * @param {object} authContext - { companyId, hierarchyRank, employeeId }
+ * @param {number|null} [headerCompanyId] - parsed X-Company-Id header, if any
+ * @returns {Promise<ServicePO[]>}
+ */
+const getActivePOs = async (authContext, headerCompanyId = null, query = {}) => {
+  const companyId = await resolveActorCompanyScopeForSelectedBU(authContext, headerCompanyId);
+
+  // Optional entityIds/businessUnitIds (comma-separated): a strict company_id IN (selected) match,
+  // so BU-less POs (Centralised / "No Business Unit" / the actor's own unassigned ones) are not
+  // mixed in — same rule as GET /service-pos with a BU filter. Absent/empty = unchanged.
+  const narrowing = await narrowScopeByEntityAndBusinessUnit(companyId, parseIdList(query.entityIds), parseIdList(query.businessUnitIds));
+  if (narrowing.narrowed) {
+    return servicePORepository.getActivePOs(narrowing.scope, null, null, null);
+  }
+
+  const centralisedOwnerIds = await resolveCentralisedOwnerIds(companyId);
+  const centralisedTenant = await resolveCentralisedServicePOTenant(companyId, authContext.employeeId);
+  return servicePORepository.getActivePOs(companyId, authContext.employeeId, centralisedOwnerIds, centralisedTenant);
+};
+
+/**
+ * Whether any work log entry exists anywhere in this Service PO's
+ * hierarchy — the Main PO itself, or any Parent/Child node under it —
+ * across BOTH work-log sources: the official `timesheets` table and the
+ * Employee Self Timesheet draft table (`employee_work_logs`). Used as the
+ * delete guard in deleteServicePO() below; nowhere else.
+ *
+ * @param {number} servicePOId
+ * @param {number} companyId
+ * @returns {Promise<boolean>}
+ */
+async function hasWorkLogsInHierarchy(servicePOId, companyId) {
+  const hierarchyNodes = await servicePOHierarchyRepository.findByServicePO(servicePOId);
+  const hierarchyNodeIds = hierarchyNodes.map((node) => node.id);
+
+  const [hasTimesheets, hasEmployeeWorkLogs] = await Promise.all([
+    timesheetRepository.existsForServicePO(servicePOId, companyId),
+    employeeWorkLogRepository.existsForServicePOOrHierarchy(servicePOId, hierarchyNodeIds, companyId),
+  ]);
+
+  return hasTimesheets || hasEmployeeWorkLogs;
+}
+
+const deleteServicePO = async (id, userId, req) => {
+  const scope = await resolveActorFullReach({
+    hierarchyRank: req.hierarchyRank,
+    employeeId: req.employeeId,
+    employeeBusinessUnits: req.employeeBusinessUnits,
+  });
+
+  const existing = await servicePORepository.findById(id, scope, req.employeeId);
+  if (!existing) {
+    const err = new Error('Service PO not found.');
+    err.statusCode = 404;
+    throw err;
+  }
+  const companyId = existing.company_id;
+
+  if (await hasWorkLogsInHierarchy(id, companyId)) {
+    const err = new Error(
+      'This Service PO cannot be deleted because work log entries exist for this Service PO or its hierarchy.'
+    );
+    err.statusCode = 400;
+    throw err;
+  }
+
+  await servicePORepository.softDelete(id, userId, companyId);
+};
+
+module.exports = {
+  getCreators,
+  resolveIndividuallyMappedServicePOIds,
+  getAll,
+  getById,
+  getAccessibleById,
+  create,
+  update,
+  close,
+  delete: deleteServicePO,
+  allocateResources,
+  deallocateResource,
+  getUtilisation,
+  getActivePOs,
+};

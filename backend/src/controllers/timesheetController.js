@@ -1,0 +1,631 @@
+'use strict';
+
+const timesheetService = require('../services/timesheetService');
+const { resolveActorFullReach } = require('../services/companyAccessControlService');
+const { createAuditLog, getIpAddress } = require('../middlewares/auditLog');
+const {
+  sendSuccess,
+  sendCreated,
+  sendNoContent,
+  sendPaginated,
+  sendNotFound,
+  sendError,
+} = require('../utils/response');
+const logger = require('../utils/logger');
+
+// ── Helper: standardise error handling across handlers ───────────────────────
+function handleError(next, err, context) {
+  logger.error(`TimesheetController error [${context}]`, {
+    message: err.message,
+    stack: err.stack,
+  });
+  // Surface known HTTP errors; delegate the rest to the global handler
+  if (err.statusCode) {
+    err.status = err.statusCode;
+  }
+  next(err);
+}
+
+// Who did what, for the sync / delete trail (console + log file). One line per request, always with the actor and BU.
+function actorOf(req) {
+  return { userId: req.userId, employeeId: req.employeeId || null, role: req.userRoleName || null, ip: getIpAddress(req) };
+}
+
+// ── Import Handlers ───────────────────────────────────────────────────────────
+
+/**
+ * POST /api/v1/timesheets/upload
+ *
+ * Accepts a multipart file upload (field: "file"), parses and validates
+ * all rows, persists an import history record, and returns a preview
+ * of valid and error rows.
+ *
+ * The file is already on disk courtesy of the handleTimesheetUpload middleware.
+ */
+const upload = async (req, res, next) => {
+  try {
+    const { path: filePath, originalname, mimetype } = req.file;
+    const userId = req.userId;
+
+    const month = parseInt(req.body.month, 10);
+    const year  = parseInt(req.body.year,  10);
+
+    if (!month || month < 1 || month > 12) {
+      return sendError(res, 'month is required and must be between 1 and 12.', 422);
+    }
+    if (!year || year < 2000) {
+      return sendError(res, 'year is required and must be 2000 or later.', 422);
+    }
+
+    const result = await timesheetService.previewImport(
+      filePath,
+      originalname,
+      userId,
+      mimetype,
+      month,
+      year,
+      req.companyId
+    );
+
+    return sendSuccess(
+      res,
+      result,
+      result.canConfirm
+        ? `Preview ready. ${result.validRows} valid row(s), ${result.errorRows} error(s). Call POST /confirm/${result.importId} to import.`
+        : `No valid rows found. ${result.errorRows} error(s). Please correct the file and re-upload.`,
+      200
+    );
+  } catch (err) {
+    return handleError(next, err, 'upload');
+  }
+};
+
+/**
+ * POST /api/v1/timesheets/sync-employee-worklogs
+ *
+ * "Sync Employee Work Logs" — an alternative source to the Excel upload
+ * above. Reads every 'pending' row from the employee_work_logs table
+ * (Employee Self Timesheet module, Stage 1 — never from `timesheets`) for
+ * the selected month/year and runs them through the EXACT SAME preview
+ * pipeline (validation, 176-hour adjustment, duplicate detection, import
+ * history) as an Excel upload. The returned importId is confirmed with the
+ * SAME POST /timesheets/confirm/:importId endpoint used for Excel imports.
+ */
+const syncEmployeeWorkLogs = async (req, res, next) => {
+  try {
+    const userId = req.userId;
+    const month = parseInt(req.body.month, 10);
+    const year  = parseInt(req.body.year,  10);
+
+    if (!month || month < 1 || month > 12) {
+      return sendError(res, 'month is required and must be between 1 and 12.', 422);
+    }
+    if (!year || year < 2000) {
+      return sendError(res, 'year is required and must be 2000 or later.', 422);
+    }
+
+    logger.info('[SYNC] request received', { ...actorOf(req), businessUnitId: req.companyId, month, year });
+    const result = await timesheetService.previewPmsImport(month, year, userId, req.companyId);
+    const ctx = result.syncContext || {};
+    logger.info(`[${ctx.mode || 'SYNC'}] preview OK`, {
+      ...actorOf(req), businessUnitId: req.companyId, businessUnitName: ctx.businessUnitName,
+      parentBusinessUnitId: ctx.parentBusinessUnitId, isSubBusinessUnit: ctx.isSubBusinessUnit,
+      month, year, importId: result.importId, validRows: result.validRows, errorRows: result.errorRows,
+      skippedEmployees: result.skippedCount, willReplaceImportIds: ctx.previousImportIds,
+    });
+
+    // Employees already synced from another Business Unit they are mapped to are skipped (never duplicated);
+    // say so explicitly — the full list (name, code, BU) is in result.skippedEmployees.
+    const skippedNote = result.skippedCount > 0
+      ? ` ${result.skippedCount} employee(s) already synced from another Business Unit were skipped.`
+      : '';
+
+    return sendSuccess(
+      res,
+      result,
+      (result.canConfirm
+        ? `Sync preview ready. ${result.validRows} valid row(s), ${result.errorRows} error(s). Call POST /confirm/${result.importId} to import.`
+        : `No pending employee work log entries found for this month. ${result.errorRows} error(s).`) + skippedNote,
+      200
+    );
+  } catch (err) {
+    logger.warn('[SYNC] preview REJECTED', { ...actorOf(req), businessUnitId: req.companyId, month: req.body && req.body.month, year: req.body && req.body.year, statusCode: err.statusCode || 500, reason: err.message });
+    return handleError(next, err, 'syncEmployeeWorkLogs');
+  }
+};
+
+/**
+ * POST /api/v1/timesheets/confirm/:importId
+ *
+ * Confirms a pending import: re-validates the source file and bulk-inserts
+ * all valid rows into the timesheets table.
+ */
+const confirm = async (req, res, next) => {
+  try {
+    const importId = parseInt(req.params.importId, 10);
+    if (isNaN(importId) || importId < 1) {
+      return sendError(res, 'Invalid importId parameter.', 400);
+    }
+
+    logger.info('[CONFIRM] request received', { ...actorOf(req), businessUnitId: req.companyId, importId });
+    const result = await timesheetService.confirmImport(
+      importId,
+      req.userId,
+      getIpAddress(req),
+      req.companyId
+    );
+    const ctx = result.syncContext || {};
+    logger.info(`[${ctx.mode || 'IMPORT'}] confirm SUCCESS`, {
+      ...actorOf(req), businessUnitId: req.companyId, businessUnitName: ctx.businessUnitName,
+      parentBusinessUnitId: ctx.parentBusinessUnitId, isSubBusinessUnit: ctx.isSubBusinessUnit,
+      importId, status: result.status, insertedRows: result.insertedRows, errorRows: result.errorRows,
+      replacedRows: ctx.replacedRows, reopenedWorkLogs: ctx.reopenedWorkLogs, previousImportIds: ctx.previousImportIds,
+    });
+
+    return sendSuccess(
+      res,
+      result,
+      `Import #${importId} completed. ${result.insertedRows} timesheet row(s) inserted.`,
+      200
+    );
+  } catch (err) {
+    logger.warn('[CONFIRM] REJECTED / FAILED — nothing was changed', { ...actorOf(req), businessUnitId: req.companyId, importId: req.params.importId, statusCode: err.statusCode || 500, reason: err.message });
+    return handleError(next, err, 'confirm');
+  }
+};
+
+/**
+ * GET /api/v1/timesheets/import/history
+ *
+ * Returns a paginated list of all past import operations. Mounted on
+ * authenticateReadMultiBU (see timesheet.routes.js) — req.companyIds is
+ * always an array: every Business Unit the caller can reach when no
+ * X-Company-Id/company_id is given, or just the one explicitly requested
+ * (validated against that same reach) otherwise. Never a single frozen
+ * req.companyId, so a just-confirmed import under ANY of the caller's
+ * Business Units always shows up here, regardless of which BU happened to
+ * be "active" elsewhere in the app when this list was last loaded.
+ */
+const getHistory = async (req, res, next) => {
+  try {
+    const { data, meta } = await timesheetService.getImportHistory(req.query, req.companyIds);
+    return sendPaginated(res, data, meta, 'Import history fetched successfully.');
+  } catch (err) {
+    return handleError(next, err, 'getHistory');
+  }
+};
+
+/**
+ * GET /api/v1/timesheets/import/:id
+ *
+ * Returns a single import history record, including all error rows.
+ */
+const getImportById = async (req, res, next) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (isNaN(id) || id < 1) {
+      return sendError(res, 'Invalid import ID.', 400);
+    }
+
+    const record = await timesheetService.getImportById(id, req.companyIds);
+    return sendSuccess(res, record, 'Import record fetched successfully.');
+  } catch (err) {
+    return handleError(next, err, 'getImportById');
+  }
+};
+
+/**
+ * GET /api/v1/timesheets/import/:id/rows
+ *
+ * Returns all timesheet rows inserted as part of the given import.
+ *
+ * `role` (from body/query, merged — NOT the JWT, see hoursVisibility.js)
+ * controls whether rows show the original hours_logged + modified_hours
+ * side by side, or (role === "management") only the effective/modified
+ * value under hours_logged.
+ */
+const getImportRows = async (req, res, next) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (isNaN(id) || id < 1) {
+      return sendError(res, 'Invalid import ID.', 400);
+    }
+    const filters = { ...req.body, ...req.query };
+
+    const search = typeof req.query.search === 'string' ? req.query.search : undefined;
+
+    const rows = await timesheetService.getImportRows(id, filters.role, req.companyIds, search);
+    return sendSuccess(res, rows, 'Imported timesheet rows fetched successfully.');
+  } catch (err) {
+    return handleError(next, err, 'getImportRows');
+  }
+};
+
+// ── CRUD Handlers ─────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/v1/timesheets
+ *
+ * Query params: page, limit, startDate, endDate, employeeId, poId, subProjectId,
+ *               sortBy, sortOrder, role
+ *
+ * `role` (from body/query, merged — NOT the JWT, see hoursVisibility.js)
+ * controls whether rows show the original hours_logged + modified_hours
+ * side by side, or (role === "management") only the effective/modified
+ * value under hours_logged.
+ */
+const getAll = async (req, res, next) => {
+  try {
+    const filters = { ...req.body, ...req.query };
+    const { data, meta } = await timesheetService.getAllTimesheets(filters, req.companyIds);
+    return sendPaginated(res, data, meta, 'Timesheets fetched successfully.');
+  } catch (err) {
+    return handleError(next, err, 'getAll');
+  }
+};
+
+/**
+ * GET /api/v1/timesheets/:id
+ *
+ * `role` (from body/query, merged — NOT the JWT, see hoursVisibility.js)
+ * controls whether the response shows the original hours_logged +
+ * modified_hours side by side, or (role === "management") only the
+ * effective/modified value under hours_logged.
+ */
+const getById = async (req, res, next) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (isNaN(id) || id < 1) {
+      return sendError(res, 'Invalid timesheet ID.', 400);
+    }
+    const filters = { ...req.body, ...req.query };
+
+    const record = await timesheetService.getTimesheetById(id, filters.role, req.companyId);
+    return sendSuccess(res, record, 'Timesheet fetched successfully.');
+  } catch (err) {
+    return handleError(next, err, 'getById');
+  }
+};
+
+/**
+ * POST /api/v1/timesheets
+ *
+ * Manual single-entry create — e.g. an Admin backfilling a row missing from
+ * an Excel upload. Resolves and validates employee/PO/sub-project exactly as
+ * the Excel import does; client_id/service_type_id/service_category_id are
+ * optional extra cross-checks (validation-only, never stored on the row).
+ * timesheet_import_id is required — the entry is attached to that monthly
+ * sheet, and the employee's hours within it must not exceed 176.
+ *
+ * Body: { employee_id, service_po_id, sub_project_id?, timesheet_import_id, client_id?, service_type_id?, service_category_id?, timesheet_date, hours_logged }
+ */
+const create = async (req, res, next) => {
+  try {
+    const data = {
+      employee_id:          req.body.employee_id,
+      service_po_id:        req.body.service_po_id,
+      sub_project_id:       req.body.sub_project_id || null,
+      timesheet_import_id:  req.body.timesheet_import_id,
+      client_id:            req.body.client_id,
+      service_type_id:      req.body.service_type_id,
+      service_category_id:  req.body.service_category_id,
+      timesheet_date:       req.body.timesheet_date,
+      hours_logged:         req.body.hours_logged,
+      created_by:           req.userId,
+      updated_by:           req.userId,
+    };
+
+    const timesheet = await timesheetService.createTimesheet(data, req.companyId);
+
+    createAuditLog(
+      req.userId,
+      'CREATE',
+      'timesheets',
+      timesheet.id,
+      null,
+      timesheet.toJSON(),
+      getIpAddress(req)
+    );
+
+    return sendCreated(res, { id: timesheet.id }, 'Timesheet entry created successfully.');
+  } catch (err) {
+    return handleError(next, err, 'create');
+  }
+};
+
+/**
+ * PUT /api/v1/timesheets/:id
+ *
+ * Body: partial timesheet fields
+ */
+const update = async (req, res, next) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (isNaN(id) || id < 1) {
+      return sendError(res, 'Invalid timesheet ID.', 400);
+    }
+
+    const data = {
+      ...(req.body.employee_id   !== undefined && { employee_id:   req.body.employee_id }),
+      ...(req.body.service_po_id !== undefined && { service_po_id: req.body.service_po_id }),
+      ...(req.body.sub_project_id !== undefined && { sub_project_id: req.body.sub_project_id }),
+      ...(req.body.timesheet_date !== undefined && { timesheet_date: req.body.timesheet_date }),
+      ...(req.body.hours_logged   !== undefined && { hours_logged:   req.body.hours_logged }),
+      updated_by: req.userId,
+    };
+
+    const timesheet = await timesheetService.updateTimesheet(id, data, req.companyId);
+
+    createAuditLog(
+      req.userId,
+      'UPDATE',
+      'timesheets',
+      id,
+      null,
+      timesheet.toJSON(),
+      getIpAddress(req)
+    );
+
+    return sendSuccess(res, timesheet, 'Timesheet entry updated successfully.');
+  } catch (err) {
+    return handleError(next, err, 'update');
+  }
+};
+
+/**
+ * PATCH /api/v1/timesheets/:id/modified-hours
+ *
+ * HR-only. Sets the admin-adjustable "Modified Hours" for a single
+ * timesheet entry, and marks it (and its parent monthly sheet, if any) as
+ * published (is_publish = true). Never touches hours_logged, the original
+ * immutable value — a separate endpoint from PUT /timesheets/:id, which
+ * never touches modified_hours/is_publish.
+ *
+ * Body: { modified_hours }
+ */
+const updateModifiedHours = async (req, res, next) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (isNaN(id) || id < 1) {
+      return sendError(res, 'Invalid timesheet ID.', 400);
+    }
+
+    const timesheet = await timesheetService.updateModifiedHours(id, req.body.modified_hours, req.companyId);
+
+    createAuditLog(
+      req.userId,
+      'UPDATE',
+      'timesheets',
+      id,
+      null,
+      { modified_hours: timesheet.modified_hours, is_publish: timesheet.is_publish },
+      getIpAddress(req)
+    );
+
+    return sendSuccess(res, timesheet, 'Modified hours updated successfully.');
+  } catch (err) {
+    return handleError(next, err, 'updateModifiedHours');
+  }
+};
+
+/**
+ * PUT /api/v1/timesheets/import/:timesheetImportId/hours
+ *
+ * HR-only. Bulk-updates modified_hours for several timesheet entries
+ * belonging to ONE monthly import. Never touches is_publish — a dedicated,
+ * narrower sibling of PATCH /:id/modified-hours; publishing is a separate
+ * endpoint (see publishImport below).
+ *
+ * Body: { timesheets: [{ id, hours }, ...] }
+ */
+const bulkUpdateImportHours = async (req, res, next) => {
+  try {
+    const timesheetImportId = parseInt(req.params.timesheetImportId, 10);
+    if (isNaN(timesheetImportId) || timesheetImportId < 1) {
+      return sendError(res, 'Invalid timesheet import ID.', 400);
+    }
+
+    const { timesheets } = req.body;
+
+    const updatedCount = await timesheetService.bulkUpdateImportModifiedHours(timesheetImportId, timesheets, req.companyId);
+
+    createAuditLog(
+      req.userId,
+      'UPDATE',
+      'timesheets',
+      null,
+      null,
+      { timesheetImportId, updatedIds: timesheets.map((t) => t.id), updatedCount },
+      getIpAddress(req)
+    );
+
+    return sendSuccess(
+      res,
+      { updated_records: updatedCount },
+      'Timesheet hours updated successfully.'
+    );
+  } catch (err) {
+    return handleError(next, err, 'bulkUpdateImportHours');
+  }
+};
+
+/**
+ * PUT /api/v1/timesheets/import/:timesheetImportId/publish
+ *
+ * HR-only. Publishes an imported monthly sheet: sets is_publish = true on
+ * the timesheet_import_history record and every timesheets row belonging to
+ * it. Never touches hours_logged/modified_hours — a dedicated, narrower
+ * sibling of PUT /import/:timesheetImportId/hours above. is_publish is a
+ * one-way flag; publishing an already-published import is a no-op that
+ * reports it back instead of writing again.
+ *
+ * No request body.
+ */
+const publishImport = async (req, res, next) => {
+  try {
+    const timesheetImportId = parseInt(req.params.timesheetImportId, 10);
+    if (isNaN(timesheetImportId) || timesheetImportId < 1) {
+      return sendError(res, 'Invalid timesheet import ID.', 400);
+    }
+
+    const { alreadyPublished } = await timesheetService.publishImport(timesheetImportId, req.companyId);
+
+    if (alreadyPublished) {
+      return sendSuccess(res, { timesheetImportId }, 'Monthly timesheet is already published.');
+    }
+
+    createAuditLog(
+      req.userId,
+      'UPDATE',
+      'timesheet_import_history',
+      timesheetImportId,
+      null,
+      { is_publish: true },
+      getIpAddress(req)
+    );
+
+    return sendSuccess(res, { timesheetImportId }, 'Monthly timesheet published successfully.');
+  } catch (err) {
+    return handleError(next, err, 'publishImport');
+  }
+};
+
+/**
+ * DELETE /api/v1/timesheets/:id
+ */
+const deleteTimesheet = async (req, res, next) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (isNaN(id) || id < 1) {
+      return sendError(res, 'Invalid timesheet ID.', 400);
+    }
+
+    // A delete must succeed for any timesheet the caller has genuine access
+    // to (through ANY of their Business Units), never narrowed down to
+    // whichever ONE happens to be currently active (X-Company-Id) — see
+    // resolveActorFullReach()'s doc comment.
+    const fullReachCompanyIds = await resolveActorFullReach({
+      hierarchyRank: req.hierarchyRank,
+      employeeId: req.employeeId,
+      employeeBusinessUnits: req.employeeBusinessUnits,
+    });
+
+    const reason = (req.body && typeof req.body.reason === 'string' ? req.body.reason.trim() : '').slice(0, 500) || null;
+    const deleted = await timesheetService.deleteTimesheet(id, fullReachCompanyIds);
+    logger.warn('[DELETE] single timesheet deleted', { ...actorOf(req), timesheetId: id, businessUnitId: deleted && deleted.company_id, employeeId_deleted: deleted && deleted.employee_id, date: deleted && deleted.timesheet_date, importId: deleted && deleted.timesheet_import_id, reason: reason || 'not given' });
+
+    // Records WHICH timesheet (employee, PO, date, hours) and the BU it belonged to.
+    createAuditLog(
+      req.userId,
+      'DELETE',
+      'timesheets',
+      id,
+      deleted,
+      { reason: reason || 'MANUAL_SINGLE_DELETE', via: 'DELETE /timesheets/:id' },
+      getIpAddress(req),
+      { companyId: deleted && deleted.company_id }
+    );
+
+    return sendNoContent(res);
+  } catch (err) {
+    logger.warn('[DELETE] single timesheet delete REJECTED', { ...actorOf(req), timesheetId: req.params.id, statusCode: err.statusCode || 500, reason: err.message });
+    return handleError(next, err, 'deleteTimesheet');
+  }
+};
+
+/**
+ * Normalises a request body's `ids` field into a clean array of positive
+ * integers. Accepts { ids: [1,2,3] }, { ids: 5 }, or { id: 5 } so the same
+ * endpoint naturally supports both single-row and multi-row deletes.
+ *
+ * @param {object} body - req.body
+ * @returns {number[]}
+ */
+function parseIdsFromBody(body) {
+  let ids = body && body.ids !== undefined ? body.ids : undefined;
+  if (!Array.isArray(ids)) {
+    ids = ids !== undefined ? [ids] : (body && body.id !== undefined ? [body.id] : []);
+  }
+  return ids
+    .map((v) => parseInt(v, 10))
+    .filter((v) => !isNaN(v) && v > 0);
+}
+
+/**
+ * DELETE /api/v1/timesheets
+ * DELETE /api/v1/timesheets/import
+ *
+ * Deletes one or more "monthly sheets" (timesheet import batches) in a single call.
+ * Body: { ids: [1, 2, 3] } — pass a single-element array to delete just one sheet.
+ * Each id is a Timesheet Import History ID (timesheet_import_history.id).
+ *
+ * For every import this removes the child timesheet rows created by that import,
+ * the child error rows, the import history record itself, and the uploaded file
+ * on disk.
+ */
+const deleteImports = async (req, res, next) => {
+  try {
+    const ids = parseIdsFromBody(req.body);
+
+    if (ids.length === 0) {
+      return sendError(res, 'ids must be a non-empty array of valid Timesheet Import History IDs.', 422);
+    }
+
+    // Same rationale as deleteTimesheet() above — full BU/owned-Company
+    // reach, never narrowed to just the currently-active X-Company-Id.
+    const fullReachCompanyIds = await resolveActorFullReach({
+      hierarchyRank: req.hierarchyRank,
+      employeeId: req.employeeId,
+      employeeBusinessUnits: req.employeeBusinessUnits,
+    });
+
+    const reason = (req.body && typeof req.body.reason === 'string' ? req.body.reason.trim() : '').slice(0, 500) || null;
+    const { deletedImports = [], ...result } = await timesheetService.deleteImports(ids, fullReachCompanyIds);
+    for (const sheet of deletedImports) {
+      logger.warn('[DELETE] monthly sheet deleted (Delete Monthly Sheet)', { ...actorOf(req), importId: sheet.import_id, businessUnitId: sheet.company_id, source: sheet.source, month: sheet.month, year: sheet.year, workLogsRevertedToApproved: result.revertedWorkLogs, reason: reason || 'not given' });
+    }
+
+    // One audit row PER monthly sheet, so each one carries its own month, year, source and BU /
+    // Sub-BU (a single batch can span several of them) and can be filtered by BU.
+    for (const sheet of deletedImports) {
+      createAuditLog(
+        req.userId,
+        'DELETE',
+        'timesheet_import_history',
+        sheet.import_id,
+        sheet,
+        { reason: reason || 'MANUAL_MONTHLY_SHEET_DELETE', via: 'DELETE /timesheets(/import)', deleted_in_batch: deletedImports.length, work_logs_reverted_to_approved: result.revertedWorkLogs },
+        getIpAddress(req),
+        { companyId: sheet.company_id }
+      );
+    }
+
+    return sendSuccess(
+      res,
+      result,
+      `${result.deletedImportCount} monthly sheet(s) deleted, along with ${result.deletedTimesheetRows} timesheet row(s) and ${result.deletedErrorRows} error row(s).`,
+      200
+    );
+  } catch (err) {
+    logger.warn('[DELETE] monthly sheet delete REJECTED', { ...actorOf(req), importIds: req.body && (req.body.ids || req.body.id), statusCode: err.statusCode || 500, reason: err.message });
+    return handleError(next, err, 'deleteImports');
+  }
+};
+
+module.exports = {
+  upload,
+  syncEmployeeWorkLogs,
+  confirm,
+  getHistory,
+  getImportById,
+  getImportRows,
+  getAll,
+  getById,
+  create,
+  update,
+  updateModifiedHours,
+  bulkUpdateImportHours,
+  publishImport,
+  deleteTimesheet,
+  deleteImports,
+};

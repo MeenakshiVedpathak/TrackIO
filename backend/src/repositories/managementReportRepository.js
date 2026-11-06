@@ -1,0 +1,2202 @@
+'use strict';
+
+const { sequelize } = require('../models');
+const { QueryTypes } = require('sequelize');
+const { buLessServicePOInTenantSql } = require('../utils/servicePOTenantSql');
+const monthlyCapService = require('../services/monthlyCapService');
+const { capForCompanyMonthSql, capForMonthStartSql } = require('../utils/monthlyCapSql');
+
+/**
+ * Whether a `companyIds` scope array resolves to "nothing this caller may
+ * see" — an empty array is a legitimate value (every entityIds/
+ * businessUnitIds id turned out to be outside the caller's reach — see
+ * companyAccessControlService.intersectIds()), never an error. Callers MUST
+ * check this before building a raw-SQL `IN (:companyIds)` clause: unlike
+ * the ORM's `Op.in` (which safely degrades an empty array to `IN (NULL)`),
+ * this file's raw `sequelize.query()` + named-replacement `IN (:companyIds)`
+ * idiom has NO such protection — an empty array becomes a literal `IN ()`,
+ * a Postgres syntax error, not a zero-row result. Same helper as
+ * reportRepository.js's own isEmptyCompanyScope().
+ *
+ * @param {number[]|null|undefined} companyIds
+ * @returns {boolean}
+ */
+function isEmptyCompanyScope(companyIds) {
+  return !companyIds || companyIds.length === 0;
+}
+
+// An Employee created after the Employee-Business-Unit redesign
+// (database/migrations/20260866_create_employee_business_units.sql) never
+// gets its own `employees.company_id` populated; its Company/BU membership
+// lives exclusively in `employee_business_units`. Matching on `e.company_id`
+// alone silently drops such employees from these reports. Same OR-with-
+// legacy-column pattern as employeeRepository.js's employeeScope().
+// IN(:companyIds)-aware — this constant's sole consumer,
+// getEmployeeCapacityForecast(), was converted to the "no X-Company-Id ->
+// role reach" array scope (see resolveReportCompanyScope.js).
+const EMPLOYEE_COMPANY_SCOPE_SQL = `(
+  e.company_id IN (:companyIds)
+  OR EXISTS (
+    SELECT 1 FROM employee_business_units ebu
+    WHERE ebu.employee_id = e.id
+      AND ebu.business_unit_id IN (:companyIds)
+      AND ebu.status = 'active'
+  )
+)`;
+
+/**
+ * Management Report Repository
+ *
+ * The 10 new management/business reports approved on top of the existing
+ * Report module (reportRepository.js, left untouched). Combined into one
+ * file per layer (repository/service/controller/routes) rather than one
+ * file per report, matching this project's existing convention for the
+ * Report module.
+ *
+ * These reports are the first consumers of cost_budget_master (planned
+ * monthly Invoice Amount per Service PO) and resource_budget_master
+ * (planned monthly hours per Employee + Service PO) — every other report/
+ * dashboard query in this codebase only reads timesheets/monthly_costs/
+ * service_po_monthly_budgets (actuals), never the two new "future budget"
+ * tables. All queries use raw SQL via sequelize.query, same as
+ * reportRepository.js and dashboardRepository.js.
+ */
+
+// ALWAYS the original (true logged) hours, regardless of `hoursSource`.
+// Every report that exposes synced/adjusted hours (which follow hoursSource)
+// also exposes an `original_*` / `original*` counterpart computed from this.
+const originalHoursCol = 'COALESCE(t.original_hours, t.hours_logged)';
+
+// Hours on a Centralised Service PO (company_id NULL + is_centralised) are logged by employees of MANY
+// Business Units, but every BU admin of the tenant can see that PO. A BU's report must only count its OWN
+// BU's timesheets against it; any other PO keeps every row (cross-BU staffing on a BU's own PO is intended).
+// Needs the timesheets alias `t` and the :companyIds replacement (the caller's BU scope).
+const CENTRALISED_HOURS_GUARD_SQL =
+  '(t.company_id IN (:companyIds) OR NOT EXISTS (SELECT 1 FROM service_pos spc WHERE spc.id = t.service_po_id AND spc.is_centralised = true))';
+
+const formatMonthYear = (month, year) => (
+  `${parseInt(year, 10)}-${String(parseInt(month, 10)).padStart(2, '0')}`
+);
+
+// ---------------------------------------------------------------------------
+// 1. Service PO Profitability (Margin) Report — ACTUAL basis
+// ---------------------------------------------------------------------------
+/**
+ * One row per billable Service PO for the given month/year:
+ * invoiced_amount minus delivery_cost = margin. Both invoiced_amount and
+ * delivery_cost are read from service_po_monthly_budgets (invoice_amount /
+ * billed_amount respectively) for the report's month/year — delivery_cost
+ * is NOT computed from timesheets x monthly_costs (that data is too sparse
+ * per-employee to be a reliable cost basis; billed_amount is the
+ * finance-entered actual instead).
+ *
+ * @param {object} filters
+ * @param {number} filters.month
+ * @param {number} filters.year
+ * @param {number} [filters.clientId]
+ * @param {number} [filters.poId]
+ * @param {string} [filters.status]
+ * @param {boolean} [filters.isBillable]
+ * @param {number} [filters.serviceCategoryId]
+ * @param {number} [filters.serviceTypeId]
+ * @param {string} [filters.search]
+ * @param {string} [filters.sortBy]
+ * @param {string} [filters.sortOrder]
+ * @param {number} filters.limit
+ * @param {number} filters.offset
+ * @param {number[]} filters.companyIds
+ * @returns {{ rows: object[], count: number }}
+ */
+async function getServicePOProfitability(filters) {
+  const {
+    month, year, clientId, poId, status, isBillable,
+    serviceCategoryId, serviceTypeId, search,
+    sortBy = 'margin', sortOrder = 'DESC', limit, offset, hoursSource, roleId, companyIds,
+  } = filters;
+
+  const hoursCol = (hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const allowedSort = ['c.client_name', 'sp.service_po_name', 'invoiced_amount', 'delivery_cost', 'margin', 'margin_pct', 'hours_delivered'];
+  const safeSort = allowedSort.includes(sortBy) ? sortBy : 'margin';
+  const safeOrder = sortOrder && sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+
+  const monthNum = parseInt(month, 10);
+  const yearNum = parseInt(year, 10);
+
+  const replacements = { monthNum, yearNum, limit, offset, companyIds };
+  const conditions = ['(sp.company_id IN (:companyIds) OR ' + buLessServicePOInTenantSql('sp', 'companyIds') + ')', 'sp.is_billable = true'];
+
+  if (clientId) { conditions.push('sp.client_id IN (:clientId)'); replacements.clientId = [].concat(clientId); }
+  if (poId) { conditions.push('sp.id = :poId'); replacements.poId = poId; }
+  if (status && status !== 'all') { conditions.push('sp.status = :status'); replacements.status = status; }
+  if (isBillable !== undefined) { conditions.push('sp.is_billable = :isBillable'); replacements.isBillable = isBillable; }
+  if (serviceTypeId) { conditions.push('st.id = :serviceTypeId'); replacements.serviceTypeId = serviceTypeId; }
+  if (serviceCategoryId) { conditions.push('sc.id = :serviceCategoryId'); replacements.serviceCategoryId = serviceCategoryId; }
+  if (search) {
+    conditions.push('(c.client_name ILIKE :search OR sp.service_po_name ILIKE :search OR sp.service_po_code ILIKE :search)');
+    replacements.search = `%${search}%`;
+  }
+  const publishGuard = Number(roleId) === 5
+    ? `AND EXISTS (SELECT 1 FROM timesheet_import_history h WHERE h.id = t.timesheet_import_id AND h.is_publish = true)`
+    : '';
+
+  const whereClause = `WHERE ${conditions.join(' AND ')}`;
+
+  const dataQuery = `
+    SELECT
+      sp.id                                          AS service_po_id,
+      sp.service_po_code,
+      sp.service_po_name,
+      sp.status,
+      c.id                                            AS client_id,
+      c.client_name,
+      st.service_type_name                            AS service_type,
+      sc.name                                         AS service_category_name,
+      COALESCE(cur.hours_delivered, 0)                AS hours_delivered,
+      COALESCE(cur.original_hours_delivered, 0)       AS original_hours_delivered,
+      ROUND(COALESCE(spmb.invoice_amount, 0)::numeric, 2)  AS invoiced_amount,
+      ROUND(COALESCE(spmb.billed_amount, 0)::numeric, 2)   AS delivery_cost,
+      ROUND((COALESCE(spmb.invoice_amount, 0) - COALESCE(spmb.billed_amount, 0))::numeric, 2) AS margin,
+      CASE
+        WHEN COALESCE(spmb.invoice_amount, 0) > 0
+          THEN ROUND(((COALESCE(spmb.invoice_amount, 0) - COALESCE(spmb.billed_amount, 0)) / spmb.invoice_amount * 100)::numeric, 2)
+        ELSE NULL
+      END                                              AS margin_pct
+    FROM service_pos sp
+    INNER JOIN clients c        ON c.id  = sp.client_id
+    INNER JOIN service_types st ON st.id = sp.service_type_id
+    INNER JOIN service_categories sc ON sc.id = st.service_category_id
+    LEFT JOIN service_po_monthly_budgets spmb
+           ON spmb.service_po_id = sp.id AND spmb.month = :monthNum AND spmb.year = :yearNum
+    LEFT JOIN (
+      SELECT
+        t.service_po_id,
+        SUM(${hoursCol})                                AS hours_delivered,
+        SUM(${originalHoursCol})                        AS original_hours_delivered
+      FROM timesheets t
+      WHERE EXTRACT(MONTH FROM t.timesheet_date) = :monthNum
+        AND EXTRACT(YEAR  FROM t.timesheet_date) = :yearNum
+        AND ${CENTRALISED_HOURS_GUARD_SQL}
+        ${publishGuard}
+      GROUP BY t.service_po_id
+    ) cur ON cur.service_po_id = sp.id
+    ${whereClause}
+    ORDER BY ${safeSort} ${safeOrder}
+    LIMIT :limit OFFSET :offset
+  `;
+
+  const countQuery = `
+    SELECT COUNT(*) AS total
+    FROM service_pos sp
+    INNER JOIN clients c        ON c.id  = sp.client_id
+    INNER JOIN service_types st ON st.id = sp.service_type_id
+    INNER JOIN service_categories sc ON sc.id = st.service_category_id
+    ${whereClause}
+  `;
+
+  const [rows, countResult] = await Promise.all([
+    sequelize.query(dataQuery, { replacements, type: QueryTypes.SELECT }),
+    sequelize.query(countQuery, { replacements, type: QueryTypes.SELECT }),
+  ]);
+
+  return { rows, count: parseInt(countResult[0].total, 10) };
+}
+
+// ---------------------------------------------------------------------------
+// 2. Budgeted Margin Forecast Report — PLANNED basis
+// ---------------------------------------------------------------------------
+/**
+ * One row per Service PO with an active cost_budget_master entry for the
+ * given month/year: budgeted_revenue (cost_budget_master.invoice_amount)
+ * minus budgeted_cost (resource_budget_master.hours x monthly_costs.total_cost
+ * for that same employee/month) = forecasted_margin.
+ *
+ * @param {object} filters
+ * @returns {{ rows: object[], count: number }}
+ */
+async function getBudgetedMarginForecast(filters) {
+  const {
+    month, year, clientId, poId, status, search,
+    sortBy = 'forecasted_margin', sortOrder = 'DESC', limit, offset, companyIds,
+  } = filters;
+
+  const allowedSort = ['c.client_name', 'sp.service_po_name', 'budgeted_revenue', 'budgeted_cost', 'forecasted_margin', 'forecasted_margin_pct', 'budgeted_hours'];
+  const safeSort = allowedSort.includes(sortBy) ? sortBy : 'forecasted_margin';
+  const safeOrder = sortOrder && sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+
+  const monthNum = parseInt(month, 10);
+  const yearNum = parseInt(year, 10);
+  const monthYear = formatMonthYear(month, year);
+
+  const replacements = { monthNum, yearNum, monthYear, limit, offset, companyIds };
+  const conditions = ["(cbm.company_id IN (:companyIds) OR cbm.company_id IS NULL)", "cbm.status = 'active'", 'cbm.month = :monthNum', 'cbm.year = :yearNum'];
+
+  if (clientId) { conditions.push('sp.client_id IN (:clientId)'); replacements.clientId = [].concat(clientId); }
+  if (poId) { conditions.push('sp.id = :poId'); replacements.poId = poId; }
+  if (status && status !== 'all') { conditions.push('sp.status = :status'); replacements.status = status; }
+  if (search) {
+    conditions.push('(c.client_name ILIKE :search OR sp.service_po_name ILIKE :search OR sp.service_po_code ILIKE :search)');
+    replacements.search = `%${search}%`;
+  }
+
+  const whereClause = `WHERE ${conditions.join(' AND ')}`;
+
+  const dataQuery = `
+    SELECT
+      sp.id                                     AS service_po_id,
+      sp.service_po_code,
+      sp.service_po_name,
+      sp.status,
+      c.id                                       AS client_id,
+      c.client_name,
+      cbm.description                            AS budget_description,
+      ROUND(cbm.invoice_amount::numeric, 2)      AS budgeted_revenue,
+      COALESCE(rb.budgeted_hours, 0)              AS budgeted_hours,
+      ROUND(COALESCE(rb.budgeted_cost, 0)::numeric, 2) AS budgeted_cost,
+      ROUND((cbm.invoice_amount - COALESCE(rb.budgeted_cost, 0))::numeric, 2) AS forecasted_margin,
+      CASE
+        WHEN cbm.invoice_amount > 0
+          THEN ROUND(((cbm.invoice_amount - COALESCE(rb.budgeted_cost, 0)) / cbm.invoice_amount * 100)::numeric, 2)
+        ELSE NULL
+      END                                        AS forecasted_margin_pct
+    FROM cost_budget_master cbm
+    INNER JOIN service_pos sp ON sp.id = cbm.service_po_id
+    INNER JOIN clients c      ON c.id  = sp.client_id
+    LEFT JOIN (
+      SELECT
+        rbm.service_po_id,
+        SUM(rbm.hours)                             AS budgeted_hours,
+        SUM(rbm.hours * COALESCE(mc.total_cost, 0)) AS budgeted_cost
+      FROM resource_budget_master rbm
+      LEFT JOIN monthly_costs mc
+             ON mc.employee_id = rbm.emp_id AND mc.month_year = :monthYear
+      WHERE rbm.status = 'active' AND rbm.month = :monthNum AND rbm.year = :yearNum
+      GROUP BY rbm.service_po_id
+    ) rb ON rb.service_po_id = sp.id
+    ${whereClause}
+    ORDER BY ${safeSort} ${safeOrder}
+    LIMIT :limit OFFSET :offset
+  `;
+
+  const countQuery = `
+    SELECT COUNT(*) AS total
+    FROM cost_budget_master cbm
+    INNER JOIN service_pos sp ON sp.id = cbm.service_po_id
+    INNER JOIN clients c      ON c.id  = sp.client_id
+    ${whereClause}
+  `;
+
+  const [rows, countResult] = await Promise.all([
+    sequelize.query(dataQuery, { replacements, type: QueryTypes.SELECT }),
+    sequelize.query(countQuery, { replacements, type: QueryTypes.SELECT }),
+  ]);
+
+  return { rows, count: parseInt(countResult[0].total, 10) };
+}
+
+// ---------------------------------------------------------------------------
+// 3. Resource Staffing Plan Accuracy Report
+// ---------------------------------------------------------------------------
+/**
+ * Planned (resource_budget_master) vs actual (timesheets) hours per
+ * employee + Service PO for the given month/year. FULL OUTER JOIN so rows
+ * with a plan but no actuals, and rows with actuals but no plan, both
+ * surface.
+ *
+ * @param {object} filters
+ * @returns {{ rows: object[], count: number }}
+ */
+async function getResourceStaffingPlanAccuracy(filters) {
+  const {
+    month, year, employeeIds, poId, search, varianceThresholdPct,
+    sortBy = 'variance', sortOrder = 'DESC', limit, offset, hoursSource, roleId, companyIds,
+  } = filters;
+
+  const hoursCol = (hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  // Bare output-column names (no `e.`/`sp.` qualifier) — sortBy is applied
+  // in the OUTER wrapping query below (after the threshold filter), where
+  // only the inner SELECT's exposed column names are visible, not its
+  // table aliases.
+  const allowedSort = ['full_name', 'service_po_name', 'planned_hours', 'actual_hours', 'variance', 'variance_pct'];
+  const safeSort = allowedSort.includes(sortBy) ? sortBy : 'variance';
+  const safeOrder = sortOrder && sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+
+  const monthNum = parseInt(month, 10);
+  const yearNum = parseInt(year, 10);
+  // undefined -> no threshold filtering at all (existing behavior: every
+  // row returned, service-layer `at_risk` flag only). A real number
+  // (including 0) -> only rows meeting the threshold are returned, applied
+  // BEFORE pagination (see the wrapping SELECT below), so both the
+  // returned page and the count query's total reflect the filtered set.
+  const varianceThresholdPctValue = varianceThresholdPct !== undefined && varianceThresholdPct !== null
+    ? parseFloat(varianceThresholdPct)
+    : null;
+  const replacements = { monthNum, yearNum, limit, offset, companyIds, varianceThresholdPct: varianceThresholdPctValue };
+
+  const publishGuard = Number(roleId) === 5
+    ? `AND EXISTS (SELECT 1 FROM timesheet_import_history h WHERE h.id = t.timesheet_import_id AND h.is_publish = true)`
+    : '';
+
+  let employeeFilter = '';
+  let poFilter = '';
+  // ANDed with the in_scope_pos/companyIds scoping in the CTEs — only ever narrows.
+  if (employeeIds && employeeIds.length > 0) { employeeFilter = 'AND combined.emp_id IN (:employeeIds)'; replacements.employeeIds = employeeIds; }
+  if (poId) { poFilter = 'AND po_id = :poId'; replacements.poId = poId; }
+
+  const searchFilter = search
+    ? `AND (e.full_name ILIKE :search OR e.employee_code ILIKE :search OR sp.service_po_name ILIKE :search)`
+    : '';
+  if (search) replacements.search = `%${search}%`;
+
+  // planned (resource_budget_master.company_id) and actual (timesheets.company_id)
+  // are stamped with two DIFFERENT semantics — the PO's own owning company vs.
+  // the acting/logging session's company (cross-BU staffing is allowed; see
+  // resourceBudgetService.js/timesheetService.js's doc comments) — and were
+  // previously each filtered independently by :companyId with no join
+  // condition tying them to the same Service PO's ownership. Anchoring both
+  // CTEs on a single in_scope_pos set (this BU's own POs, plus Centralised
+  // BU-less POs) instead fixes both the Centralised-PO omission and the
+  // cross-BU-mapped-employee actual-hours undercount, and guarantees planned
+  // vs actual are compared for the SAME set of POs.
+  const cteBlock = `
+    WITH in_scope_pos AS (
+      SELECT id FROM service_pos WHERE (company_id IN (:companyIds) OR ${buLessServicePOInTenantSql(null, 'companyIds')})
+    ),
+    planned AS (
+      SELECT emp_id, service_po_id AS po_id, SUM(hours) AS planned_hours
+      FROM resource_budget_master
+      WHERE status = 'active' AND month = :monthNum AND year = :yearNum
+        AND service_po_id IN (SELECT id FROM in_scope_pos)
+      GROUP BY emp_id, service_po_id
+    ),
+    actual AS (
+      SELECT t.employee_id AS emp_id, t.service_po_id AS po_id, SUM(${hoursCol}) AS actual_hours, SUM(${originalHoursCol}) AS original_actual_hours
+      FROM timesheets t
+      WHERE EXTRACT(MONTH FROM t.timesheet_date) = :monthNum
+        AND EXTRACT(YEAR  FROM t.timesheet_date) = :yearNum
+        AND t.service_po_id IN (SELECT id FROM in_scope_pos)
+        AND ${CENTRALISED_HOURS_GUARD_SQL}
+        ${publishGuard}
+      GROUP BY t.employee_id, t.service_po_id
+    ),
+    combined AS (
+      SELECT
+        COALESCE(planned.emp_id, actual.emp_id) AS emp_id,
+        COALESCE(planned.po_id, actual.po_id)   AS po_id,
+        COALESCE(planned.planned_hours, 0)      AS planned_hours,
+        COALESCE(actual.actual_hours, 0)        AS actual_hours,
+        COALESCE(actual.original_actual_hours, 0) AS original_actual_hours
+      FROM planned
+      FULL OUTER JOIN actual ON actual.emp_id = planned.emp_id AND actual.po_id = planned.po_id
+    )
+  `;
+
+  // variance_pct is a per-row computed value (no GROUP BY at this level —
+  // `combined` already pre-aggregates planned/actual per emp+PO), so the
+  // threshold is applied with a plain WHERE — but on an OUTER query, since
+  // Postgres can't reference a SELECT-list alias (variance_pct) from the
+  // WHERE clause of the same query it's defined in. Wrapping in a
+  // subquery is what lets both the threshold check AND the ORDER BY below
+  // refer to `variance_pct` by name instead of repeating the CASE
+  // expression. NULL variance_pct (planned_hours = 0) never satisfies a
+  // threshold — same as the service layer's existing `at_risk` formula.
+  const varianceFilterClause = `
+    WHERE :varianceThresholdPct::numeric IS NULL
+       OR (filtered.variance_pct IS NOT NULL AND ABS(filtered.variance_pct) >= :varianceThresholdPct)
+  `;
+
+  const dataQuery = `
+    ${cteBlock}
+    SELECT * FROM (
+      SELECT
+        e.id                    AS employee_id,
+        e.employee_code,
+        e.full_name,
+        sp.id                   AS service_po_id,
+        sp.service_po_code,
+        sp.service_po_name,
+        combined.planned_hours,
+        combined.actual_hours,
+        ROUND((combined.actual_hours - combined.planned_hours)::numeric, 2) AS variance,
+        CASE
+          WHEN combined.planned_hours > 0
+            THEN ROUND(((combined.actual_hours - combined.planned_hours) / combined.planned_hours * 100)::numeric, 2)
+          ELSE NULL
+        END                       AS variance_pct,
+        combined.original_actual_hours,
+        ROUND((combined.original_actual_hours - combined.planned_hours)::numeric, 2) AS original_variance,
+        CASE
+          WHEN combined.planned_hours > 0
+            THEN ROUND(((combined.original_actual_hours - combined.planned_hours) / combined.planned_hours * 100)::numeric, 2)
+          ELSE NULL
+        END                       AS original_variance_pct
+      FROM combined
+      INNER JOIN employees e   ON e.id  = combined.emp_id
+      INNER JOIN service_pos sp ON sp.id = combined.po_id
+      WHERE 1=1 ${employeeFilter} ${poFilter} ${searchFilter}
+    ) filtered
+    ${varianceFilterClause}
+    ORDER BY ${safeSort} ${safeOrder}
+    LIMIT :limit OFFSET :offset
+  `;
+
+  const countQuery = `
+    ${cteBlock}
+    SELECT COUNT(*) AS total FROM (
+      SELECT
+        combined.planned_hours,
+        CASE
+          WHEN combined.planned_hours > 0
+            THEN ROUND(((combined.actual_hours - combined.planned_hours) / combined.planned_hours * 100)::numeric, 2)
+          ELSE NULL
+        END AS variance_pct
+      FROM combined
+      INNER JOIN employees e   ON e.id  = combined.emp_id
+      INNER JOIN service_pos sp ON sp.id = combined.po_id
+      WHERE 1=1 ${employeeFilter} ${poFilter} ${searchFilter}
+    ) filtered
+    ${varianceFilterClause}
+  `;
+
+  const [rows, countResult] = await Promise.all([
+    sequelize.query(dataQuery, { replacements, type: QueryTypes.SELECT }),
+    sequelize.query(countQuery, { replacements, type: QueryTypes.SELECT }),
+  ]);
+
+  return { rows, count: parseInt(countResult[0].total, 10) };
+}
+
+// ---------------------------------------------------------------------------
+// 4. Client Profitability & Revenue Concentration Report
+// ---------------------------------------------------------------------------
+/**
+ * Per-client rollup of Priority-1's margin calc, plus each client's share
+ * of total company revenue for the same period (concentration risk).
+ * total_delivery_cost is service_po_monthly_budgets.billed_amount summed
+ * across the client's POs for the period — not a timesheet/monthly_costs
+ * calculation, same basis as getServicePOProfitability.
+ *
+ * @param {object} filters
+ * @returns {{ rows: object[], count: number }}
+ */
+async function getClientProfitabilityConcentration(filters) {
+  const {
+    month, year, search, sortBy = 'total_margin', sortOrder = 'DESC',
+    limit, offset, companyIds,
+  } = filters;
+
+  const allowedSort = ['client_name', 'total_invoiced', 'total_delivery_cost', 'total_margin', 'margin_pct', 'revenue_concentration_pct'];
+  const safeSort = allowedSort.includes(sortBy) ? sortBy : 'total_margin';
+  const safeOrder = sortOrder && sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+
+  const monthNum = parseInt(month, 10);
+  const yearNum = parseInt(year, 10);
+  const replacements = { monthNum, yearNum, limit, offset, companyIds };
+
+  const searchFilter = search ? 'AND c.client_name ILIKE :search' : '';
+  if (search) replacements.search = `%${search}%`;
+
+  const perClientCte = `
+    WITH per_client AS (
+      SELECT
+        c.id   AS client_id,
+        c.client_name,
+        COALESCE(SUM(spmb.invoice_amount), 0)                     AS total_invoiced,
+        COALESCE(SUM(spmb.billed_amount), 0)                      AS total_delivery_cost
+      FROM clients c
+      INNER JOIN service_pos sp ON sp.client_id = c.id AND sp.is_billable = true
+      LEFT JOIN service_po_monthly_budgets spmb
+             ON spmb.service_po_id = sp.id AND spmb.month = :monthNum AND spmb.year = :yearNum
+      WHERE c.company_id IN (:companyIds)
+      GROUP BY c.id, c.client_name
+      HAVING COALESCE(SUM(spmb.invoice_amount), 0) > 0 OR COALESCE(SUM(spmb.billed_amount), 0) > 0
+    ),
+    company_total AS (
+      SELECT SUM(total_invoiced) AS grand_total FROM per_client
+    )
+  `;
+
+  const dataQuery = `
+    ${perClientCte}
+    SELECT
+      per_client.client_id,
+      per_client.client_name,
+      ROUND(per_client.total_invoiced::numeric, 2)      AS total_invoiced,
+      ROUND(per_client.total_delivery_cost::numeric, 2) AS total_delivery_cost,
+      ROUND((per_client.total_invoiced - per_client.total_delivery_cost)::numeric, 2) AS total_margin,
+      CASE
+        WHEN per_client.total_invoiced > 0
+          THEN ROUND(((per_client.total_invoiced - per_client.total_delivery_cost) / per_client.total_invoiced * 100)::numeric, 2)
+        ELSE NULL
+      END AS margin_pct,
+      CASE
+        WHEN company_total.grand_total > 0
+          THEN ROUND((per_client.total_invoiced / company_total.grand_total * 100)::numeric, 2)
+        ELSE 0
+      END AS revenue_concentration_pct
+    FROM per_client, company_total
+    WHERE 1=1 ${searchFilter}
+    ORDER BY ${safeSort} ${safeOrder}
+    LIMIT :limit OFFSET :offset
+  `;
+
+  const countQuery = `
+    ${perClientCte}
+    SELECT COUNT(*) AS total FROM per_client WHERE 1=1 ${searchFilter}
+  `;
+
+  const [rows, countResult] = await Promise.all([
+    sequelize.query(dataQuery, { replacements, type: QueryTypes.SELECT }),
+    sequelize.query(countQuery, { replacements, type: QueryTypes.SELECT }),
+  ]);
+
+  return { rows, count: parseInt(countResult[0].total, 10) };
+}
+
+// ---------------------------------------------------------------------------
+// 5. BU (Company) Performance Scorecard — Entity Admin / Admin only
+// ---------------------------------------------------------------------------
+/**
+ * One row per Company (BU) within the caller's allowed Entities.
+ *
+ * @param {object} filters
+ * @param {number[]} filters.companyIds - every company_id under the caller's entityIds
+ * @returns {{ rows: object[], count: number }}
+ */
+async function getBUPerformanceScorecard(filters) {
+  const {
+    month, year, companyIds, search,
+    sortBy = 'total_margin', sortOrder = 'DESC', limit, offset, hoursSource, roleId,
+  } = filters;
+
+  if (!companyIds || companyIds.length === 0) {
+    return { rows: [], count: 0 };
+  }
+
+  const hoursCol = (hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const allowedSort = ['company_name', 'active_employees', 'active_pos', 'total_invoiced', 'total_delivery_cost', 'total_margin', 'avg_utilization_pct'];
+  const safeSort = allowedSort.includes(sortBy) ? sortBy : 'total_margin';
+  const safeOrder = sortOrder && sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+
+  const monthNum = parseInt(month, 10);
+  const yearNum = parseInt(year, 10);
+  const replacements = { monthNum, yearNum, limit, offset, companyIds };
+
+  const publishGuard = Number(roleId) === 5
+    ? `AND EXISTS (SELECT 1 FROM timesheet_import_history h WHERE h.id = t.timesheet_import_id AND h.is_publish = true)`
+    : '';
+
+  const searchFilter = search ? 'AND co.company_name ILIKE :search' : '';
+  if (search) replacements.search = `%${search}%`;
+
+  const cte = `
+    WITH bu AS (
+      SELECT
+        co.id AS company_id, co.company_code, co.company_name, co.entity_id,
+        (SELECT COUNT(*) FROM employees e WHERE e.status = 'active' AND (
+          e.company_id = co.id
+          OR EXISTS (
+            SELECT 1 FROM employee_business_units ebu
+            WHERE ebu.employee_id = e.id AND ebu.business_unit_id = co.id AND ebu.status = 'active'
+          )
+        )) AS active_employees,
+        (SELECT COUNT(*) FROM service_pos sp WHERE sp.company_id = co.id AND sp.status IN ('in-progress','pending')) AS active_pos,
+        COALESCE((
+          SELECT SUM(spmb.invoice_amount)
+          FROM service_po_monthly_budgets spmb
+          INNER JOIN service_pos sp ON sp.id = spmb.service_po_id
+          WHERE sp.company_id = co.id AND spmb.month = :monthNum AND spmb.year = :yearNum
+        ), 0) AS total_invoiced,
+        -- Anchored on sp.company_id (the PO's own owner), matching
+        -- total_invoiced above — same basis as getServicePOProfitability:
+        -- service_po_monthly_budgets.billed_amount, not a timesheet/
+        -- monthly_costs calculation.
+        COALESCE((
+          SELECT SUM(spmb.billed_amount)
+          FROM service_po_monthly_budgets spmb
+          INNER JOIN service_pos sp ON sp.id = spmb.service_po_id
+          WHERE sp.company_id = co.id AND spmb.month = :monthNum AND spmb.year = :yearNum
+        ), 0) AS total_delivery_cost,
+        -- BU-wise hours (feeds the utilisation %): grouped by t.company_id = the SYNC BU the employee's
+        -- month was synced from (employee-wise sync), the same basis as the headcount above (employees
+        -- mapped to the BU) — so hours on a cross-BU / Centralised PO sit under the employee's BU and
+        -- are no longer lost (they used to be anchored on the PO's owner, sp.company_id).
+        COALESCE((
+          SELECT SUM(${hoursCol})
+          FROM timesheets t
+          WHERE t.company_id = co.id
+            AND EXTRACT(MONTH FROM t.timesheet_date) = :monthNum
+            AND EXTRACT(YEAR  FROM t.timesheet_date) = :yearNum
+            ${publishGuard}
+        ), 0) AS total_hours_logged,
+        COALESCE((
+          SELECT SUM(${originalHoursCol})
+          FROM timesheets t
+          WHERE t.company_id = co.id
+            AND EXTRACT(MONTH FROM t.timesheet_date) = :monthNum
+            AND EXTRACT(YEAR  FROM t.timesheet_date) = :yearNum
+            ${publishGuard}
+        ), 0) AS original_total_hours_logged
+      FROM companies co
+      WHERE co.id IN (:companyIds) AND co.is_deleted = false
+      ${searchFilter}
+    )
+  `;
+
+  const dataQuery = `
+    ${cte}
+    SELECT
+      company_id, company_code, company_name, entity_id,
+      active_employees, active_pos,
+      ROUND(total_invoiced::numeric, 2)      AS total_invoiced,
+      ROUND(total_delivery_cost::numeric, 2) AS total_delivery_cost,
+      ROUND((total_invoiced - total_delivery_cost)::numeric, 2) AS total_margin,
+      CASE
+        WHEN active_employees > 0
+          THEN ROUND((total_hours_logged / (active_employees * ${capForCompanyMonthSql('bu.company_id', ':monthNum', ':yearNum')}) * 100)::numeric, 2)
+        ELSE NULL
+      END AS avg_utilization_pct,
+      CASE
+        WHEN active_employees > 0
+          THEN ROUND((original_total_hours_logged / (active_employees * ${capForCompanyMonthSql('bu.company_id', ':monthNum', ':yearNum')}) * 100)::numeric, 2)
+        ELSE NULL
+      END AS original_avg_utilization_pct
+    FROM bu
+    ORDER BY ${safeSort} ${safeOrder}
+    LIMIT :limit OFFSET :offset
+  `;
+
+  const countQuery = `${cte} SELECT COUNT(*) AS total FROM bu`;
+
+  const [rows, countResult] = await Promise.all([
+    sequelize.query(dataQuery, { replacements, type: QueryTypes.SELECT }),
+    sequelize.query(countQuery, { replacements, type: QueryTypes.SELECT }),
+  ]);
+
+  return { rows, count: parseInt(countResult[0].total, 10) };
+}
+
+// ---------------------------------------------------------------------------
+// 6. Employee Capacity & Bench Forecast Report
+// ---------------------------------------------------------------------------
+/**
+ * Per active employee: total PLANNED hours (resource_budget_master) across
+ * every Service PO for the given month/year, vs the month's Monthly Cap Hours, plus a
+ * bench flag driven by active employee_servicepo_mapping rows with little/
+ * no planned work.
+ *
+ * @param {object} filters
+ * @returns {{ rows: object[], count: number }}
+ */
+async function getEmployeeCapacityForecast(filters) {
+  const {
+    month, year, employeeId, designation, search, benchThresholdHours,
+    sortBy = 'capacity_used_pct', sortOrder = 'DESC', limit, offset, companyIds,
+  } = filters;
+
+  const MONTHLY_CAP = await monthlyCapService.getCapForMonth(month, year, companyIds);
+  // undefined -> no bench filtering (existing behavior: every row
+  // returned, each merely annotated with bench_flag computed against the
+  // display default of 40). A real number (including 0) -> the caller
+  // explicitly asked to filter, so only bench_flag = true rows (at THAT
+  // threshold) are returned — applied before pagination, see
+  // benchFilterClause below.
+  const benchThresholdFilterRequested = benchThresholdHours !== undefined;
+  const benchThreshold = benchThresholdFilterRequested ? parseFloat(benchThresholdHours) : 40;
+
+  const allowedSort = ['full_name', 'designation', 'total_planned_hours', 'capacity_used_pct', 'active_po_mappings_count'];
+  const safeSort = allowedSort.includes(sortBy) ? sortBy : 'capacity_used_pct';
+  const safeOrder = sortOrder && sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+
+  const monthNum = parseInt(month, 10);
+  const yearNum = parseInt(year, 10);
+  const replacements = {
+    monthNum, yearNum, limit, offset, companyIds,
+    monthlyCap: MONTHLY_CAP, benchThreshold, benchThresholdFilterRequested,
+  };
+
+  const conditions = ["e.status = 'active'", EMPLOYEE_COMPANY_SCOPE_SQL];
+  if (employeeId) { conditions.push('e.id = :employeeId'); replacements.employeeId = employeeId; }
+  if (designation) { conditions.push('e.designation ILIKE :designation'); replacements.designation = `%${designation}%`; }
+  if (search) {
+    conditions.push('(e.full_name ILIKE :search OR e.employee_code ILIKE :search)');
+    replacements.search = `%${search}%`;
+  }
+  const whereClause = `WHERE ${conditions.join(' AND ')}`;
+
+  // bench_flag is a per-row computed value (active_po_mappings_count > 0
+  // AND total_planned_hours < threshold) — filtering on it requires an
+  // OUTER query, same reasoning as getResourceStaffingPlanAccuracy's
+  // variance_pct filter above: Postgres can't reference a SELECT-list
+  // alias from that same query's WHERE clause. When no threshold was
+  // explicitly requested, this clause is a no-op (every row passes).
+  const benchFilterClause = `
+    WHERE :benchThresholdFilterRequested = false OR filtered.bench_flag = true
+  `;
+
+  const dataQuery = `
+    SELECT * FROM (
+      SELECT
+        e.id                                  AS employee_id,
+        e.employee_code,
+        e.full_name,
+        e.designation,
+        :monthlyCap                           AS monthly_capacity_hours,
+        COALESCE(rb.total_planned_hours, 0)    AS total_planned_hours,
+        ROUND((COALESCE(rb.total_planned_hours, 0) / :monthlyCap * 100)::numeric, 2) AS capacity_used_pct,
+        COALESCE(map.active_po_mappings_count, 0) AS active_po_mappings_count,
+        (COALESCE(rb.total_planned_hours, 0) > :monthlyCap)                          AS overallocation_flag,
+        (COALESCE(map.active_po_mappings_count, 0) > 0 AND COALESCE(rb.total_planned_hours, 0) < :benchThreshold) AS bench_flag
+      FROM employees e
+      LEFT JOIN (
+        SELECT emp_id, SUM(hours) AS total_planned_hours
+        FROM resource_budget_master
+        WHERE status = 'active' AND month = :monthNum AND year = :yearNum AND company_id IN (:companyIds)
+        GROUP BY emp_id
+      ) rb ON rb.emp_id = e.id
+      LEFT JOIN (
+        SELECT employee_id, COUNT(*) AS active_po_mappings_count
+        FROM employee_servicepo_mapping
+        WHERE status = 'active' AND company_id IN (:companyIds)
+        GROUP BY employee_id
+      ) map ON map.employee_id = e.id
+      ${whereClause}
+    ) filtered
+    ${benchFilterClause}
+    ORDER BY ${safeSort} ${safeOrder}
+    LIMIT :limit OFFSET :offset
+  `;
+
+  const countQuery = `
+    SELECT COUNT(*) AS total FROM (
+      SELECT
+        (COALESCE(map.active_po_mappings_count, 0) > 0 AND COALESCE(rb.total_planned_hours, 0) < :benchThreshold) AS bench_flag
+      FROM employees e
+      LEFT JOIN (
+        SELECT emp_id, SUM(hours) AS total_planned_hours
+        FROM resource_budget_master
+        WHERE status = 'active' AND month = :monthNum AND year = :yearNum AND company_id IN (:companyIds)
+        GROUP BY emp_id
+      ) rb ON rb.emp_id = e.id
+      LEFT JOIN (
+        SELECT employee_id, COUNT(*) AS active_po_mappings_count
+        FROM employee_servicepo_mapping
+        WHERE status = 'active' AND company_id IN (:companyIds)
+        GROUP BY employee_id
+      ) map ON map.employee_id = e.id
+      ${whereClause}
+    ) filtered
+    ${benchFilterClause}
+  `;
+
+  const [rows, countResult] = await Promise.all([
+    sequelize.query(dataQuery, { replacements, type: QueryTypes.SELECT }),
+    sequelize.query(countQuery, { replacements, type: QueryTypes.SELECT }),
+  ]);
+
+  return { rows, count: parseInt(countResult[0].total, 10) };
+}
+
+// ---------------------------------------------------------------------------
+// 7. Service PO Timeline Risk Report (date-elapsed risk only — see
+//    computeTimelineRisk() in managementReportService.js)
+// ---------------------------------------------------------------------------
+/**
+ * Raw hours-delivered-to-date + PO date range, for the service layer to
+ * derive elapsed %, consumed %, and a projected exhaustion date.
+ *
+ * @param {object} filters
+ * @returns {{ rows: object[], count: number }}
+ */
+async function getServicePOTimelineRiskRaw(filters) {
+  const {
+    status, clientId, poId, search,
+    sortBy = 'sp.end_date', sortOrder = 'ASC', limit, offset, hoursSource, roleId, companyIds,
+    asOfDate, monthStart, monthEnd,
+  } = filters;
+
+  const hoursCol = (hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const allowedSort = ['sp.service_po_name', 'sp.start_date', 'sp.end_date', 'hours_delivered_to_date'];
+  const safeSort = allowedSort.includes(sortBy) ? sortBy : 'sp.end_date';
+  const safeOrder = sortOrder && sortOrder.toUpperCase() === 'DESC' ? 'DESC' : 'ASC';
+
+  const replacements = { limit, offset, companyIds, asOfDate: asOfDate || null, monthStart: monthStart || null, monthEnd: monthEnd || null };
+  const conditions = [
+    '(sp.company_id IN (:companyIds) OR ' + buLessServicePOInTenantSql('sp', 'companyIds') + ')',
+    'sp.start_date IS NOT NULL',
+    'sp.end_date IS NOT NULL',
+  ];
+
+  if (status && status !== 'all') { conditions.push('sp.status = :status'); replacements.status = status; }
+  if (clientId) { conditions.push('sp.client_id IN (:clientId)'); replacements.clientId = [].concat(clientId); }
+  if (poId) { conditions.push('sp.id = :poId'); replacements.poId = poId; }
+  if (search) {
+    conditions.push('(c.client_name ILIKE :search OR sp.service_po_name ILIKE :search OR sp.service_po_code ILIKE :search)');
+    replacements.search = `%${search}%`;
+  }
+
+  const publishGuard = Number(roleId) === 5
+    ? `AND EXISTS (SELECT 1 FROM timesheet_import_history h WHERE h.id = t.timesheet_import_id AND h.is_publish = true)`
+    : '';
+
+  const whereClause = `WHERE ${conditions.join(' AND ')}`;
+
+  const dataQuery = `
+    SELECT
+      sp.id                                AS service_po_id,
+      sp.service_po_code,
+      sp.service_po_name,
+      sp.status,
+      sp.start_date,
+      sp.end_date,
+      sp.po_value,
+      c.id                                  AS client_id,
+      c.client_name,
+      COALESCE(hrs.hours_delivered_to_date, 0) AS hours_delivered_to_date,
+      COALESCE(hrs.original_hours_delivered_to_date, 0) AS original_hours_delivered_to_date,
+      COALESCE(hrs.hours_in_month, 0) AS hours_in_month,
+      COALESCE(hrs.original_hours_in_month, 0) AS original_hours_in_month
+    FROM service_pos sp
+    INNER JOIN clients c ON c.id = sp.client_id
+    LEFT JOIN (
+      -- Hours delivered up to the report's "as of" date (the end of the selected month, or the chosen
+      -- date; no limit when neither is given) — the SAME cut-off the elapsed-time % uses, so hours and
+      -- risk describe the same moment. Adjusted and original are summed over exactly the same rows.
+      SELECT t.service_po_id,
+             SUM(${hoursCol}) AS hours_delivered_to_date,
+             SUM(${originalHoursCol}) AS original_hours_delivered_to_date,
+             SUM(${hoursCol}) FILTER (WHERE :monthStart::date IS NOT NULL AND t.timesheet_date >= :monthStart::date AND t.timesheet_date <= :monthEnd::date) AS hours_in_month,
+             SUM(${originalHoursCol}) FILTER (WHERE :monthStart::date IS NOT NULL AND t.timesheet_date >= :monthStart::date AND t.timesheet_date <= :monthEnd::date) AS original_hours_in_month
+      FROM timesheets t
+      WHERE (:asOfDate::date IS NULL OR t.timesheet_date <= :asOfDate::date)
+        AND ${CENTRALISED_HOURS_GUARD_SQL}
+        ${publishGuard}
+      GROUP BY t.service_po_id
+    ) hrs ON hrs.service_po_id = sp.id
+    ${whereClause}
+    ORDER BY ${safeSort} ${safeOrder}
+    LIMIT :limit OFFSET :offset
+  `;
+
+  const countQuery = `
+    SELECT COUNT(*) AS total
+    FROM service_pos sp
+    INNER JOIN clients c ON c.id = sp.client_id
+    ${whereClause}
+  `;
+
+  const [rows, countResult] = await Promise.all([
+    sequelize.query(dataQuery, { replacements, type: QueryTypes.SELECT }),
+    sequelize.query(countQuery, { replacements, type: QueryTypes.SELECT }),
+  ]);
+
+  return { rows, count: parseInt(countResult[0].total, 10) };
+}
+
+// ---------------------------------------------------------------------------
+// 8. Delivery Head / Account Owner Performance Report
+// ---------------------------------------------------------------------------
+/**
+ * Rollup of Priority-1's margin calc grouped by ServicePO.delivery_head_employee_id.
+ *
+ * @param {object} filters
+ * @returns {{ rows: object[], count: number }}
+ */
+async function getDeliveryHeadPerformance(filters) {
+  const {
+    month, year, deliveryHeadEmployeeId, search,
+    sortBy = 'total_margin', sortOrder = 'DESC', limit, offset, hoursSource, roleId, companyIds,
+  } = filters;
+
+  const hoursCol = (hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const allowedSort = ['full_name', 'po_count', 'total_hours_delivered', 'total_invoiced', 'total_delivery_cost', 'total_margin'];
+  const safeSort = allowedSort.includes(sortBy) ? sortBy : 'total_margin';
+  const safeOrder = sortOrder && sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+
+  const monthNum = parseInt(month, 10);
+  const yearNum = parseInt(year, 10);
+  const monthYear = formatMonthYear(month, year);
+  const replacements = { monthNum, yearNum, monthYear, limit, offset, companyIds };
+
+  const publishGuard = Number(roleId) === 5
+    ? `AND EXISTS (SELECT 1 FROM timesheet_import_history h WHERE h.id = t.timesheet_import_id AND h.is_publish = true)`
+    : '';
+
+  const conditions = ['(sp.company_id IN (:companyIds) OR ' + buLessServicePOInTenantSql('sp', 'companyIds') + ')', 'sp.delivery_head_employee_id IS NOT NULL'];
+  if (deliveryHeadEmployeeId) {
+    conditions.push('sp.delivery_head_employee_id = :deliveryHeadEmployeeId');
+    replacements.deliveryHeadEmployeeId = deliveryHeadEmployeeId;
+  }
+  if (search) {
+    conditions.push('e.full_name ILIKE :search');
+    replacements.search = `%${search}%`;
+  }
+  const whereClause = `WHERE ${conditions.join(' AND ')}`;
+
+  const perPoCte = `
+    WITH per_po AS (
+      SELECT
+        sp.id AS service_po_id,
+        sp.delivery_head_employee_id,
+        COALESCE(spmb.invoice_amount, 0)        AS invoiced_amount,
+        COALESCE(cur.delivery_cost, 0)          AS delivery_cost,
+        COALESCE(cur.hours_delivered, 0)        AS hours_delivered,
+        COALESCE(cur.original_hours_delivered, 0) AS original_hours_delivered,
+        COALESCE(prev.hours_delivered_before, 0) AS hours_delivered_before
+      FROM service_pos sp
+      LEFT JOIN service_po_monthly_budgets spmb
+             ON spmb.service_po_id = sp.id AND spmb.month = :monthNum AND spmb.year = :yearNum
+      LEFT JOIN (
+        SELECT t.service_po_id, SUM(${hoursCol}) AS hours_delivered,
+               SUM(${originalHoursCol}) AS original_hours_delivered,
+               SUM(${hoursCol} * COALESCE(mc.total_cost, 0)) AS delivery_cost
+        FROM timesheets t
+        LEFT JOIN monthly_costs mc ON mc.employee_id = t.employee_id AND mc.month_year = :monthYear
+        WHERE EXTRACT(MONTH FROM t.timesheet_date) = :monthNum
+          AND EXTRACT(YEAR  FROM t.timesheet_date) = :yearNum
+          AND ${CENTRALISED_HOURS_GUARD_SQL}
+          ${publishGuard}
+        GROUP BY t.service_po_id
+      ) cur ON cur.service_po_id = sp.id
+      LEFT JOIN (
+        SELECT service_po_id, SUM(${hoursCol}) AS hours_delivered_before
+        FROM timesheets t
+        WHERE timesheet_date < MAKE_DATE(:yearNum, :monthNum, 1)
+          AND ${CENTRALISED_HOURS_GUARD_SQL}
+          ${publishGuard}
+        GROUP BY service_po_id
+      ) prev ON prev.service_po_id = sp.id
+      WHERE (sp.company_id IN (:companyIds) OR ${buLessServicePOInTenantSql('sp', 'companyIds')}) AND sp.delivery_head_employee_id IS NOT NULL
+    )
+  `;
+
+  const dataQuery = `
+    ${perPoCte}
+    SELECT
+      e.id                                    AS employee_id,
+      e.employee_code,
+      e.full_name,
+      COUNT(per_po.service_po_id)              AS po_count,
+      ROUND(SUM(per_po.hours_delivered)::numeric, 2)   AS total_hours_delivered,
+      ROUND(SUM(per_po.original_hours_delivered)::numeric, 2) AS original_total_hours_delivered,
+      ROUND(SUM(per_po.invoiced_amount)::numeric, 2)   AS total_invoiced,
+      ROUND(SUM(per_po.delivery_cost)::numeric, 2)     AS total_delivery_cost,
+      ROUND((SUM(per_po.invoiced_amount) - SUM(per_po.delivery_cost))::numeric, 2) AS total_margin
+    FROM per_po
+    INNER JOIN employees e ON e.id = per_po.delivery_head_employee_id
+    INNER JOIN service_pos sp ON sp.id = per_po.service_po_id
+    ${whereClause}
+    GROUP BY e.id, e.employee_code, e.full_name
+    ORDER BY ${safeSort} ${safeOrder}
+    LIMIT :limit OFFSET :offset
+  `;
+
+  const countQuery = `
+    ${perPoCte}
+    SELECT COUNT(DISTINCT per_po.delivery_head_employee_id) AS total
+    FROM per_po
+    INNER JOIN employees e ON e.id = per_po.delivery_head_employee_id
+    INNER JOIN service_pos sp ON sp.id = per_po.service_po_id
+    ${whereClause}
+  `;
+
+  const [rows, countResult] = await Promise.all([
+    sequelize.query(dataQuery, { replacements, type: QueryTypes.SELECT }),
+    sequelize.query(countQuery, { replacements, type: QueryTypes.SELECT }),
+  ]);
+
+  return { rows, count: parseInt(countResult[0].total, 10) };
+}
+
+// ---------------------------------------------------------------------------
+// 9. Invoice Realization / Billing Efficiency Report
+// ---------------------------------------------------------------------------
+/**
+ * Trended invoiced vs billed amounts per Service PO across a month/year
+ * range, from service_po_monthly_budgets. months_outstanding is a
+ * simplified proxy — the count of months IN THE SELECTED RANGE where
+ * unbilled > 0, not a true consecutive-run or payment-terms-aware figure
+ * (no due-date/payment-date field exists in the schema).
+ *
+ * @param {object} filters
+ * @returns {{ rows: object[], count: number }}
+ */
+async function getInvoiceRealizationTrend(filters) {
+  const {
+    startYear, startMonth, endYear, endMonth, clientId, poId, search,
+    sortBy = 'total_unbilled', sortOrder = 'DESC', limit, offset, companyIds,
+  } = filters;
+
+  const allowedSort = ['service_po_name', 'total_invoiced', 'total_billed', 'total_unbilled', 'months_outstanding'];
+  const safeSort = allowedSort.includes(sortBy) ? sortBy : 'total_unbilled';
+  const safeOrder = sortOrder && sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+
+  const replacements = {
+    startPeriod: startYear * 100 + startMonth,
+    endPeriod: endYear * 100 + endMonth,
+    limit, offset, companyIds,
+  };
+
+  const conditions = ['(sp.company_id IN (:companyIds) OR ' + buLessServicePOInTenantSql('sp', 'companyIds') + ')', '(spmb.year * 100 + spmb.month) BETWEEN :startPeriod AND :endPeriod'];
+  if (clientId) { conditions.push('sp.client_id IN (:clientId)'); replacements.clientId = [].concat(clientId); }
+  if (poId) { conditions.push('sp.id = :poId'); replacements.poId = poId; }
+  if (search) {
+    conditions.push('(c.client_name ILIKE :search OR sp.service_po_name ILIKE :search)');
+    replacements.search = `%${search}%`;
+  }
+  const whereClause = `WHERE ${conditions.join(' AND ')}`;
+
+  const cte = `
+    WITH months AS (
+      SELECT
+        sp.id AS service_po_id, sp.service_po_code, sp.service_po_name,
+        c.id AS client_id, c.client_name,
+        spmb.month, spmb.year,
+        spmb.invoice_amount, spmb.billed_amount,
+        (spmb.invoice_amount - spmb.billed_amount) AS unbilled
+      FROM service_po_monthly_budgets spmb
+      INNER JOIN service_pos sp ON sp.id = spmb.service_po_id
+      INNER JOIN clients c ON c.id = sp.client_id
+      ${whereClause}
+    )
+  `;
+
+  const dataQuery = `
+    ${cte}
+    SELECT
+      service_po_id, service_po_code, service_po_name, client_id, client_name,
+      ROUND(SUM(invoice_amount)::numeric, 2)                                AS total_invoiced,
+      ROUND(SUM(billed_amount)::numeric, 2)                                 AS total_billed,
+      ROUND(SUM(unbilled)::numeric, 2)                                      AS total_unbilled,
+      COUNT(*) FILTER (WHERE unbilled > 0)                                  AS months_outstanding,
+      json_agg(json_build_object(
+        'month', month, 'year', year,
+        'invoice_amount', invoice_amount, 'billed_amount', billed_amount, 'unbilled', unbilled
+      ) ORDER BY year, month)                                               AS monthly_trend
+    FROM months
+    GROUP BY service_po_id, service_po_code, service_po_name, client_id, client_name
+    ORDER BY ${safeSort} ${safeOrder}
+    LIMIT :limit OFFSET :offset
+  `;
+
+  const countQuery = `
+    ${cte}
+    SELECT COUNT(*) AS total FROM (
+      SELECT service_po_id FROM months GROUP BY service_po_id
+    ) sub
+  `;
+
+  const [rows, countResult] = await Promise.all([
+    sequelize.query(dataQuery, { replacements, type: QueryTypes.SELECT }),
+    sequelize.query(countQuery, { replacements, type: QueryTypes.SELECT }),
+  ]);
+
+  return { rows, count: parseInt(countResult[0].total, 10) };
+}
+
+// ---------------------------------------------------------------------------
+// 10. Service Line (Category/Type) Business Mix Report
+// ---------------------------------------------------------------------------
+/**
+ * Aggregates hours/cost/revenue by ServiceCategory + ServiceType for a
+ * given month/year, with an optional prior period for MoM growth %.
+ *
+ * @param {object} filters
+ * @returns {object[]}
+ */
+async function getServiceLineBusinessMix(filters) {
+  const {
+    month, year, compareMonth, compareYear,
+    serviceCategoryId, serviceTypeId, hoursSource, roleId, companyIds,
+  } = filters;
+
+  const hoursCol = (hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const monthNum = parseInt(month, 10);
+  const yearNum = parseInt(year, 10);
+  const monthYear = formatMonthYear(month, year);
+
+  const replacements = { monthNum, yearNum, monthYear, companyIds };
+  // Anchored on sp.company_id (the PO's own owner), matching invoiceQuery
+  // below — NOT t.company_id (the acting/logging session's company). The two
+  // result sets are merged purely by service_type_id (see fetchPeriod()), so
+  // using a different anchor per side previously let a cross-BU-mapped
+  // employee's hours/cost land under one BU's row while the matching PO's
+  // invoice landed under a different BU's row for the same service type,
+  // producing a numerically wrong (not just missing) margin.
+  // Hours of a Centralised PO only count the viewer's own BU's timesheets (CENTRALISED_HOURS_GUARD_SQL);
+  // any other PO keeps every employee's rows (cross-BU staffing, regardless of t.company_id).
+  const conditions = ['(sp.company_id IN (:companyIds) OR ' + buLessServicePOInTenantSql('sp', 'companyIds') + ')', CENTRALISED_HOURS_GUARD_SQL, 'EXTRACT(MONTH FROM t.timesheet_date) = :monthNum', 'EXTRACT(YEAR FROM t.timesheet_date) = :yearNum'];
+
+  if (serviceCategoryId) { conditions.push('sc.id = :serviceCategoryId'); replacements.serviceCategoryId = serviceCategoryId; }
+  if (serviceTypeId) { conditions.push('st.id = :serviceTypeId'); replacements.serviceTypeId = serviceTypeId; }
+
+  const publishGuard = Number(roleId) === 5
+    ? `AND EXISTS (SELECT 1 FROM timesheet_import_history h WHERE h.id = t.timesheet_import_id AND h.is_publish = true)`
+    : '';
+
+  const whereClause = `WHERE ${conditions.join(' AND ')} ${publishGuard}`;
+
+  // Hours + delivery cost from timesheets, grouped by category/type.
+  const hoursCostQuery = `
+    SELECT
+      sc.id                                AS service_category_id,
+      sc.name                              AS service_category_name,
+      st.id                                AS service_type_id,
+      st.service_type_name,
+      ROUND(SUM(${hoursCol})::numeric, 2)  AS hours_delivered,
+      ROUND(SUM(${originalHoursCol})::numeric, 2) AS original_hours_delivered,
+      ROUND(SUM(${hoursCol} * COALESCE(mc.total_cost, 0))::numeric, 2) AS delivery_cost
+    FROM timesheets t
+    INNER JOIN service_pos sp        ON sp.id = t.service_po_id
+    INNER JOIN service_types st      ON st.id = sp.service_type_id
+    INNER JOIN service_categories sc ON sc.id = st.service_category_id
+    LEFT JOIN monthly_costs mc       ON mc.employee_id = t.employee_id AND mc.month_year = :monthYear
+    ${whereClause}
+    GROUP BY sc.id, sc.name, st.id, st.service_type_name
+  `;
+
+  // Invoice amount aggregated independently by category/type — driven from
+  // service_pos + service_po_monthly_budgets directly, NOT joined through
+  // timesheets (a PO with N timesheet rows would otherwise have its single
+  // monthly invoice_amount counted N times).
+  const invoiceQuery = `
+    SELECT
+      sc.id      AS service_category_id,
+      st.id      AS service_type_id,
+      ROUND(COALESCE(SUM(spmb.invoice_amount), 0)::numeric, 2) AS invoiced_amount
+    FROM service_pos sp
+    INNER JOIN service_types st      ON st.id = sp.service_type_id
+    INNER JOIN service_categories sc ON sc.id = st.service_category_id
+    LEFT JOIN service_po_monthly_budgets spmb
+           ON spmb.service_po_id = sp.id AND spmb.month = :monthNum AND spmb.year = :yearNum
+    WHERE (sp.company_id IN (:companyIds) OR ${buLessServicePOInTenantSql('sp', 'companyIds')})
+      ${serviceCategoryId ? 'AND sc.id = :serviceCategoryId' : ''}
+      ${serviceTypeId ? 'AND st.id = :serviceTypeId' : ''}
+    GROUP BY sc.id, st.id
+  `;
+
+  async function fetchPeriod(monthNumVal, yearNumVal, monthYearVal) {
+    const periodReplacements = { ...replacements, monthNum: monthNumVal, yearNum: yearNumVal, monthYear: monthYearVal };
+    const [hoursCostRows, invoiceRows] = await Promise.all([
+      sequelize.query(hoursCostQuery, { replacements: periodReplacements, type: QueryTypes.SELECT }),
+      sequelize.query(invoiceQuery, { replacements: periodReplacements, type: QueryTypes.SELECT }),
+    ]);
+
+    const invoiceByType = new Map(invoiceRows.map((r) => [r.service_type_id, parseFloat(r.invoiced_amount) || 0]));
+
+    return hoursCostRows.map((row) => {
+      const invoiced = invoiceByType.get(row.service_type_id) || 0;
+      const cost = parseFloat(row.delivery_cost) || 0;
+      const hours = parseFloat(row.hours_delivered) || 0;
+      const originalHours = parseFloat(row.original_hours_delivered) || 0;
+      const margin = Math.round((invoiced - cost) * 100) / 100;
+      return {
+        ...row,
+        invoiced_amount: Math.round(invoiced * 100) / 100,
+        margin,
+        margin_per_hour: hours > 0 ? Math.round((margin / hours) * 100) / 100 : null,
+        original_margin_per_hour: originalHours > 0 ? Math.round((margin / originalHours) * 100) / 100 : null,
+      };
+    });
+  }
+
+  const rows = await fetchPeriod(monthNum, yearNum, monthYear);
+
+  let priorRows = [];
+  if (compareMonth && compareYear) {
+    priorRows = await fetchPeriod(parseInt(compareMonth, 10), parseInt(compareYear, 10), formatMonthYear(compareMonth, compareYear));
+  }
+
+  return { rows, priorRows };
+}
+
+// A Project Manager's resolved team roster, for EVERY Project Manager at
+// once (not per-caller). There is no direct project_manager_id column
+// anywhere in this schema (only service_pos.delivery_head_employee_id exists
+// as a direct FK, for a different role) — so this mirrors the same two-hop,
+// data-driven path employeeAccessControlService.resolveEmployeeAccessWhere()
+// already walks for a single caller: PM -> Team Lead (team_mappings) ->
+// Employee (manager_employee_mappings), PLUS employees mapped directly to
+// the PM. `roster_distinct` is (pm_id, employee_id) — an employee mapped to
+// two Team Leads (PRIMARY+SECONDARY) can appear under two PMs; harmless here
+// since PM-wise rollups are meant to reflect that dual reporting line.
+const PM_ROSTER_CTE = `
+  pms AS (
+    SELECT DISTINCT e.id AS pm_id, e.full_name AS pm_name, e.employee_code AS pm_code
+    FROM employees e
+    INNER JOIN employee_roles er ON er.employee_id = e.id AND er.status = 'active'
+    INNER JOIN roles r ON r.id = er.role_id AND r.role_name = 'Project Manager'
+    WHERE e.is_deleted = false AND e.status = 'active' AND ${EMPLOYEE_COMPANY_SCOPE_SQL}
+  ),
+  team_leads AS (
+    SELECT tm.service_po_admin_employee_id AS pm_id, tm.manager_employee_id AS tl_id
+    FROM team_mappings tm
+    WHERE tm.status = 'active'
+  ),
+  roster AS (
+    SELECT pm_id, pm_id AS employee_id FROM pms
+    UNION
+    SELECT pms.pm_id, mem.employee_id
+    FROM manager_employee_mappings mem
+    INNER JOIN pms ON pms.pm_id = mem.manager_employee_id
+    WHERE mem.status = 'active'
+    UNION
+    SELECT tl.pm_id, tl.tl_id AS employee_id FROM team_leads tl
+    UNION
+    SELECT tl.pm_id, mem.employee_id
+    FROM manager_employee_mappings mem
+    INNER JOIN team_leads tl ON tl.tl_id = mem.manager_employee_id
+    WHERE mem.status = 'active'
+  ),
+  roster_distinct AS (
+    SELECT DISTINCT pm_id, employee_id FROM roster
+  )
+`;
+
+// The flat per-employee-per-month capacity figure already used everywhere
+// else in this codebase for an "available hours" concept (see
+// getEmployeeCapacityForecast above and pmDashboardRepository.getTeamCapacity)
+// — reused here for consistency rather than a calendar-working-days figure,
+// which this schema has no holiday/working-day-calendar table to compute.
+// Monthly capacity per calendar month of a month-series query (alias `m`, column
+// month_start): the Monthly Cap Hours that month was synced with, scoped to the
+// caller's :companyIds — so a range spanning a cap change uses each month's own cap.
+const CAP_M = capForMonthStartSql('m.month_start', 'companyIds');
+
+// A billable-hours WHERE fragment for getPMWiseUtilization/
+// getProjectWiseUtilization below. `service_pos.is_billable` (a real column,
+// not a name-matching heuristic) is the authoritative flag for this — it
+// correctly covers every non-project overhead Service PO this schema
+// actually has (confirmed against real data: "On Bench", "Leaves",
+// "Training & Upskilling", "HR and Admin Activity" are ALL is_billable=false)
+// without needing to enumerate their names. An earlier name-based version of
+// this filter (LOWER(service_po_name) NOT IN ('idle','on bench')) MISSED
+// "HR and Admin Activity" — a shared, org-wide catch-all PO nearly every
+// employee is mapped to — which silently inflated every PM's resource_count
+// to the entire company headcount. is_billable=false also means "Training"
+// IS excludable after all, contrary to this file's earlier assumption.
+const BILLABLE_ENTRY_FILTER_SQL = `sp.is_billable = true`;
+
+// Sort key -> its as-logged (Original basis) twin column, used when hoursSource === 'O'.
+// Keys outside this map (names, counts, available hours) sort identically on both bases.
+const ORIGINAL_SORT_TWIN = {
+  total_logged_hours: 'original_total_logged_hours',
+  utilization_pct: 'original_utilization_pct',
+  avg_bench_pct: 'original_avg_bench_pct',
+};
+
+const PERIOD_EXPR_SQL =`(EXTRACT(YEAR FROM t.timesheet_date)::int * 100 + EXTRACT(MONTH FROM t.timesheet_date)::int)`;
+
+// BU scope for the 2 Bench reports below — deliberately NOT the usual
+// "(sp.company_id IN (:companyIds) OR sp.company_id IS NULL)" idiom used
+// everywhere else in this file (getProjectWiseUtilization included): the
+// "Idle"/"On Bench" Service PO is a single shared, org-wide utility PO with
+// sp.company_id = NULL BY DESIGN (confirmed against real data — every Bench-
+// tagged timesheet row joins to the same PO row regardless of which BU
+// logged it), so "OR sp.company_id IS NULL" would make every Bench entry
+// pass every BU's filter — defeating scoping entirely for this report only
+// (this is the bug reported against resource-wise-bench/month-wise-bench).
+// t.company_id (the timesheet row's own company, stamped from the actor who
+// logged it — confirmed populated with real, differentiated values even
+// when sp.company_id is null) is the reliable per-row BU signal here,
+// matching dashboardRepository.js's buildAnalyticsFilters() convention for
+// this exact same getNoWorkTrend/getLeaveHoursTrend bench/leave scenario —
+// except without ITS "OR sp.company_id IS NULL" clause, which would
+// reintroduce the same bug.
+//
+// UPDATE (employee-wise Sync Employee Work Logs): a synced timesheet row's company_id is now the
+// employee's SYNC BU (one of the BUs they are mapped to), and a multi-BU employee is synced only once.
+// The Bench reports are EMPLOYEE-wise, so the scope is "the EMPLOYEE is mapped to the selected BU/Sub-BU"
+// (EXISTS — never a JOIN, so a multi-BU employee is not multiplied) instead of t.company_id/sp.company_id.
+// Needs the timesheets alias `t` and the :companyIds replacement.
+const BENCH_COMPANY_SCOPE_SQL = `EXISTS (
+  SELECT 1 FROM employees be
+  WHERE be.id = t.employee_id
+    AND (
+      be.company_id IN (:companyIds)
+      OR EXISTS (
+        SELECT 1 FROM employee_business_units bebu
+        WHERE bebu.employee_id = be.id
+          AND bebu.business_unit_id IN (:companyIds)
+          AND bebu.status = 'active'
+      )
+    )
+)`;
+
+// The bare Project Manager roster (id/name/code) — reused by
+// getPMWiseUtilization below (which needs ONLY this, not the org-hierarchy
+// walk PM_ROSTER_CTE further down builds on top of it for the Bench
+// reports' PM-attribution column).
+const PMS_ONLY_CTE_SQL = `
+  pms AS (
+    SELECT DISTINCT e.id AS pm_id, e.full_name AS pm_name, e.employee_code AS pm_code
+    FROM employees e
+    INNER JOIN employee_roles er ON er.employee_id = e.id AND er.status = 'active'
+    INNER JOIN roles r ON r.id = er.role_id AND r.role_name = 'Project Manager'
+    WHERE e.is_deleted = false AND e.status = 'active' AND ${EMPLOYEE_COMPANY_SCOPE_SQL}
+  )
+`;
+
+// ---------------------------------------------------------------------------
+// 11. Project Manager-wise Utilization Report — one row per Project Manager.
+//
+// A PM's "team" here is driven ENTIRELY by Service PO staffing, not the
+// org hierarchy (team_mappings/manager_employee_mappings) getResourceWiseBench
+// uses for its PM column — matching the already-established "Project
+// Manager sees only individually-mapped Service POs" rule
+// (servicePOService.js's resolveIndividuallyMappedServicePOIds() /
+// employee_servicepo_mapping, capability servicepo.view_mapped_employees):
+//   1. Find every Service PO the PM is THEMSELVES individually mapped to
+//      (employee_servicepo_mapping, active row, employee_id = PM's id).
+//   2. `resource_count` = COUNT(DISTINCT employee_id) of every employee
+//      individually mapped to any of those Service POs (any employee, not
+//      just direct reports) — an employee mapped to 2 of the PM's Service
+//      POs is counted ONCE, not twice.
+//   3. `project_count` = COUNT(DISTINCT project_id) across those same
+//      Service POs — a static staffing/master-data count, not an
+//      hours-logged-activity count.
+//   4. `total_logged_hours` = actual timesheet hours (billable only —
+//      Bench/Leave excluded) logged by each mapped employee AGAINST THE
+//      SPECIFIC Service PO they're mapped to under this PM.
+//   5. `total_available_hours` = the PLANNED/BUDGETED hours for those same
+//      (employee, Service PO) pairs, read from resource_budget_master (the
+//      "PO Master") for the requested month range — NOT a flat capacity
+//      constant. This is the authoritative source of "available hours";
+//      a pair with no budget row for a given month simply contributes 0.
+// ---------------------------------------------------------------------------
+/**
+ * @param {object} filters
+ * @param {number} filters.startMonth
+ * @param {number} filters.startYear
+ * @param {number} filters.endMonth
+ * @param {number} filters.endYear
+ * @param {string} [filters.search] - matches PM name/employee code
+ * @param {string} [filters.sortBy]
+ * @param {string} [filters.sortOrder]
+ * @param {number} filters.limit
+ * @param {number} filters.offset
+ * @param {number[]} filters.companyIds
+ * @param {string} [filters.hoursSource]
+ * @returns {Promise<{ rows: object[], count: number }>}
+ */
+async function getPMWiseUtilization(filters) {
+  if (isEmptyCompanyScope(filters.companyIds)) {
+    return {
+      rows: [],
+      count: 0,
+      summary: { total_resource_count: 0, total_project_count: 0, total_logged_hours: 0, original_total_logged_hours: 0, total_available_hours: 0 },
+    };
+  }
+
+  const {
+    startMonth, startYear, endMonth, endYear, search, hoursSource,
+    sortBy = 'utilization_pct', sortOrder = 'DESC', limit, offset, companyIds,
+  } = filters;
+
+  const hoursCol = (hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const allowedSort = ['pm_name', 'resource_count', 'project_count', 'total_logged_hours', 'total_available_hours', 'utilization_pct'];
+  const allowedSafeSort = allowedSort.includes(sortBy) ? sortBy : 'utilization_pct';
+  // Original basis: sort by the as-logged twin of the chosen key (fixed allow-list map, never request input).
+  const safeSort = (hoursSource === 'O' && ORIGINAL_SORT_TWIN[allowedSafeSort]) || allowedSafeSort;
+  const safeOrder = sortOrder && sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+
+  const replacements = {
+    startPeriod: startYear * 100 + startMonth,
+    endPeriod: endYear * 100 + endMonth,
+    startMonthYear: startYear * 100 + startMonth,
+    endMonthYear: endYear * 100 + endMonth,
+    limit, offset, companyIds,
+  };
+
+  const searchClause = search ? 'AND (pms.pm_name ILIKE :search OR pms.pm_code ILIKE :search)' : '';
+  if (search) replacements.search = `%${search}%`;
+
+  const cte = `
+    WITH ${PMS_ONLY_CTE_SQL},
+    pm_mapped_spos AS (
+      SELECT DISTINCT pms.pm_id, sp.id AS service_po_id, sp.project_id
+      FROM employee_servicepo_mapping esm
+      INNER JOIN pms ON pms.pm_id = esm.employee_id
+      INNER JOIN service_pos sp ON sp.id = esm.service_po_id AND sp.is_deleted = false
+      WHERE esm.status = 'active' AND ${BILLABLE_ENTRY_FILTER_SQL}
+    ),
+    spo_resources AS (
+      SELECT pms2.pm_id, pms2.service_po_id, pms2.project_id, esm2.employee_id
+      FROM pm_mapped_spos pms2
+      INNER JOIN employee_servicepo_mapping esm2
+              ON esm2.service_po_id = pms2.service_po_id AND esm2.status = 'active'
+    ),
+    pm_staffing AS (
+      SELECT
+        pm_id,
+        COUNT(DISTINCT employee_id) AS resource_count,
+        COUNT(DISTINCT project_id) FILTER (WHERE project_id IS NOT NULL) AS project_count
+      FROM spo_resources
+      GROUP BY pm_id
+    ),
+    logged AS (
+      SELECT sr.pm_id, SUM(${hoursCol}) AS total_logged_hours, SUM(${originalHoursCol}) AS original_total_logged_hours
+      FROM spo_resources sr
+      INNER JOIN timesheets t ON t.employee_id = sr.employee_id AND t.service_po_id = sr.service_po_id
+      WHERE ${PERIOD_EXPR_SQL} BETWEEN :startPeriod AND :endPeriod
+      GROUP BY sr.pm_id
+    ),
+    available AS (
+      SELECT sr.pm_id, SUM(rbm.hours) AS total_available_hours
+      FROM spo_resources sr
+      INNER JOIN resource_budget_master rbm
+              ON rbm.emp_id = sr.employee_id AND rbm.service_po_id = sr.service_po_id
+             AND rbm.status = 'active'
+             AND (rbm.year * 100 + rbm.month) BETWEEN :startMonthYear AND :endMonthYear
+      GROUP BY sr.pm_id
+    )
+  `;
+
+  const baseSelect = `
+    ${cte}
+    SELECT
+      pms.pm_id AS project_manager_id, pms.pm_name AS project_manager_name, pms.pm_code AS project_manager_code,
+      COALESCE(ps.resource_count, 0)  AS resource_count,
+      COALESCE(ps.project_count, 0)   AS project_count,
+      ROUND(COALESCE(lg.total_logged_hours, 0)::numeric, 2)     AS total_logged_hours,
+      ROUND(COALESCE(lg.original_total_logged_hours, 0)::numeric, 2) AS original_total_logged_hours,
+      ROUND(COALESCE(av.total_available_hours, 0)::numeric, 2) AS total_available_hours,
+      CASE WHEN COALESCE(av.total_available_hours, 0) > 0
+        THEN ROUND((COALESCE(lg.total_logged_hours, 0) / av.total_available_hours * 100)::numeric, 2)
+        ELSE 0
+      END AS utilization_pct,
+      CASE WHEN COALESCE(av.total_available_hours, 0) > 0
+        THEN ROUND((COALESCE(lg.original_total_logged_hours, 0) / av.total_available_hours * 100)::numeric, 2)
+        ELSE 0
+      END AS original_utilization_pct
+    FROM pms
+    LEFT JOIN pm_staffing ps ON ps.pm_id = pms.pm_id
+    LEFT JOIN logged lg      ON lg.pm_id = pms.pm_id
+    LEFT JOIN available av   ON av.pm_id = pms.pm_id
+    WHERE 1=1 ${searchClause}
+  `;
+
+  const dataQuery = `${baseSelect} ORDER BY ${safeSort} ${safeOrder} NULLS LAST LIMIT :limit OFFSET :offset`;
+  const countQuery = `SELECT COUNT(*) AS total FROM (${baseSelect}) filtered`;
+  // Full-dataset (unpaginated) summary — every PM's own row already carries
+  // its own totals (baseSelect has no LIMIT/OFFSET); summing across ALL of
+  // them here gives the full filtered dataset's totals, not just the
+  // current page's.
+  const summaryQuery = `
+    SELECT
+      COALESCE(SUM(resource_count), 0)        AS total_resource_count,
+      COALESCE(SUM(project_count), 0)         AS total_project_count,
+      COALESCE(SUM(total_logged_hours), 0)    AS total_logged_hours,
+      COALESCE(SUM(original_total_logged_hours), 0) AS original_total_logged_hours,
+      COALESCE(SUM(total_available_hours), 0) AS total_available_hours
+    FROM (${baseSelect}) all_pms
+  `;
+
+  const [rows, countResult, summaryResult] = await Promise.all([
+    sequelize.query(dataQuery, { replacements, type: QueryTypes.SELECT }),
+    sequelize.query(countQuery, { replacements, type: QueryTypes.SELECT }),
+    sequelize.query(summaryQuery, { replacements, type: QueryTypes.SELECT }),
+  ]);
+
+  const summaryRow = summaryResult[0] || {};
+  const summary = {
+    total_resource_count: parseInt(summaryRow.total_resource_count, 10) || 0,
+    total_project_count: parseInt(summaryRow.total_project_count, 10) || 0,
+    total_logged_hours: parseFloat(summaryRow.total_logged_hours) || 0,
+    original_total_logged_hours: parseFloat(summaryRow.original_total_logged_hours) || 0,
+    total_available_hours: parseFloat(summaryRow.total_available_hours) || 0,
+  };
+
+  return { rows, count: parseInt(countResult[0].total, 10), summary };
+}
+
+// ---------------------------------------------------------------------------
+// 12. "Project-wise" Utilization Report — despite the name (kept for
+// continuity with the source spec), this is actually SERVICE PO-wise: one
+// row per Service PO, carrying its Client and Project for context. Same
+// staffing/hours/budget conventions as getPMWiseUtilization above (Service
+// PO mapping defines the resource pool; logged hours from timesheets;
+// available hours from resource_budget_master), just grouped by Service PO
+// instead of by Project Manager.
+// ---------------------------------------------------------------------------
+/**
+ * @param {object} filters
+ * @param {number} filters.startMonth
+ * @param {number} filters.startYear
+ * @param {number} filters.endMonth
+ * @param {number} filters.endYear
+ * @param {string} [filters.search] - matches client/project/Service PO name or code
+ * @param {string} [filters.sortBy]
+ * @param {string} [filters.sortOrder]
+ * @param {number} filters.limit
+ * @param {number} filters.offset
+ * @param {number[]} filters.companyIds
+ * @param {string} [filters.hoursSource]
+ * @returns {Promise<{ rows: object[], count: number }>}
+ */
+async function getProjectWiseUtilization(filters) {
+  // pmServicePoIds (array) = Project Manager mode: only the PM's own Service POs, no BU condition; null = other roles.
+  const pmMode = Array.isArray(filters.pmServicePoIds);
+  if (pmMode ? filters.pmServicePoIds.length === 0 : isEmptyCompanyScope(filters.companyIds)) {
+    return {
+      rows: [],
+      count: 0,
+      summary: { total_resource_count: 0, total_logged_hours: 0, original_total_logged_hours: 0, total_available_hours: 0 },
+    };
+  }
+
+  const {
+    startMonth, startYear, endMonth, endYear, search, hoursSource,
+    sortBy = 'utilization_pct', sortOrder = 'DESC', limit, offset, companyIds,
+  } = filters;
+
+  const hoursCol = (hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const allowedSort = ['client_name', 'project_name', 'service_po_name', 'resource_count', 'total_logged_hours', 'total_available_hours', 'utilization_pct'];
+  const allowedSafeSort = allowedSort.includes(sortBy) ? sortBy : 'utilization_pct';
+  // Original basis: sort by the as-logged twin of the chosen key (fixed allow-list map, never request input).
+  const safeSort = (hoursSource === 'O' && ORIGINAL_SORT_TWIN[allowedSafeSort]) || allowedSafeSort;
+  const safeOrder = sortOrder && sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+
+  const replacements = {
+    startPeriod: startYear * 100 + startMonth,
+    endPeriod: endYear * 100 + endMonth,
+    startMonthYear: startYear * 100 + startMonth,
+    endMonthYear: endYear * 100 + endMonth,
+    limit, offset, companyIds,
+  };
+
+  const conditions = [
+    'sp.is_deleted = false',
+    pmMode ? 'sp.id IN (:pmServicePoIds)' : '(sp.company_id IN (:companyIds) OR ' + buLessServicePOInTenantSql('sp', 'companyIds') + ')',
+    BILLABLE_ENTRY_FILTER_SQL,
+  ];
+  if (pmMode) replacements.pmServicePoIds = filters.pmServicePoIds;
+  if (search) {
+    conditions.push('(c.client_name ILIKE :search OR p.project_name ILIKE :search OR sp.service_po_name ILIKE :search OR sp.service_po_code ILIKE :search)');
+    replacements.search = `%${search}%`;
+  }
+  const whereClause = `WHERE ${conditions.join(' AND ')}`;
+
+  const cte = `
+    WITH in_scope_spos AS (
+      SELECT
+        sp.id AS service_po_id, sp.service_po_code, sp.service_po_name,
+        p.id AS project_id, p.project_code, p.project_name,
+        c.id AS client_id, c.client_name
+      FROM service_pos sp
+      LEFT JOIN projects p ON p.id = sp.project_id
+      LEFT JOIN clients c  ON c.id = sp.client_id
+      ${whereClause}
+    ),
+    spo_resources AS (
+      SELECT iss.service_po_id, esm.employee_id
+      FROM in_scope_spos iss
+      INNER JOIN employee_servicepo_mapping esm
+              ON esm.service_po_id = iss.service_po_id AND esm.status = 'active'
+    ),
+    spo_staffing AS (
+      SELECT service_po_id, COUNT(DISTINCT employee_id) AS resource_count
+      FROM spo_resources
+      GROUP BY service_po_id
+    ),
+    logged AS (
+      SELECT sr.service_po_id, SUM(${hoursCol}) AS total_logged_hours, SUM(${originalHoursCol}) AS original_total_logged_hours
+      FROM spo_resources sr
+      INNER JOIN timesheets t ON t.employee_id = sr.employee_id AND t.service_po_id = sr.service_po_id
+      WHERE ${PERIOD_EXPR_SQL} BETWEEN :startPeriod AND :endPeriod
+      GROUP BY sr.service_po_id
+    ),
+    available AS (
+      SELECT sr.service_po_id, SUM(rbm.hours) AS total_available_hours
+      FROM spo_resources sr
+      INNER JOIN resource_budget_master rbm
+              ON rbm.emp_id = sr.employee_id AND rbm.service_po_id = sr.service_po_id
+             AND rbm.status = 'active'
+             AND (rbm.year * 100 + rbm.month) BETWEEN :startMonthYear AND :endMonthYear
+      GROUP BY sr.service_po_id
+    )
+  `;
+
+  const baseSelect = `
+    ${cte}
+    SELECT
+      iss.service_po_id, iss.service_po_code, iss.service_po_name,
+      iss.project_id, iss.project_code, iss.project_name,
+      iss.client_id, iss.client_name,
+      COALESCE(ss.resource_count, 0) AS resource_count,
+      ROUND(COALESCE(lg.total_logged_hours, 0)::numeric, 2)     AS total_logged_hours,
+      ROUND(COALESCE(lg.original_total_logged_hours, 0)::numeric, 2) AS original_total_logged_hours,
+      ROUND(COALESCE(av.total_available_hours, 0)::numeric, 2)  AS total_available_hours,
+      CASE WHEN COALESCE(av.total_available_hours, 0) > 0
+        THEN ROUND((COALESCE(lg.total_logged_hours, 0) / av.total_available_hours * 100)::numeric, 2)
+        ELSE 0
+      END AS utilization_pct,
+      CASE WHEN COALESCE(av.total_available_hours, 0) > 0
+        THEN ROUND((COALESCE(lg.original_total_logged_hours, 0) / av.total_available_hours * 100)::numeric, 2)
+        ELSE 0
+      END AS original_utilization_pct
+    FROM in_scope_spos iss
+    LEFT JOIN spo_staffing ss ON ss.service_po_id = iss.service_po_id
+    LEFT JOIN logged lg       ON lg.service_po_id = iss.service_po_id
+    LEFT JOIN available av    ON av.service_po_id = iss.service_po_id
+  `;
+
+  const dataQuery = `SELECT * FROM (${baseSelect}) filtered ORDER BY ${safeSort} ${safeOrder} NULLS LAST LIMIT :limit OFFSET :offset`;
+  const countQuery = `SELECT COUNT(*) AS total FROM (${baseSelect}) filtered`;
+  // Full-dataset (unpaginated) summary — every Service PO's own row already
+  // carries its own totals (baseSelect has no LIMIT/OFFSET); summing across
+  // ALL of them here gives the full filtered dataset's totals, not just the
+  // current page's.
+  const summaryQuery = `
+    SELECT
+      COALESCE(SUM(resource_count), 0)        AS total_resource_count,
+      COALESCE(SUM(total_logged_hours), 0)    AS total_logged_hours,
+      COALESCE(SUM(original_total_logged_hours), 0) AS original_total_logged_hours,
+      COALESCE(SUM(total_available_hours), 0) AS total_available_hours
+    FROM (${baseSelect}) all_spos
+  `;
+
+  const [rows, countResult, summaryResult] = await Promise.all([
+    sequelize.query(dataQuery, { replacements, type: QueryTypes.SELECT }),
+    sequelize.query(countQuery, { replacements, type: QueryTypes.SELECT }),
+    sequelize.query(summaryQuery, { replacements, type: QueryTypes.SELECT }),
+  ]);
+
+  const summaryRow = summaryResult[0] || {};
+  const summary = {
+    total_resource_count: parseInt(summaryRow.total_resource_count, 10) || 0,
+    total_logged_hours: parseFloat(summaryRow.total_logged_hours) || 0,
+    original_total_logged_hours: parseFloat(summaryRow.original_total_logged_hours) || 0,
+    total_available_hours: parseFloat(summaryRow.total_available_hours) || 0,
+  };
+
+  return { rows, count: parseInt(countResult[0].total, 10), summary };
+}
+
+// A month-range date-bounds helper shared by getMonthWiseBench and
+// getResourceWiseBench below — both scan timesheets by real calendar date
+// (not the year*100+month period-integer idiom used elsewhere in this file)
+// since both need generate_series to zero-fill months with no activity.
+function monthRangeDateBounds(startMonth, startYear, endMonth, endYear) {
+  return {
+    startDate: `${startYear}-${String(startMonth).padStart(2, '0')}-01`,
+    endDateExclusive: endMonth === 12 ? `${endYear + 1}-01-01` : `${endYear}-${String(endMonth + 1).padStart(2, '0')}-01`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 13. Month-wise Bench Report — org-wide monthly Bench %, one row per
+// calendar month in range. Reuses the exact Bench heuristic already
+// established in pmDashboardRepository.js/dashboardRepository.js
+// (LOWER(service_po_name) IN ('idle', 'on bench')). "Total Available Hrs
+// (Org)" per month = COUNT(DISTINCT employees who logged ANY hours that
+// month) x MONTHLY_CAP — there is no historical headcount table (confirmed
+// by pmDashboardService.getMonthlyHoursTrend's own doc comment), so "who was
+// active that month" is proxied from actual logged activity rather than
+// today's employees.status, which would misrepresent earlier months for
+// anyone who joined/left mid-range.
+// ---------------------------------------------------------------------------
+/**
+ * @param {object} filters
+ * @param {number} filters.startMonth
+ * @param {number} filters.startYear
+ * @param {number} filters.endMonth
+ * @param {number} filters.endYear
+ * @param {number[]} filters.companyIds
+ * @param {string} [filters.hoursSource]
+ * @returns {Promise<object[]>} one row per calendar month, zero-filled
+ */
+async function getMonthWiseBench(filters) {
+  const { startMonth, startYear, endMonth, endYear, hoursSource, companyIds } = filters;
+
+  const hoursCol = (hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const replacements = {
+    ...monthRangeDateBounds(startMonth, startYear, endMonth, endYear),
+    companyIds,
+  };
+
+  const scopeClause = BENCH_COMPANY_SCOPE_SQL;
+
+  const monthlyQuery = `
+    WITH months AS (
+      SELECT generate_series(:startDate::date, (:endDateExclusive::date - interval '1 month'), interval '1 month')::date AS month_start
+    ),
+    bench_entries AS (
+      SELECT t.employee_id, date_trunc('month', t.timesheet_date)::date AS month_start, ${hoursCol} AS hours,
+             ${originalHoursCol} AS original_hours
+      FROM timesheets t
+      INNER JOIN service_pos sp ON sp.id = t.service_po_id
+      WHERE ${scopeClause}
+        AND t.timesheet_date >= :startDate AND t.timesheet_date < :endDateExclusive
+        AND LOWER(sp.service_po_name) IN ('idle', 'on bench')
+    ),
+    bench_by_month AS (
+      SELECT month_start, COUNT(DISTINCT employee_id) AS resources_on_bench, SUM(hours) AS total_bench_hours,
+             SUM(original_hours) AS original_total_bench_hours
+      FROM bench_entries GROUP BY month_start
+    ),
+    active_by_month AS (
+      SELECT date_trunc('month', t.timesheet_date)::date AS month_start, COUNT(DISTINCT t.employee_id) AS active_employee_count
+      FROM timesheets t
+      INNER JOIN service_pos sp ON sp.id = t.service_po_id
+      WHERE ${scopeClause}
+        AND t.timesheet_date >= :startDate AND t.timesheet_date < :endDateExclusive
+      GROUP BY month_start
+    )
+    SELECT
+      EXTRACT(MONTH FROM m.month_start)::int AS month,
+      EXTRACT(YEAR FROM m.month_start)::int AS year,
+      COALESCE(bm.resources_on_bench, 0) AS resources_on_bench,
+      ROUND(COALESCE(bm.total_bench_hours, 0)::numeric, 2) AS total_bench_hours,
+      ROUND((COALESCE(ahm.active_employee_count, 0) * ${CAP_M})::numeric, 2) AS total_available_hours,
+      CASE WHEN COALESCE(ahm.active_employee_count, 0) > 0
+        THEN ROUND((COALESCE(bm.total_bench_hours, 0) / (ahm.active_employee_count * ${CAP_M}) * 100)::numeric, 2)
+        ELSE 0
+      END AS bench_pct,
+      ROUND(COALESCE(bm.original_total_bench_hours, 0)::numeric, 2) AS original_total_bench_hours,
+      CASE WHEN COALESCE(ahm.active_employee_count, 0) > 0
+        THEN ROUND((COALESCE(bm.original_total_bench_hours, 0) / (ahm.active_employee_count * ${CAP_M}) * 100)::numeric, 2)
+        ELSE 0
+      END AS original_bench_pct
+    FROM months m
+    LEFT JOIN bench_by_month bm ON bm.month_start = m.month_start
+    LEFT JOIN active_by_month ahm ON ahm.month_start = m.month_start
+    ORDER BY m.month_start
+  `;
+
+  return sequelize.query(monthlyQuery, { replacements, type: QueryTypes.SELECT });
+}
+
+// ---------------------------------------------------------------------------
+// 14. Resource-wise Bench % Report — one row per Employee who had at least
+// one Bench-tagged (idle/on bench) timesheet entry anywhere in the month
+// range, with a Bench % per calendar month plus an average across the
+// range. Companion to getMonthWiseBench above (same source Excel tab, split
+// into 2 reports/endpoints per product decision) — same Bench heuristic and
+// monthly-cap convention (per-month Monthly Cap Hours). `project_manager_name` is resolved via the
+// same PM roster this file already builds for getPMWiseUtilization, walked
+// through the Employee's PRIMARY manager mapping only (an Employee with only
+// a SECONDARY manager mapping, no PRIMARY one, gets a null PM here).
+// ---------------------------------------------------------------------------
+/**
+ * @param {object} filters
+ * @param {number} filters.startMonth
+ * @param {number} filters.startYear
+ * @param {number} filters.endMonth
+ * @param {number} filters.endYear
+ * @param {string} [filters.sortBy]
+ * @param {string} [filters.sortOrder]
+ * @param {number} filters.limit
+ * @param {number} filters.offset
+ * @param {number[]} filters.companyIds
+ * @param {string} [filters.hoursSource]
+ * @returns {Promise<{ rows: object[], count: number }>}
+ */
+async function getResourceWiseBench(filters) {
+  const {
+    startMonth, startYear, endMonth, endYear, hoursSource,
+    sortBy = 'avg_bench_pct', sortOrder = 'DESC', limit, offset, companyIds,
+  } = filters;
+
+  const hoursCol = (hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const allowedSort = ['full_name', 'avg_bench_pct'];
+  const allowedSafeSort = allowedSort.includes(sortBy) ? sortBy : 'avg_bench_pct';
+  // Original basis: sort by the as-logged twin (original_avg_bench_pct) via the fixed allow-list map.
+  const safeSort = (hoursSource === 'O' && ORIGINAL_SORT_TWIN[allowedSafeSort]) || allowedSafeSort;
+  const safeOrder = sortOrder && sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+
+  const replacements = {
+    ...monthRangeDateBounds(startMonth, startYear, endMonth, endYear),
+    companyIds, limit, offset,
+  };
+
+  const scopeClause = BENCH_COMPANY_SCOPE_SQL;
+
+  const resourceCte = `
+    WITH ${PM_ROSTER_CTE},
+    primary_chain AS (
+      SELECT mem.employee_id, mem.manager_employee_id AS tl_id
+      FROM manager_employee_mappings mem
+      WHERE mem.status = 'active' AND mem.mapping_type = 'PRIMARY'
+    ),
+    employee_pm AS (
+      SELECT pc.employee_id, COALESCE(tm.pm_id, direct_pm.pm_id) AS pm_id
+      FROM primary_chain pc
+      LEFT JOIN team_leads tm ON tm.tl_id = pc.tl_id
+      LEFT JOIN pms direct_pm ON direct_pm.pm_id = pc.tl_id
+    ),
+    months AS (
+      SELECT generate_series(:startDate::date, (:endDateExclusive::date - interval '1 month'), interval '1 month')::date AS month_start
+    ),
+    bench_entries AS (
+      SELECT t.employee_id, date_trunc('month', t.timesheet_date)::date AS month_start, ${hoursCol} AS hours,
+             ${originalHoursCol} AS original_hours
+      FROM timesheets t
+      INNER JOIN service_pos sp ON sp.id = t.service_po_id
+      WHERE ${scopeClause}
+        AND t.timesheet_date >= :startDate AND t.timesheet_date < :endDateExclusive
+        AND LOWER(sp.service_po_name) IN ('idle', 'on bench')
+    ),
+    bench_by_employee_month AS (
+      SELECT employee_id, month_start, SUM(hours) AS bench_hours, SUM(original_hours) AS original_bench_hours
+      FROM bench_entries GROUP BY employee_id, month_start
+    ),
+    flagged_employees AS (
+      SELECT DISTINCT employee_id FROM bench_entries
+    )
+  `;
+
+  const baseSelect = `
+    ${resourceCte}
+    SELECT
+      fe.employee_id, e.full_name, e.employee_code, pmEmp.full_name AS project_manager_name,
+      json_agg(json_build_object(
+        'month', EXTRACT(MONTH FROM m.month_start)::int,
+        'year', EXTRACT(YEAR FROM m.month_start)::int,
+        'bench_hours', ROUND(COALESCE(bem.bench_hours, 0)::numeric, 2),
+        'bench_pct', ROUND((COALESCE(bem.bench_hours, 0) / ${CAP_M} * 100)::numeric, 2),
+        'original_bench_hours', ROUND(COALESCE(bem.original_bench_hours, 0)::numeric, 2),
+        'original_bench_pct', ROUND((COALESCE(bem.original_bench_hours, 0) / ${CAP_M} * 100)::numeric, 2)
+      ) ORDER BY m.month_start) AS months,
+      ROUND(AVG(COALESCE(bem.bench_hours, 0) / ${CAP_M} * 100)::numeric, 2) AS avg_bench_pct,
+      ROUND(AVG(COALESCE(bem.original_bench_hours, 0) / ${CAP_M} * 100)::numeric, 2) AS original_avg_bench_pct
+    FROM flagged_employees fe
+    CROSS JOIN months m
+    INNER JOIN employees e ON e.id = fe.employee_id
+    LEFT JOIN employee_pm ep ON ep.employee_id = fe.employee_id
+    LEFT JOIN employees pmEmp ON pmEmp.id = ep.pm_id
+    LEFT JOIN bench_by_employee_month bem ON bem.employee_id = fe.employee_id AND bem.month_start = m.month_start
+    GROUP BY fe.employee_id, e.full_name, e.employee_code, pmEmp.full_name
+  `;
+
+  const dataQuery = `
+    SELECT * FROM (${baseSelect}) filtered
+    ORDER BY ${safeSort} ${safeOrder}
+    LIMIT :limit OFFSET :offset
+  `;
+  const countQuery = `SELECT COUNT(*) AS total FROM (${resourceCte} SELECT 1 FROM flagged_employees) counted`;
+
+  const [rows, countResult] = await Promise.all([
+    sequelize.query(dataQuery, { replacements, type: QueryTypes.SELECT }),
+    sequelize.query(countQuery, { replacements, type: QueryTypes.SELECT }),
+  ]);
+
+  return { rows, count: parseInt(countResult[0].total, 10) };
+}
+
+// ---------------------------------------------------------------------------
+// 15. Resource Cost / Utilization Report — one row per (Employee, Service PO)
+// staffing assignment (employee_servicepo_mapping, same staffing-pool
+// convention as getPMWiseUtilization/getProjectWiseUtilization above), with a
+// dynamic per-month breakdown nested as a `months` json array (same
+// json_agg(json_build_object(...) ORDER BY month_start) pivot technique as
+// getResourceWiseBench above) so the SQL emits exactly one row per roster
+// entry regardless of how many months are in range — no join-multiplication.
+//
+// Capped Hours is always that month's Monthly Cap Hours (CAP_M) — never derived from
+// resource_budget_master/timesheets. Resource Budget Hours (Projection %
+// basis) comes from resource_budget_master; Logged Hours (Actual % basis)
+// comes from timesheets, same hoursSource/roleId conventions as every other
+// report in this file. Monthly CTC comes from monthly_costs (month_year
+// string parsed to a date — month/year are Sequelize VIRTUAL getters on that
+// model, not real columns, so raw SQL parses month_year directly instead).
+//
+// Project Manager(s) per Service PO are pre-aggregated into a single
+// pm_names CTE (STRING_AGG(DISTINCT ..., ', ') — same multi-value-into-one-
+// cell convention as reportRepository.js's `clients` column) keyed by
+// service_po_id alone, then LEFT JOINed onto the roster — never joined as
+// raw per-PM rows into the roster itself, so a Service PO with 3 PMs still
+// yields exactly one roster row, never 3 (see this report's "no duplicate
+// rows" requirement).
+//
+// Excludes Centralised/non-billable Service POs (sp.is_billable = true) by
+// default — same convention BILLABLE_ENTRY_FILTER_SQL already establishes
+// for getPMWiseUtilization/getProjectWiseUtilization, to keep auto-mapped
+// Leave/On-Bench/Training overhead POs (which have no genuine PM/Client-
+// relevant cost story) out of a report about real project cost/utilization.
+// Pass isBillable=false or isBillable=all to include them anyway.
+//
+// Scoped by the EMPLOYEE's own Business Unit (EMPLOYEE_COMPANY_SCOPE_SQL) —
+// deliberately NOT also restricted by sp.company_id: an employee can be
+// validly staffed onto another BU's Service PO (see the Employee company-
+// scope split bug fix elsewhere in this codebase — over-restricting by
+// sp.company_id on an employee-centric report incorrectly drops legitimate
+// cross-BU staffing rows), matching getPMWiseUtilization's own scoping choice.
+//
+// @param {object} filters
+// @param {number} filters.startMonth
+// @param {number} filters.startYear
+// @param {number} filters.endMonth
+// @param {number} filters.endYear
+// @param {number[]} [filters.employeeIds]
+// @param {number[]} [filters.clientIds]
+// @param {number[]} [filters.projectIds]
+// @param {number[]} [filters.poIds]
+// @param {number[]} [filters.projectManagerIds]
+// @param {boolean|'all'} [filters.isBillable] - default true (Centralised/non-billable POs excluded)
+// @param {string} [filters.search]
+// @param {string} [filters.sortBy]
+// @param {string} [filters.sortOrder]
+// @param {number} [filters.limit]
+// @param {number} [filters.offset]
+// @param {boolean} [filters.exportAll] - true skips LIMIT/OFFSET entirely (full-dataset Excel export)
+// @param {number[]} filters.companyIds
+// @param {string} [filters.hoursSource]
+// @param {number|string} [filters.roleId]
+// @returns {Promise<{ rows: object[], count: number, summary: object[] }>}
+async function getResourceCostUtilization(filters) {
+  if (isEmptyCompanyScope(filters.companyIds)) {
+    return { rows: [], count: 0, summary: [] };
+  }
+
+  const {
+    startMonth, startYear, endMonth, endYear,
+    employeeIds, clientIds, projectIds, poIds, projectManagerIds,
+    isBillable, search, hoursSource, roleId,
+    sortBy = 'employee_name', sortOrder = 'ASC',
+    limit, offset, exportAll, companyIds,
+  } = filters;
+
+  const hoursCol = (hoursSource === 'O') ? 'COALESCE(t.original_hours, t.hours_logged)' : 'COALESCE(t.modified_hours, t.hours_logged)';
+  const allowedSort = ['employee_name', 'employee_code', 'bu_name', 'client_name', 'project_name', 'service_po_name'];
+  const safeSort = allowedSort.includes(sortBy) ? sortBy : 'employee_name';
+  const safeOrder = sortOrder && String(sortOrder).toUpperCase() === 'DESC' ? 'DESC' : 'ASC';
+
+  const { startDate, endDateExclusive } = monthRangeDateBounds(startMonth, startYear, endMonth, endYear);
+
+  const replacements = {
+    startDate, endDateExclusive,
+    startPeriod: startYear * 100 + startMonth,
+    endPeriod: endYear * 100 + endMonth,
+    companyIds,
+    limit, offset,
+  };
+
+  const rosterConditions = [
+    'e.is_deleted = false',
+    "e.status = 'active'",
+    EMPLOYEE_COMPANY_SCOPE_SQL,
+    "esm.status = 'active'",
+    'sp.is_deleted = false',
+    '(p.id IS NULL OR p.is_deleted = false)',
+  ];
+
+  if (isBillable === undefined) {
+    rosterConditions.push('sp.is_billable = true');
+  } else if (isBillable !== 'all') {
+    rosterConditions.push('sp.is_billable = :isBillable');
+    replacements.isBillable = (isBillable === true || isBillable === 'true');
+  }
+  if (employeeIds && employeeIds.length > 0) {
+    rosterConditions.push('e.id IN (:employeeIds)');
+    replacements.employeeIds = employeeIds;
+  }
+  if (clientIds && clientIds.length > 0) {
+    rosterConditions.push('c.id IN (:clientIds)');
+    replacements.clientIds = clientIds;
+  }
+  if (projectIds && projectIds.length > 0) {
+    rosterConditions.push('p.id IN (:projectIds)');
+    replacements.projectIds = projectIds;
+  }
+  if (poIds && poIds.length > 0) {
+    rosterConditions.push('sp.id IN (:poIds)');
+    replacements.poIds = poIds;
+  }
+  if (projectManagerIds && projectManagerIds.length > 0) {
+    rosterConditions.push(`EXISTS (
+      SELECT 1 FROM employee_servicepo_mapping f_pm_esm
+      WHERE f_pm_esm.service_po_id = sp.id AND f_pm_esm.status = 'active'
+        AND f_pm_esm.is_project_manager = true
+        AND f_pm_esm.employee_id IN (:projectManagerIds)
+    )`);
+    replacements.projectManagerIds = projectManagerIds;
+  }
+  if (search) {
+    rosterConditions.push(`(
+      e.full_name ILIKE :search OR e.employee_code ILIKE :search
+      OR c.client_name ILIKE :search OR p.project_name ILIKE :search
+      OR sp.service_po_name ILIKE :search OR sp.service_po_code ILIKE :search
+      OR EXISTS (
+        SELECT 1 FROM employee_servicepo_mapping s_pm_esm
+        INNER JOIN employees s_pm_emp ON s_pm_emp.id = s_pm_esm.employee_id
+        WHERE s_pm_esm.service_po_id = sp.id AND s_pm_esm.status = 'active'
+          AND s_pm_esm.is_project_manager = true AND s_pm_emp.full_name ILIKE :search
+      )
+    )`);
+    replacements.search = `%${search}%`;
+  }
+  const rosterWhere = `WHERE ${rosterConditions.join(' AND ')}`;
+
+  // Role ID 5 only: exclude unpublished timesheet rows.
+  const publishGuard = Number(roleId) === 5
+    ? `AND EXISTS (SELECT 1 FROM timesheet_import_history h WHERE h.id = t.timesheet_import_id AND h.is_publish = true)`
+    : '';
+
+  const sharedCte = `
+    WITH pm_names AS (
+      SELECT pm_esm.service_po_id,
+             STRING_AGG(DISTINCT pm_emp.full_name, ', ' ORDER BY pm_emp.full_name) AS project_managers
+      FROM employee_servicepo_mapping pm_esm
+      INNER JOIN employees pm_emp ON pm_emp.id = pm_esm.employee_id AND pm_emp.is_deleted = false
+      WHERE pm_esm.status = 'active' AND pm_esm.is_project_manager = true
+      GROUP BY pm_esm.service_po_id
+    ),
+    roster AS (
+      SELECT
+        e.id AS employee_id, e.employee_code, e.full_name AS employee_name,
+        -- BU Name: resolved via employee_business_units (the current,
+        -- authoritative multi-BU membership table — see EmployeeBusinessUnit
+        -- model/companyAccessControlService), NOT employees.company_id
+        -- (legacy, and unpopulated for the vast majority of employees in
+        -- practice since the Employee-Business-Unit redesign). Same
+        -- STRING_AGG(DISTINCT ... company_name) convention platformAdminRepository.
+        -- buildSyncedWorkLogQuery already uses for this exact "an employee can
+        -- be mapped to more than one BU" case.
+        --
+        -- BU Hierarchy: bu_name lists the TOP-LEVEL BUs (a Sub-BU mapping
+        -- contributes its Parent's name) and sub_bu_name lists the Sub-BUs
+        -- themselves — previously both were mixed into one bu_name string.
+        -- STRING_AGG skips the NULLs a root BU produces for sub_bu_name.
+        STRING_AGG(DISTINCT COALESCE(pcomp.company_name, comp.company_name), ', '
+                   ORDER BY COALESCE(pcomp.company_name, comp.company_name)) AS bu_name,
+        STRING_AGG(DISTINCT CASE WHEN pcomp.id IS NOT NULL THEN comp.company_name END, ', '
+                   ORDER BY CASE WHEN pcomp.id IS NOT NULL THEN comp.company_name END) AS sub_bu_name,
+        sp.id AS service_po_id, sp.service_po_code, sp.service_po_name,
+        c.id AS client_id, c.client_name,
+        p.id AS project_id, p.project_name,
+        pm.project_managers
+      FROM employee_servicepo_mapping esm
+      INNER JOIN employees e  ON e.id  = esm.employee_id
+      INNER JOIN service_pos sp ON sp.id = esm.service_po_id
+      INNER JOIN clients c    ON c.id  = sp.client_id
+      LEFT JOIN projects p    ON p.id  = sp.project_id
+      LEFT JOIN employee_business_units ebu ON ebu.employee_id = e.id AND ebu.status = 'active'
+      LEFT JOIN companies comp ON comp.id = ebu.business_unit_id AND comp.is_deleted = false
+      LEFT JOIN companies pcomp ON pcomp.id = comp.parent_business_unit_id AND pcomp.is_deleted = false
+      LEFT JOIN pm_names pm   ON pm.service_po_id = sp.id
+      ${rosterWhere}
+      GROUP BY e.id, e.employee_code, e.full_name,
+               sp.id, sp.service_po_code, sp.service_po_name,
+               c.id, c.client_name, p.id, p.project_name, pm.project_managers
+    ),
+    months AS (
+      SELECT generate_series(:startDate::date, (:endDateExclusive::date - interval '1 month'), interval '1 month')::date AS month_start
+    ),
+    resource_budget_by_month AS (
+      SELECT rbm.emp_id, rbm.service_po_id, make_date(rbm.year, rbm.month, 1) AS month_start,
+             SUM(rbm.hours) AS resource_budget_hours
+      FROM resource_budget_master rbm
+      WHERE rbm.status = 'active' AND (rbm.year * 100 + rbm.month) BETWEEN :startPeriod AND :endPeriod
+      GROUP BY rbm.emp_id, rbm.service_po_id, make_date(rbm.year, rbm.month, 1)
+    ),
+    logged_by_month AS (
+      SELECT t.employee_id, t.service_po_id, date_trunc('month', t.timesheet_date)::date AS month_start,
+             SUM(${hoursCol}) AS logged_hours,
+             SUM(${originalHoursCol}) AS original_logged_hours
+      FROM timesheets t
+      WHERE t.timesheet_date >= :startDate AND t.timesheet_date < :endDateExclusive
+        -- EMPLOYEE-wise: no t.company_id filter (it is the employee's SYNC BU, and a multi-BU employee is
+        -- synced once). The roster is already scoped by the employee's BU mapping (EMPLOYEE_COMPANY_SCOPE_SQL)
+        -- and every logged row of a roster (employee, Service PO) pair counts, cross-BU/Centralised included.
+        ${publishGuard}
+      GROUP BY t.employee_id, t.service_po_id, date_trunc('month', t.timesheet_date)
+    ),
+    monthly_cost_by_month AS (
+      SELECT mc.employee_id, (mc.month_year || '-01')::date AS month_start, mc.total_cost
+      FROM monthly_costs mc
+      WHERE (mc.month_year || '-01')::date >= :startDate AND (mc.month_year || '-01')::date < :endDateExclusive
+    )
+  `;
+
+  const rosterPageSelect = exportAll
+    ? `SELECT * FROM roster ORDER BY ${safeSort} ${safeOrder}, employee_id, service_po_id`
+    : `SELECT * FROM roster ORDER BY ${safeSort} ${safeOrder}, employee_id, service_po_id LIMIT :limit OFFSET :offset`;
+
+  const monthJsonExpr = `
+    json_agg(json_build_object(
+      'month', EXTRACT(MONTH FROM m.month_start)::int,
+      'year', EXTRACT(YEAR FROM m.month_start)::int,
+      'cappedHours', ${CAP_M},
+      'resourceBudgetHours', ROUND(COALESCE(rb.resource_budget_hours, 0)::numeric, 2),
+      'loggedHours', ROUND(COALESCE(lg.logged_hours, 0)::numeric, 2),
+      'monthlyCtc', ROUND(COALESCE(mc.total_cost, 0)::numeric, 2),
+      'projectionPercentage', ROUND((COALESCE(rb.resource_budget_hours, 0) / ${CAP_M} * 100)::numeric, 2),
+      'actualPercentage', ROUND((COALESCE(lg.logged_hours, 0) / ${CAP_M} * 100)::numeric, 2),
+      'contribution', ROUND((COALESCE(mc.total_cost, 0) * (COALESCE(lg.logged_hours, 0) / ${CAP_M}))::numeric, 2),
+      'originalLoggedHours', ROUND(COALESCE(lg.original_logged_hours, 0)::numeric, 2),
+      'originalActualPercentage', ROUND((COALESCE(lg.original_logged_hours, 0) / ${CAP_M} * 100)::numeric, 2),
+      'originalContribution', ROUND((COALESCE(mc.total_cost, 0) * (COALESCE(lg.original_logged_hours, 0) / ${CAP_M}))::numeric, 2)
+    ) ORDER BY m.month_start) AS months
+  `;
+
+  const dataQuery = `
+    ${sharedCte},
+    roster_page AS (${rosterPageSelect})
+    SELECT
+      rp.employee_id, rp.employee_code, rp.employee_name, rp.bu_name, rp.sub_bu_name,
+      rp.service_po_id, rp.service_po_code, rp.service_po_name,
+      rp.client_id, rp.client_name, rp.project_id, rp.project_name,
+      rp.project_managers,
+      ${monthJsonExpr}
+    FROM roster_page rp
+    CROSS JOIN months m
+    LEFT JOIN resource_budget_by_month rb ON rb.emp_id = rp.employee_id AND rb.service_po_id = rp.service_po_id AND rb.month_start = m.month_start
+    LEFT JOIN logged_by_month lg          ON lg.employee_id = rp.employee_id AND lg.service_po_id = rp.service_po_id AND lg.month_start = m.month_start
+    LEFT JOIN monthly_cost_by_month mc    ON mc.employee_id = rp.employee_id AND mc.month_start = m.month_start
+    GROUP BY rp.employee_id, rp.employee_code, rp.employee_name, rp.bu_name, rp.sub_bu_name,
+             rp.service_po_id, rp.service_po_code, rp.service_po_name,
+             rp.client_id, rp.client_name, rp.project_id, rp.project_name, rp.project_managers
+    ORDER BY rp.${safeSort} ${safeOrder}, rp.employee_id, rp.service_po_id
+  `;
+
+  const countQuery = `${sharedCte} SELECT COUNT(*) AS total FROM roster`;
+
+  // Full-dataset (unpaginated) per-month summary — every roster row matching
+  // the current filters, not just the current page's roster_page slice.
+  const summaryQuery = `
+    ${sharedCte}
+    SELECT
+      EXTRACT(MONTH FROM m.month_start)::int AS month,
+      EXTRACT(YEAR FROM m.month_start)::int AS year,
+      COUNT(DISTINCT r.employee_id) AS resource_count,
+      COUNT(DISTINCT r.service_po_id) AS service_po_count,
+      ROUND(SUM(COALESCE(rb.resource_budget_hours, 0))::numeric, 2) AS total_resource_budget_hours,
+      ROUND(SUM(COALESCE(lg.logged_hours, 0))::numeric, 2) AS total_logged_hours,
+      ROUND(SUM(COALESCE(mc.total_cost, 0) * (COALESCE(lg.logged_hours, 0) / ${CAP_M}))::numeric, 2) AS total_contribution,
+      ROUND(SUM(COALESCE(lg.original_logged_hours, 0))::numeric, 2) AS original_total_logged_hours,
+      ROUND(SUM(COALESCE(mc.total_cost, 0) * (COALESCE(lg.original_logged_hours, 0) / ${CAP_M}))::numeric, 2) AS original_total_contribution
+    FROM roster r
+    CROSS JOIN months m
+    LEFT JOIN resource_budget_by_month rb ON rb.emp_id = r.employee_id AND rb.service_po_id = r.service_po_id AND rb.month_start = m.month_start
+    LEFT JOIN logged_by_month lg          ON lg.employee_id = r.employee_id AND lg.service_po_id = r.service_po_id AND lg.month_start = m.month_start
+    LEFT JOIN monthly_cost_by_month mc    ON mc.employee_id = r.employee_id AND mc.month_start = m.month_start
+    GROUP BY m.month_start
+    ORDER BY m.month_start
+  `;
+
+  const [rows, countResult, summary] = await Promise.all([
+    sequelize.query(dataQuery, { replacements, type: QueryTypes.SELECT }),
+    sequelize.query(countQuery, { replacements, type: QueryTypes.SELECT }),
+    sequelize.query(summaryQuery, { replacements, type: QueryTypes.SELECT }),
+  ]);
+
+  return { rows, count: parseInt(countResult[0].total, 10), summary };
+}
+
+module.exports = {
+  getServicePOProfitability,
+  getBudgetedMarginForecast,
+  getResourceStaffingPlanAccuracy,
+  getClientProfitabilityConcentration,
+  getBUPerformanceScorecard,
+  getEmployeeCapacityForecast,
+  getServicePOTimelineRiskRaw,
+  getDeliveryHeadPerformance,
+  getInvoiceRealizationTrend,
+  getServiceLineBusinessMix,
+  getPMWiseUtilization,
+  getProjectWiseUtilization,
+  getMonthWiseBench,
+  getResourceWiseBench,
+  getResourceCostUtilization,
+};

@@ -1,0 +1,625 @@
+'use strict';
+
+const xlsx = require('xlsx');
+const { sequelize, Role } = require('../models');
+const employeeRepository = require('../repositories/employeeRepository');
+const employeeRoleRepository = require('../repositories/employeeRoleRepository');
+const employeeBusinessUnitRepository = require('../repositories/employeeBusinessUnitRepository');
+const employeeServicePOMappingService = require('./employeeServicePOMappingService');
+const { resolveOptionalCreateCompanyId, resolveTenantAdminId } = require('./companyAccessControlService');
+const { SUB_BU_HEADERS, ENTITY_HEADERS, normaliseName, splitNames, loadSubBusinessUnits, buildActorBusinessUnitLookup } = require('./importSubBusinessUnitService');
+const logger = require('../utils/logger');
+
+// Bulk-imported logins all get this same default password rather than a
+// per-row random one (HR request — random passwords aren't practical to
+// hand out across a whole spreadsheet of new hires at once). Employees can
+// change it via the existing forgot-password flow after first login.
+const DEFAULT_IMPORT_PASSWORD = 'Gtt@1234';
+
+// Flexible column-header → field mapping (matched after normalising to lowercase + collapsed spaces)
+const HEADER_MAP = {
+  'employee code': 'employee_code',
+  'emp code': 'employee_code',
+  'empcode': 'employee_code',
+  'code': 'employee_code',
+  'emp_code': 'employee_code',
+  'full name': 'full_name',
+  'name': 'full_name',
+  'employee name': 'full_name',
+  'fullname': 'full_name',
+  'full_name': 'full_name',
+  'designation': 'designation',
+  'role': 'designation',
+  'job title': 'designation',
+  'total experience': 'total_experience',
+  'total exp': 'total_experience',
+  'total_experience': 'total_experience',
+  'total_exp': 'total_experience',
+  'experience': 'total_experience',
+  'company experience': 'company_experience',
+  'company exp': 'company_experience',
+  'company_experience': 'company_experience',
+  'company_exp': 'company_experience',
+  'description': 'resource_description',
+  'resource description': 'resource_description',
+  'resource_description': 'resource_description',
+  'payroll entity': 'payroll_entity',
+  'payroll_entity': 'payroll_entity',
+  'location': 'location',
+  'sub location': 'sub_location',
+  'sub_location': 'sub_location',
+  'sublocation': 'sub_location',
+  'original entity': 'original_entity',
+  'original_entity': 'original_entity',
+  'date of joining': 'date_of_joining',
+  'joining date': 'date_of_joining',
+  'doj': 'date_of_joining',
+  'date_of_joining': 'date_of_joining',
+  'date of leaving': 'date_of_leaving',
+  'leaving date': 'date_of_leaving',
+  'dol': 'date_of_leaving',
+  'date_of_leaving': 'date_of_leaving',
+  'status': 'status',
+  'email': 'email',
+  'email id': 'email',
+  'emailid': 'email',
+  'email address': 'email',
+  'business units': 'business_units_raw',
+  'business unit': 'business_units_raw',
+  'business_units': 'business_units_raw',
+  'business_unit': 'business_units_raw',
+  'bu': 'business_units_raw',
+  'bu name': 'business_units_raw',
+  'bu_name': 'business_units_raw',
+  // BU Hierarchy / Sub-BU support — see importSubBusinessUnitService.js and
+  // resolveRowBusinessUnitIds() below. Mandatory when a named Business Unit
+  // has Sub-BUs (unless the Sub-BU is already named in "Business Units").
+  ...Object.fromEntries(SUB_BU_HEADERS.map((h) => [h, 'sub_bu_raw'])),
+  // Optional — tells apart two Business Units with the same name under
+  // different Entities.
+  ...Object.fromEntries(ENTITY_HEADERS.map((h) => [h, 'entity_name'])),
+};
+
+const CODE_RE = /^[A-Z0-9_/#-]{2,20}$/;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// Employee is the sole login identity (email/password live natively on
+// `employees` — see database/migrations/20260864_add_employee_login_columns.sql,
+// same as employeeService.create()); every imported row gets a login —
+// "Email ID" is a required column, minus Manager assignment, which this
+// file's format doesn't have columns for. HR can assign a Manager
+// afterwards via PUT /employees/:id.
+
+function normaliseHeader(raw) {
+  return String(raw || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+// Convert Excel date serial number → YYYY-MM-DD
+function excelSerialToISO(serial) {
+  const utcMs = (serial - 25569) * 86400 * 1000;
+  const d = new Date(utcMs);
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function parseDate(value) {
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value === 'number') return excelSerialToISO(value);
+  if (value instanceof Date) {
+    const yyyy = value.getUTCFullYear();
+    const mm = String(value.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(value.getUTCDate()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd}`;
+  }
+  const str = String(value).trim();
+  if (!str) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return str;
+  const dmy = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+  if (dmy) return `${dmy[3]}-${dmy[2].padStart(2, '0')}-${dmy[1].padStart(2, '0')}`;
+  return null;
+}
+
+function parseNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const n = parseFloat(String(value));
+  return isNaN(n) ? null : n;
+}
+
+function isBlank(v) {
+  return v === null || v === undefined || v === '';
+}
+
+/**
+ * Parse the first sheet of the uploaded Excel/CSV file.
+ * Returns an array of raw row objects keyed by canonical field names.
+ */
+function parseEmployeeFile(filePath) {
+  const workbook = xlsx.readFile(filePath, { cellDates: false, raw: false });
+  const sheetName = workbook.SheetNames[0];
+  const sheet = workbook.Sheets[sheetName];
+  const raw = xlsx.utils.sheet_to_json(sheet, { header: 1, defval: '', blankrows: false });
+
+  if (!raw.length) return [];
+
+  // Detect header row: first row with at least 2 recognised columns in first 5 rows
+  let headerRowIdx = -1;
+  let mappedHeaders = [];
+
+  for (let i = 0; i < Math.min(5, raw.length); i++) {
+    const mapped = raw[i].map((h) => HEADER_MAP[normaliseHeader(h)] || null);
+    if (mapped.filter(Boolean).length >= 2) {
+      headerRowIdx = i;
+      mappedHeaders = mapped;
+      break;
+    }
+  }
+
+  if (headerRowIdx === -1) {
+    const err = new Error(
+      'Could not detect a valid header row. ' +
+      'Expected columns like "Employee Code", "Full Name", "Designation", etc.'
+    );
+    err.statusCode = 422;
+    throw err;
+  }
+
+  const rows = [];
+  for (let i = headerRowIdx + 1; i < raw.length; i++) {
+    const cells = raw[i];
+    const row = { _rowNum: i + 1 };
+    let hasData = false;
+
+    mappedHeaders.forEach((field, colIdx) => {
+      if (!field) return;
+      const val = cells[colIdx];
+      if (!isBlank(val)) hasData = true;
+      row[field] = isBlank(val) ? '' : val;
+    });
+
+    if (!hasData) continue; // skip entirely blank rows
+    rows.push(row);
+  }
+
+  return rows;
+}
+
+/**
+ * Validate a single raw row.
+ * Returns { errors: string[], data: object }.
+ * data is only populated when errors is empty.
+ */
+function validateRow(raw, existingCodes, seenCodes, existingEmails, seenEmails) {
+  const errors = [];
+  const data = {};
+
+  // ── employee_code (required) ────────────────────────────────────────────────
+  const code = String(raw.employee_code || '').trim().toUpperCase();
+  if (!code) {
+    errors.push('Employee code is required.');
+  } else if (!CODE_RE.test(code)) {
+    errors.push('Employee code must be 2–20 uppercase alphanumeric characters (- / # _ allowed).');
+  } else if (existingCodes.has(code)) {
+    errors.push(`Employee code "${code}" already exists.`);
+  } else if (seenCodes.has(code)) {
+    errors.push(`Employee code "${code}" is duplicated within this file.`);
+  } else {
+    data.employee_code = code;
+  }
+
+  // ── full_name (required) ────────────────────────────────────────────────────
+  const name = String(raw.full_name || '').trim();
+  if (!name) {
+    errors.push('Full name is required.');
+  } else if (name.length < 2 || name.length > 100) {
+    errors.push('Full name must be 2–100 characters.');
+  } else {
+    data.full_name = name;
+  }
+
+  // ── email (required) ────────────────────────────────────────────────────────
+  const email = String(raw.email || '').trim().toLowerCase();
+  if (!email) {
+    errors.push('Email is required.');
+  } else if (!EMAIL_RE.test(email) || email.length > 100) {
+    errors.push('Email must be a valid email address (max 100 characters).');
+  } else if (existingEmails.has(email)) {
+    errors.push(`Email "${email}" is already registered.`);
+  } else if (seenEmails.has(email)) {
+    errors.push(`Email "${email}" is duplicated within this file.`);
+  } else {
+    data.email = email;
+  }
+
+  // ── designation (optional) ──────────────────────────────────────────────────
+  if (!isBlank(raw.designation)) {
+    const desig = String(raw.designation).trim();
+    if (desig.length > 100) errors.push('Designation cannot exceed 100 characters.');
+    else if (desig) data.designation = desig;
+  }
+
+  // ── total_experience (optional) ─────────────────────────────────────────────
+  if (!isBlank(raw.total_experience)) {
+    const totalExp = parseNumber(raw.total_experience);
+    if (totalExp === null || totalExp < 0 || totalExp > 60) {
+      errors.push('Total experience must be a number between 0 and 60.');
+    } else {
+      data.total_experience = totalExp;
+    }
+  }
+
+  // ── company_experience (optional) ───────────────────────────────────────────
+  if (!isBlank(raw.company_experience)) {
+    const compExp = parseNumber(raw.company_experience);
+    if (compExp === null || compExp < 0 || compExp > 60) {
+      errors.push('Company experience must be a number between 0 and 60.');
+    } else if (data.total_experience !== undefined && compExp > data.total_experience) {
+      errors.push('Company experience cannot exceed total experience.');
+    } else {
+      data.company_experience = compExp;
+    }
+  }
+
+  // ── resource_description (optional) ─────────────────────────────────────────
+  if (!isBlank(raw.resource_description)) {
+    const desc = String(raw.resource_description).trim();
+    if (desc.length > 2000) errors.push('Resource description cannot exceed 2000 characters.');
+    else if (desc) data.resource_description = desc;
+  }
+
+  // ── payroll_entity (optional) ───────────────────────────────────────────────
+  if (!isBlank(raw.payroll_entity)) {
+    const payrollEntity = String(raw.payroll_entity).trim();
+    if (payrollEntity.length > 64) errors.push('Payroll entity cannot exceed 64 characters.');
+    else if (payrollEntity) data.payroll_entity = payrollEntity;
+  }
+
+  // ── location (optional) ─────────────────────────────────────────────────────
+  if (!isBlank(raw.location)) {
+    const location = String(raw.location).trim();
+    if (location.length > 256) errors.push('Location cannot exceed 256 characters.');
+    else if (location) data.location = location;
+  }
+
+  // ── sub_location (optional) ─────────────────────────────────────────────────
+  if (!isBlank(raw.sub_location)) {
+    const subLocation = String(raw.sub_location).trim();
+    if (subLocation.length > 256) errors.push('Sub location cannot exceed 256 characters.');
+    else if (subLocation) data.sub_location = subLocation;
+  }
+
+  // ── original_entity (optional) ──────────────────────────────────────────────
+  if (!isBlank(raw.original_entity)) {
+    const originalEntity = String(raw.original_entity).trim();
+    if (originalEntity.length > 512) errors.push('Original entity cannot exceed 512 characters.');
+    else if (originalEntity) data.original_entity = originalEntity;
+  }
+
+  // ── date_of_joining (optional) ──────────────────────────────────────────────
+  if (!isBlank(raw.date_of_joining)) {
+    const doj = parseDate(raw.date_of_joining);
+    if (!doj) {
+      errors.push('Date of joining must be a valid date (YYYY-MM-DD or DD/MM/YYYY).');
+    } else {
+      data.date_of_joining = doj;
+    }
+  }
+
+  // ── date_of_leaving (optional) ──────────────────────────────────────────────
+  if (!isBlank(raw.date_of_leaving)) {
+    const dol = parseDate(raw.date_of_leaving);
+    if (!dol) {
+      errors.push('Date of leaving must be a valid date (YYYY-MM-DD or DD/MM/YYYY).');
+    } else if (data.date_of_joining && dol <= data.date_of_joining) {
+      errors.push('Date of leaving must be after date of joining.');
+    } else {
+      data.date_of_leaving = dol;
+    }
+  }
+
+  // ── status (optional, default 'active') ─────────────────────────────────────
+  if (!isBlank(raw.status)) {
+    const status = String(raw.status).trim().toLowerCase();
+    if (!['active', 'inactive'].includes(status)) {
+      errors.push('Status must be "active" or "inactive".');
+    } else {
+      data.status = status;
+    }
+  } else {
+    data.status = 'active';
+  }
+
+  return { errors, data };
+}
+
+/**
+ * Build a case-insensitive "Business Unit name" -> id lookup, scoped to
+ * exactly the Business Units the IMPORTING actor is authorized to assign —
+ * never the currently-selected Global BU (X-Company-Id), which must have no
+ * bearing on which BU an imported row's "Business Units" column resolves
+ * to.
+ *
+ * - BU-scoped actor (req.companyId set): every Business Unit they are
+ *   ACTIVELY mapped to (req.employeeBusinessUnits — already the full
+ *   Company rows, from auth.js), not just whichever one is momentarily
+ *   active via the header. Same "don't limit a multi-BU actor to today's
+ *   selection" rule employeeService.js's resolveBUAssignmentScope() already
+ *   applies to the manual Role & BU Mapping screen — a BU Admin mapped to
+ *   BU 1 + BU 2 must be able to import a row naming either.
+ * - Company-less actor (Admin/Entity Admin — req.companyId is null): every
+ *   Company they own (resolveOwnedCompanyIds), the same scope every other
+ *   company-less create/import flow in this codebase uses — mirrors
+ *   servicePOImportService.js's resolveRowBusinessUnits().
+ *
+ * Business Unit names are only unique per Entity, so a name maps to EVERY
+ * matching Business Unit (never "last one wins") — resolveRowBusinessUnitIds()
+ * reports an ambiguous name unless the row's "Entity Name" narrows it.
+ *
+ * @param {import('express').Request} req
+ * @returns {Promise<Map<string, { id: number, company_name: string, entity_name: string|null }[]>>}
+ *   normalised company_name -> matching Business Units
+ */
+async function buildImportBuNameLookup(req) {
+  // Shared with the Client / Project / Service PO imports: an Admin's owned
+  // Companies, or a BU-scoped actor's mapped BUs + their Sub-BUs (the same
+  // reach as the manual Role & BU Mapping screen), each with its Entity name.
+  const { companiesByName } = await buildActorBusinessUnitLookup(req);
+  return companiesByName;
+}
+
+/**
+ * Resolve one row's raw "Business Units" cell against the pre-built name
+ * lookup. Blank/missing is valid and simply means "no BU mapping from this
+ * row" (never a default, and never the Global BU) — see this file's header
+ * comment on the overall BU-mapping rule. Supports a comma-separated list
+ * of names in the same cell (the underlying employee_business_units table
+ * already natively supports many-to-many BU membership — see
+ * employeeBusinessUnitRepository.replaceForEmployee() — so a multi-name
+ * cell simply maps to that existing capability, not a new format).
+ *
+ * "Sub BU" column (BU Hierarchy / Sub-BU support — see
+ * importSubBusinessUnitService.js): comma-separated Sub-BU names, each
+ * resolved ONLY among the Sub-BUs of the Business Units named on this row
+ * (so a Sub-BU name shared by two different Parents never collides). A
+ * Business Unit that has Sub-BUs must get at least one of them — from this
+ * column or, as before, named directly in "Business Units"; a BU without
+ * Sub-BUs leaves the column blank. The Parent is kept alongside its Sub-BU(s).
+ *
+ * @param {object} raw - parsed row (see parseEmployeeFile)
+ * @param {Map<string, object[]>} buNameMap - see buildImportBuNameLookup()
+ * @param {Map<number, { id: number, company_name: string }[]>} childrenByParent - Parent id -> its Sub-BUs
+ * @returns {{ ids: number[], errors: string[] }}
+ */
+function resolveRowBusinessUnitIds(raw, buNameMap, childrenByParent) {
+  // "Parent -> Sub" inside "Business Units" (the format Employee List's own
+  // Export Excel / sample template writes for a Sub-BU) is the same as
+  // naming the Parent there and the Sub-BU in "Sub BU".
+  const names = [];
+  const subBuNames = splitNames(raw.sub_bu_raw);
+  for (const entry of splitNames(raw.business_units_raw)) {
+    const [parentName, subName] = entry.split('->').map((part) => part.trim());
+    if (parentName) names.push(parentName);
+    if (subName) subBuNames.push(subName);
+  }
+  if (names.length === 0) {
+    return subBuNames.length
+      ? { ids: [], errors: ['"Sub BU" is filled but "Business Units" is blank — name the Business Unit too.'] }
+      : { ids: [], errors: [] };
+  }
+
+  const entityName = String(raw.entity_name || '').trim();
+  const ids = [];
+  const errors = [];
+  const seen = new Set();
+  const add = (id) => {
+    if (!seen.has(id)) { seen.add(id); ids.push(id); }
+  };
+
+  const namedParents = []; // { id, name } of named BUs that have Sub-BUs
+  for (const name of names) {
+    let matches = buNameMap.get(normaliseName(name)) || [];
+    if (entityName) matches = matches.filter((c) => normaliseName(c.entity_name) === normaliseName(entityName));
+    if (matches.length === 0) {
+      errors.push(`Business Unit "${name}" not found${entityName ? ` under Entity "${entityName}"` : ''}.`);
+      continue;
+    }
+    if (matches.length > 1) {
+      const entities = matches.map((c) => c.entity_name || 'no Entity').join(', ');
+      errors.push(`Business Unit "${name}" exists under more than one Entity (${entities}) — fill the "Entity Name" column to pick one.`);
+      continue;
+    }
+    add(matches[0].id);
+    if ((childrenByParent.get(matches[0].id) || []).length > 0) namedParents.push({ id: matches[0].id, name: matches[0].company_name });
+  }
+
+  // Sub BU column — resolved among the named Parents' own Sub-BUs only.
+  const candidates = namedParents.flatMap((p) => (childrenByParent.get(p.id) || []).map((c) => ({ ...c, parentName: p.name })));
+  const hadBuNameError = errors.length > 0;
+  for (const subName of subBuNames) {
+    if (namedParents.length === 0) {
+      // A Business Unit name that didn't resolve already has its own error —
+      // don't also claim "no Sub-BUs" about a BU that was never identified.
+      if (!hadBuNameError) {
+        errors.push(`Sub BU "${subName}": none of the Business Units on this row have Sub-BUs — leave "Sub BU" blank.`);
+      }
+      continue;
+    }
+    const subMatches = candidates.filter((c) => normaliseName(c.company_name) === normaliseName(subName));
+    if (subMatches.length === 0) {
+      errors.push(`Sub BU "${subName}" not found under ${namedParents.map((p) => `"${p.name}"`).join(', ')}.`);
+    } else if (subMatches.length > 1) {
+      errors.push(`Sub BU "${subName}" matches more than one Sub-BU (${subMatches.map((c) => `${c.company_name} under ${c.parentName}`).join('; ')}) — rename one in Business Unit Master.`);
+    } else {
+      add(subMatches[0].id);
+    }
+  }
+
+  // A Parent BU is kept alongside its Sub-BU(s) (a Sub-BU is part of its
+  // Parent, like a department) — same rule as employeeService's
+  // resolveBusinessUnitIds(). A Parent left WITHOUT any of its own Sub-BUs
+  // on the row is an error.
+  for (const parent of namedParents) {
+    const children = childrenByParent.get(parent.id) || [];
+    if (!children.some((c) => seen.has(c.id))) {
+      errors.push(`Business Unit "${parent.name}" has Sub-BUs — "Sub BU" is required (one of: ${children.map((c) => c.company_name).join(', ')}).`);
+    }
+  }
+
+  return { ids, errors };
+}
+
+/**
+ * Parse, validate, and import employees from the uploaded file.
+ *
+ * @param {string} filePath - Absolute path to the saved upload file
+ * @param {number} userId   - ID of the authenticated user performing the import
+ * @param {import('express').Request} req - for resolveOptionalCreateCompanyId:
+ *   a BU-scoped actor's own req.companyId always wins. A company-less
+ *   Admin/Entity Admin may optionally supply `company_id` in the multipart
+ *   form body (validated against their own owned Companies), but it is NOT
+ *   required — Business Unit assignment for an Admin-driven import is
+ *   deliberately deferred to a later step (map BUs via the ordinary Employee
+ *   Master edit / Role & BU Mapping screen after the employees exist), so
+ *   omitting it simply imports every row with company_id = NULL rather than
+ *   erroring.
+ * @returns {Promise<{ total, imported, skipped, error_rows, credentials }>}
+ */
+async function importEmployees(filePath, userId, req) {
+  const bodyCompanyId = req.body && req.body.company_id ? parseInt(req.body.company_id, 10) : undefined;
+  const companyId = await resolveOptionalCreateCompanyId(
+    { companyId: req.companyId, hierarchyRank: req.hierarchyRank, employeeId: req.employeeId },
+    bodyCompanyId
+  );
+
+  // 1. Parse Excel / CSV
+  const rawRows = parseEmployeeFile(filePath);
+
+  if (!rawRows.length) {
+    const err = new Error('The uploaded file contains no data rows.');
+    err.statusCode = 422;
+    throw err;
+  }
+
+  // 2. Batch-fetch existing codes (scoped to this company — per-company
+  // uniqueness), existing emails (global — see users_email_key), and the
+  // "Business Units" name -> id lookup (see buildImportBuNameLookup's doc
+  // comment — scoped to the IMPORTING actor's own authorized BUs, never the
+  // Global BU selector) to avoid N+1 queries.
+  // Employee code uniqueness is per Admin tenant — see employees.admin_id.
+  const tenantAdminId = await resolveTenantAdminId(
+    { hierarchyRank: req.hierarchyRank, employeeId: req.employeeId },
+    [companyId, ...(req.employeeBusinessUnits || []).map((b) => (b && typeof b === 'object' ? b.business_unit_id || b.id : b))]
+  );
+  const existingForCompany = await employeeRepository.findAllForImport(tenantAdminId);
+  const existingCodes = new Set(existingForCompany.map((e) => e.employee_code.toUpperCase()));
+  const existingEmails = new Set(await employeeRepository.findAllEmails());
+  const buNameMap = await buildImportBuNameLookup(req);
+  // BU Hierarchy / Sub-BU support — every Sub-BU of the importer's own
+  // reachable BUs (one batched query, not per-row). A BU-scoped actor may
+  // assign any Sub-BU of a BU they are mapped to — same reach as the manual
+  // Role & BU Mapping screen (employeeService.resolveBUAssignmentScope()).
+  const childrenByParent = await loadSubBusinessUnits([...buNameMap.values()].flat().map((c) => c.id));
+
+  // 3. Validate all rows; track codes/emails seen within this file to catch duplicates
+  const seenCodes = new Set();
+  const seenEmails = new Set();
+  const validRows = [];
+  const errorRows = [];
+
+  for (const raw of rawRows) {
+    const { errors, data } = validateRow(raw, existingCodes, seenCodes, existingEmails, seenEmails);
+    const { ids: businessUnitIds, errors: buErrors } = resolveRowBusinessUnitIds(raw, buNameMap, childrenByParent);
+    const allErrors = buErrors.length ? [...errors, ...buErrors] : errors;
+    if (allErrors.length) {
+      errorRows.push({ row: raw._rowNum, errors: allErrors });
+    } else {
+      data.business_unit_ids = businessUnitIds;
+      validRows.push(data);
+      seenCodes.add(data.employee_code);
+      seenEmails.add(data.email);
+    }
+  }
+
+  // 4. Look up the "Employee" role once — every valid row gets a login
+  // now that email is required, so every imported employee gets this same
+  // default role grant (same role employeeService.create() defaults to).
+  let employeeRole = null;
+  if (validRows.length > 0) {
+    employeeRole = await Role.findOne({ where: { role_name: 'Employee' } });
+    if (!employeeRole) {
+      const err = new Error('The "Employee" role is not seeded.');
+      err.statusCode = 500;
+      throw err;
+    }
+  }
+
+  // 5. Insert valid rows — Employee + native login (email/password directly
+  // on the Employee row — Employee is the sole login identity now, see this
+  // file's header comment) + the "Employee" role grant, all in one
+  // transaction so a failed role-grant insert doesn't leave a half-created
+  // login.
+  let importedCount = 0;
+  const dbErrors = [];
+  const credentials = [];
+
+  for (const row of validRows) {
+    const { email, business_unit_ids: businessUnitIds, ...employeeFields } = row;
+    try {
+      await sequelize.transaction(async (transaction) => {
+        const employee = await employeeRepository.create({
+          ...employeeFields,
+          email,
+          password: DEFAULT_IMPORT_PASSWORD,
+          company_id: companyId,
+          admin_id: tenantAdminId,
+          created_by: userId,
+          updated_by: userId,
+        }, { transaction });
+
+        await employeeRoleRepository.replaceForEmployee(employee.id, [employeeRole.id], userId, transaction);
+        credentials.push({ employee_code: employee.employee_code, email, temporaryPassword: DEFAULT_IMPORT_PASSWORD });
+
+        // "Business Units" column mapping — see resolveRowBusinessUnitIds's
+        // doc comment. A blank column resolved to an empty array, so this is
+        // simply skipped for that row (no mapping created, never a default).
+        if (businessUnitIds.length > 0) {
+          await employeeBusinessUnitRepository.replaceForEmployee(employee.id, businessUnitIds, userId, transaction);
+        }
+
+        await employeeServicePOMappingService.autoMapCentralisedServicePOs(employee.id, companyId, userId, transaction);
+      });
+      importedCount++;
+    } catch (dbErr) {
+      // Sequelize collapses both plain validation failures AND unique-
+      // constraint conflicts to the same generic "Validation error"
+      // message — the actual per-field reason only lives in `.errors[]`.
+      // Surface it here so the import UI shows what actually failed
+      // instead of that uninformative default.
+      const detail = Array.isArray(dbErr.errors) && dbErr.errors.length
+        ? dbErr.errors.map((e) => e.message).join('; ')
+        : dbErr.message;
+      logger.error('Employee import DB error', { code: row.employee_code, error: detail });
+      dbErrors.push({ row: null, errors: [`DB error for "${row.employee_code}": ${detail}`] });
+    }
+  }
+
+  logger.info('Employee import completed', {
+    userId,
+    total: rawRows.length,
+    imported: importedCount,
+    skipped: errorRows.length,
+    db_errors: dbErrors.length,
+    logins_created: credentials.length,
+  });
+
+  return {
+    total: rawRows.length,
+    imported: importedCount,
+    skipped: errorRows.length + dbErrors.length,
+    error_rows: [...errorRows, ...dbErrors],
+    credentials,
+  };
+}
+
+module.exports = { importEmployees };

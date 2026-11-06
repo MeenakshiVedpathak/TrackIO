@@ -1,0 +1,328 @@
+'use strict';
+
+const { sequelize } = require('../models');
+const employeeWorkLogRepository = require('../repositories/employeeWorkLogRepository');
+const employeeRepository = require('../repositories/employeeRepository');
+const timesheetService = require('./timesheetService');
+const employeeTimesheetService = require('./employeeTimesheetService');
+const dateHelper = require('../helpers/dateHelper');
+const logger = require('../utils/logger');
+
+/**
+ * Employee Monthly Work Log Service.
+ *
+ * Second mode alongside Daily Work Log (employeeTimesheetService.js) —
+ * lets an employee submit one month's hours in a single go instead of one
+ * entry per day. Entries are written to the SAME `employee_work_logs` table
+ * as Daily (reuses all reporting/sync/hierarchy machinery), tagged
+ * log_type: 'monthly' and dated on the month's LAST calendar day. Only
+ * eligible once the month has ended, or on its last calendar day (see
+ * dateHelper.isMonthlyLogEligible).
+ *
+ * Submitting REPLACE-SAVEs the whole month: every existing row (Daily or
+ * Monthly) in the month's date range is deleted, then exactly the given
+ * entries are reinserted — the same pattern
+ * employeeTimesheetService.replaceDailyEntries uses for one date, scoped to
+ * a whole month here. This is also how "update the Monthly entry, never
+ * duplicate" is satisfied — resubmitting just replaces it again.
+ *
+ * Blocked entirely (409) once ANY row in the month's range is already
+ * 'synced' — a synced row's official record already lives in `timesheets`
+ * and must stay read-only (see EmployeeWorkLog.js's status doc comment).
+ * Same rule for deleteMonthlyWorkLog.
+ */
+
+/**
+ * Monthly cap = every calendar day of the month x 24h. Weekends and holidays
+ * count as ordinary days (an employee may log on them), so no holiday lookup.
+ */
+function getMonthlyHourCap(month, year) {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate() * 24;
+}
+
+function badRequestError(message) {
+  const err = new Error(message);
+  err.statusCode = 400;
+  return err;
+}
+
+function validationError(message) {
+  const err = new Error(message);
+  err.statusCode = 422;
+  return err;
+}
+
+function conflictError(message) {
+  const err = new Error(message);
+  err.statusCode = 409;
+  return err;
+}
+
+/**
+ * Build the { month, year, work_date, eligible, service_pos } response
+ * shape shared by getMonthlyWorkLog and submitMonthlyWorkLog.
+ */
+async function buildMonthlyWorkLogDTO(employeeId, companyId, month, year) {
+  const { startDate, endDate } = dateHelper.getMonthBounds(month, year);
+
+  const [{ mappedPOs, hierarchyRowsByPOId }, breakdownRows] = await Promise.all([
+    employeeTimesheetService.loadMappedPOsWithHierarchy(employeeId, companyId),
+    employeeWorkLogRepository.getHierarchyBreakdownForRange({ employeeId, startDate, endDate }),
+  ]);
+
+  const hoursByPOId = employeeTimesheetService.groupHoursByServicePO(breakdownRows);
+  const service_pos = employeeTimesheetService.buildServicePOsForDate(mappedPOs, hierarchyRowsByPOId, hoursByPOId);
+
+  return {
+    month,
+    year,
+    work_date: endDate,
+    eligible: dateHelper.isMonthlyLogEligible(month, year),
+    service_pos,
+  };
+}
+
+/**
+ * GET Monthly Work Log — the month's current entries (if any), the same
+ * Service PO -> Parent -> Child hierarchy shape Daily uses, plus whether
+ * this month is currently eligible for submission.
+ *
+ * @param {number} employeeId
+ * @param {number} companyId
+ * @param {number} month
+ * @param {number} year
+ * @returns {Promise<object>}
+ */
+const getMonthlyWorkLog = async (employeeId, companyId, month, year) => {
+  return buildMonthlyWorkLogDTO(employeeId, companyId, month, year);
+};
+
+/**
+ * Submit (create or update) the Monthly Work Log for one month. REPLACE
+ * SAVE across the whole month's date range — see this file's header doc.
+ *
+ * @param {number} employeeId
+ * @param {number} companyId
+ * @param {object} data - { month, year, entries: [{ service_po_id, sub_project_id?, hierarchy_node_id?, hours, description }] }
+ * @param {object} [options]
+ * @param {number} [options.creatorId] - who to record in created_by/updated_by
+ *   (defaults to employeeId, i.e. the employee submitted it themselves). A
+ *   Manager filling this in on an Employee's behalf passes their own id here
+ *   — see managerMonthlyWorkLogService.js.
+ * @param {boolean} [options.forceApproved] - insert every row directly as
+ *   'approved' (skipping the is_timesheet_approval_required lookup below
+ *   entirely) — used by the Manager path, whose entries are approved by
+ *   definition (a Manager typed them in, there's nothing left to approve).
+ * @param {boolean} [options.allowHierarchyNode] - when false, reject any
+ *   line carrying hierarchy_node_id ("Main PO" only — the Manager path
+ *   can't yet drill into a Parent/Child hierarchy node; may be lifted
+ *   later). Defaults to true (Employee self-service is unrestricted).
+ * @param {number[]|null} [options.scopeServicePOIds] - when given, only the month's rows
+ *   on THESE Service POs are replaced (rows on every other PO are kept, and count
+ *   towards the monthly cap) — a Project Manager's bulk upload covers only the POs
+ *   they manage, so it must never wipe the employee's other projects' hours.
+ * @returns {Promise<object>} same shape as getMonthlyWorkLog
+ */
+const submitMonthlyWorkLog = async (employeeId, companyId, data, options = {}) => {
+  const { creatorId = employeeId, forceApproved = false, allowHierarchyNode = true, scopeServicePOIds = null } = options;
+  const month = parseInt(data.month, 10);
+  const year = parseInt(data.year, 10);
+  const lines = data.entries || [];
+
+  if (!dateHelper.isMonthlyLogEligible(month, year)) {
+    throw validationError(
+      'Monthly Work Log is only allowed for a month that has already ended, or on that month\'s last calendar day.'
+    );
+  }
+
+  if (!allowHierarchyNode) {
+    const hierarchyLine = lines.find((line) => line.hierarchy_node_id);
+    if (hierarchyLine) {
+      throw badRequestError(
+        `Service PO #${hierarchyLine.service_po_id}: hierarchy node selection is not supported here — log against the Main PO only.`
+      );
+    }
+  }
+
+  const { endDate, startDate } = dateHelper.getMonthBounds(month, year);
+
+  // This month's range is about to be wiped (deleteByEmployeeAndDateRange
+  // below) and reinserted wholesale — must not silently discard a row
+  // that's already been synced to the official Timesheet (see
+  // EmployeeWorkLog.js's status doc comment: "Synced rows are read-only").
+  if (await employeeWorkLogRepository.hasSyncedEntriesInRange(employeeId, startDate, endDate, companyId)) {
+    throw conflictError(
+      `This month's work log has already been synced to the official Timesheet and can no longer be edited.`
+    );
+  }
+
+  // Approved-log lock (employee path only — a manager's upload sets forceApproved): approved rows are
+  // never wiped by this replace-save, a line against a PO that already has an approved log in this month is
+  // refused (the monthly row would double-count it), and the kept approved hours count towards the cap.
+  let approvedHoursKept = 0;
+  if (!forceApproved) {
+    const approvedRows = await employeeWorkLogRepository.findApprovedInRange(
+      employeeId, startDate, endDate, { servicePOIds: Array.isArray(scopeServicePOIds) ? scopeServicePOIds : null }
+    );
+    const linePoIds = new Set(lines.map((line) => Number(line.service_po_id)));
+    const clash = approvedRows.find((row) => linePoIds.has(Number(row.service_po_id)));
+    if (clash) {
+      throw conflictError(
+        `An approved timesheet log already exists for Service PO #${clash.service_po_id} in this month (${clash.work_date}). `
+        + 'It cannot be replaced; ask your approver to revert or delete it first.'
+      );
+    }
+    approvedHoursKept = approvedRows.reduce((sum, row) => sum + parseFloat(row.hours), 0);
+  }
+
+  // Deliberately does NOT reject when Daily entries (TIME_BASED or HOURLY)
+  // already exist for this month — submitting a Monthly Work Log is
+  // ALLOWED to consolidate/replace them: deleteByEmployeeAndDateRange below
+  // wipes every existing row (Daily or Monthly) for the month before
+  // inserting the new Monthly ones, same as it always has. The REVERSE
+  // direction (a Monthly Work Log already exists -> Daily creation is
+  // blocked) is intentionally still enforced, by
+  // employeeTimesheetService.assertNoMonthlyLogForDate on every Daily write
+  // path — only THIS direction (Daily existing -> Monthly attempted) is
+  // unrestricted.
+
+  // Two lines at the same (service_po_id, hierarchy_node_id) would collide
+  // on insert — reject up front, same as Daily's replaceDailyEntries.
+  const seenKeys = new Set();
+  for (const line of lines) {
+    const key = `${line.service_po_id}|${line.hierarchy_node_id || 'po'}`;
+    if (seenKeys.has(key)) {
+      const nodeSuffix = line.hierarchy_node_id ? ` / hierarchy node #${line.hierarchy_node_id}` : '';
+      throw badRequestError(`Duplicate entry for Service PO #${line.service_po_id}${nodeSuffix} in the same request.`);
+    }
+    seenKeys.add(key);
+  }
+
+  const keptHours = Array.isArray(scopeServicePOIds)
+    ? await employeeWorkLogRepository.sumHoursInRangeExcludingPOs(employeeId, startDate, endDate, scopeServicePOIds)
+    : 0;
+  const totalHours = keptHours + approvedHoursKept + lines.reduce((sum, line) => sum + parseFloat(line.hours), 0);
+  const monthlyHourCap = getMonthlyHourCap(month, year);
+  if (totalHours > monthlyHourCap) {
+    throw badRequestError(
+      `Total hours for this month cannot exceed ${monthlyHourCap}. This request totals ${Math.round(totalHours * 100) / 100} hours.`
+    );
+  }
+
+  // Resolve/validate every line before touching the database at all —
+  // identical checks to Daily (project mapping, employee-active/PO-eligible/
+  // sub-project-belongs-to-PO, hierarchy node ownership).
+  const resolvedLines = [];
+  for (const line of lines) {
+    await employeeTimesheetService.assertProjectMapped(employeeId, line.service_po_id, companyId);
+
+    const { po } = await timesheetService.resolveManualEntryReferences(
+      { employee_id: employeeId, service_po_id: line.service_po_id, sub_project_id: line.sub_project_id },
+      companyId,
+      { skipPOCompanyScope: true, skipEmployeeCompanyScope: true }
+    );
+
+    const hierarchyNode = await employeeTimesheetService.resolveHierarchyNode(line.hierarchy_node_id, line.service_po_id);
+
+    resolvedLines.push({ line, po, hierarchyNode });
+  }
+
+  const insertedRows = await sequelize.transaction(async (transaction) => {
+    await employeeWorkLogRepository.deleteByEmployeeAndDateRange(employeeId, startDate, endDate, companyId, transaction, scopeServicePOIds, !forceApproved);
+
+    return employeeWorkLogRepository.bulkCreate(
+      resolvedLines.map(({ line, po }) => ({
+        employee_id: employeeId,
+        service_po_id: line.service_po_id,
+        sub_project_id: line.sub_project_id || null,
+        hierarchy_node_id: line.hierarchy_node_id || null,
+        work_date: endDate,
+        hours: line.hours,
+        // Never undefined — description is optional on both the Employee
+        // self-service and Manager (allowHierarchyNode: false) paths, so a
+        // genuinely blank/absent value must still resolve to '', never left
+        // unset against this NOT NULL column (same fallback pattern as
+        // employeeTimesheetService.withFallbackDescription).
+        description: line.description || '',
+        // The work log belongs to the Service PO's OWN owning BU, not
+        // necessarily the caller's active session BU (cross-BU resourcing) —
+        // see employeeTimesheetService.replaceDailyEntries' identical
+        // comment. Falls back to the session companyId for a BU-less/
+        // Centralised PO (company_id: null), and ALSO for a Centralised PO
+        // that does carry its own specific company_id — a Centralised PO is
+        // usable across BUs by definition, so its own company_id is never a
+        // meaningful anchor; only the logging employee's own session BU is.
+        company_id: po.is_centralised ? companyId : (po.company_id ?? companyId),
+        status: forceApproved ? 'approved' : 'pending',
+        log_type: 'monthly',
+        created_by: creatorId,
+        updated_by: creatorId,
+      })),
+      transaction
+    );
+  });
+
+  // Approval happens BEFORE Sync — see the matching comment in
+  // employeeTimesheetService.replaceDailyEntries. Same additive
+  // post-creation step, not a change to creation itself. Skipped entirely
+  // when forceApproved already inserted every row as 'approved' above.
+  if (!forceApproved) {
+    const employee = await employeeRepository.findById(employeeId, companyId);
+    if (employee && !employee.is_timesheet_approval_required && insertedRows.length > 0) {
+      await employeeWorkLogRepository.markApprovedByIds(insertedRows.map((row) => row.id), companyId);
+    }
+  }
+
+  logger.info('Employee monthly work log submitted', {
+    employeeId, companyId, month, year, workDate: endDate, entryCount: resolvedLines.length, creatorId, forceApproved,
+  });
+
+  return buildMonthlyWorkLogDTO(employeeId, companyId, month, year);
+};
+
+/**
+ * Delete every timesheet entry for one month — Daily or Monthly alike, same
+ * "whole-month REPLACE" scope as submitMonthlyWorkLog's clear step. Matches
+ * the UI's delete confirmation, which tells the employee every work log
+ * entry for the month is removed, including ones logged day by day in
+ * Daily mode.
+ *
+ * @param {number} employeeId
+ * @param {number} companyId
+ * @param {number} month
+ * @param {number} year
+ * @returns {Promise<void>}
+ */
+const deleteMonthlyWorkLog = async (employeeId, companyId, month, year, { byApprover = false } = {}) => {
+  const { startDate, endDate } = dateHelper.getMonthBounds(month, year);
+
+  if (await employeeWorkLogRepository.hasSyncedEntriesInRange(employeeId, startDate, endDate, companyId)) {
+    throw conflictError(
+      `This month's work log has already been synced to the official Timesheet and can no longer be deleted.`
+    );
+  }
+
+  // An employee can never delete an approved log (an approver's Revert/Delete is the only way): refuse the
+  // whole request rather than silently deleting only some of the month. An approver's own
+  // month delete (byApprover) is unchanged.
+  if (!byApprover) {
+    const approvedRows = await employeeWorkLogRepository.findApprovedInRange(employeeId, startDate, endDate);
+    if (approvedRows.length > 0) {
+      throw conflictError(
+        'This month has approved timesheet logs, which cannot be deleted. Ask your approver to revert or delete them first.'
+      );
+    }
+  }
+
+  await employeeWorkLogRepository.deleteByEmployeeAndDateRange(employeeId, startDate, endDate, companyId);
+
+  logger.info('Employee monthly work log deleted', { employeeId, companyId, month, year });
+
+};
+
+module.exports = {
+  getMonthlyWorkLog,
+  submitMonthlyWorkLog,
+  deleteMonthlyWorkLog,
+  getMonthlyHourCap,
+};
