@@ -12,6 +12,7 @@ import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
 import SearchInput from '@/components/common/SearchInput';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -120,6 +121,7 @@ const SummaryItem = ({ label, value }) => (
 );
 
 const EmployeeCapacityForecast = () => {
+  const confirmExport = useExportConfirm();
   const [monthYear, setMonthYear] = useState({
     month: prevMonth.getMonth() + 1,
     year: prevMonth.getFullYear(),
@@ -205,7 +207,7 @@ const EmployeeCapacityForecast = () => {
               activeCount={activeFilterCount}
             />
             {filteredRecords.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)}>
                 <Download className="h-4 w-4" />Export Excel
               </Button>
             )}

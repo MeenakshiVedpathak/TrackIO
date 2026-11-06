@@ -19,6 +19,7 @@ import ConfirmDialog from '@/components/common/ConfirmDialog';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter from '@/components/common/BusinessUnitFilter';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import EntityFilter from '@/components/common/EntityFilter';
 import { useMasterBuFilter } from '@/hooks/useMasterBuFilter';
 import { Button } from '@/components/ui/button';
@@ -51,6 +52,7 @@ const sortByMap = {
 };
 
 const MonthlyCostList = () => {
+  const confirmExport = useExportConfirm();
   const navigate = useNavigate();
   const { success, error: showError } = useNotification();
   const { businessUnits } = useAuth();
@@ -552,7 +554,7 @@ const MonthlyCostList = () => {
             </button>
             <button
               type="button"
-              onClick={handleDownloadPeriod}
+              onClick={() => confirmExport(handleDownloadPeriod)}
               disabled={downloadingPeriod}
               className="flex w-full items-center gap-3 rounded-lg px-3 py-3 text-left text-sm hover:bg-muted/50 disabled:opacity-50"
             >

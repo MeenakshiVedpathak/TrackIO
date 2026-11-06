@@ -3,7 +3,6 @@ import * as XLSX from 'xlsx';
 import { createColumnHelper } from '@tanstack/react-table';
 import { AlertCircle, Download } from 'lucide-react';
 import { useClientCostAnalytics } from '@/hooks/useReports';
-import { useCanViewOriginalData } from '@/hooks/usePermissions';
 import { useActiveClients } from '@/hooks/useClients';
 import { extractApiError } from '@/services/apiClient';
 import { formatCurrency, formatHours, formatDate } from '@/utils/formatters';
@@ -14,7 +13,8 @@ import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
-import SegmentedToggle from '@/components/common/SegmentedToggle';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { MultiSelect } from '@/components/ui/multi-select';
@@ -30,37 +30,27 @@ const columnHelper = createColumnHelper();
 // Top Clients is server-paginated — its sheet covers only the currently-loaded page, same
 // current-page tradeoff other reports document for their own exports; All Clients and Category
 // Breakdown are both already all-time/unpaginated datasets.
-const exportToExcel = ({ topClients, clients, categoryMatrix, categoryNames }) => {
+const exportToExcel = ({ topClients, clients, categoryMatrix, categoryNames, isOriginal }) => {
   const wb = XLSX.utils.book_new();
+  const hoursHeader = isOriginal ? 'Total Hours (Original)' : 'Total Hours';
+  const hoursOf = (c) => {
+    const v = isOriginal ? (c.original_total_hours ?? c.total_hours) : c.total_hours;
+    return v != null ? Number(v) : '';
+  };
 
-  const hasOrigTop = topClients.some((c) => c.original_total_hours != null);
-  const topHeader = [
-    'Rank',
-    'Client',
-    'Total Hours',
-    ...(hasOrigTop ? ['Original Total Hours'] : []),
-    'Total Cost',
-  ];
+  const topHeader = ['Rank', 'Client', hoursHeader, 'Total Cost'];
   const topRows = topClients.map((c) => [
     c.rank ?? '',
     c.client_name ?? '',
-    c.total_hours != null ? Number(c.total_hours) : '',
-    ...(hasOrigTop ? [c.original_total_hours != null ? Number(c.original_total_hours) : ''] : []),
+    hoursOf(c),
     c.total_cost != null ? Number(c.total_cost) : '',
   ]);
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([topHeader, ...topRows]), 'Top Clients');
 
-  const hasOrigAll = clients.some((c) => c.original_total_hours != null);
-  const allHeader = [
-    'Client',
-    'Total Hours',
-    ...(hasOrigAll ? ['Original Total Hours'] : []),
-    'Total Cost',
-  ];
+  const allHeader = ['Client', hoursHeader, 'Total Cost'];
   const allRows = clients.map((c) => [
     c.client_name ?? '',
-    c.total_hours != null ? Number(c.total_hours) : '',
-    ...(hasOrigAll ? [c.original_total_hours != null ? Number(c.original_total_hours) : ''] : []),
+    hoursOf(c),
     c.total_cost != null ? Number(c.total_cost) : '',
   ]);
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([allHeader, ...allRows]), 'All Clients');
@@ -77,7 +67,7 @@ const exportToExcel = ({ topClients, clients, categoryMatrix, categoryNames }) =
 };
 
 const ClientCostAnalytics = () => {
-  const canViewOriginal = useCanViewOriginalData();
+  const confirmExport = useExportConfirm();
   const [hoursSource, setHoursSource] = useState('M');
   const [activeTab, setActiveTab] = useState('top');
   const [page, setPage] = useState(1);
@@ -97,11 +87,6 @@ const ClientCostAnalytics = () => {
   const scope = useMemo(() => ({ entityIds, businessUnitIds: buIds }), [entityIds, buIds]);
   const { data: activeClients = [] } = useActiveClients(scope);
 
-  // Role no longer grants Original-data visibility (e.g. role reassigned mid-session) — force
-  // back to Modified, same as every other report.
-  useEffect(() => {
-    if (!canViewOriginal) setHoursSource('M');
-  }, [canViewOriginal]);
 
   // Period is optional — omit both month/year and startDate/endDate for all-time (the backend's
   // own default, same as before this filter existed). Never sent together.
@@ -133,8 +118,7 @@ const ClientCostAnalytics = () => {
   const topClientsPagination = data?.data?.top_clients?.pagination ?? null;
   const categoryMatrix = Array.isArray(data?.data?.category_matrix) ? data.data.category_matrix : [];
 
-  const hasOrigTop = useMemo(() => topClients.some((c) => c.original_total_hours != null), [topClients]);
-  const hasOrigAll = useMemo(() => clients.some((c) => c.original_total_hours != null), [clients]);
+  const isOriginal = hoursSource === HOURS_ORIGINAL;
 
   const visibleTopClientsColumns = useMemo(() => [
     columnHelper.accessor('rank', {
@@ -147,24 +131,18 @@ const ClientCostAnalytics = () => {
       size: 260,
       cell: (info) => <div className="truncate font-medium max-w-[240px]" title={info.getValue()}>{info.getValue() || '—'}</div>,
     }),
-    columnHelper.accessor('total_hours', {
+    columnHelper.accessor((row) => (isOriginal ? (row.original_total_hours ?? row.total_hours) : row.total_hours), {
+      id: 'total_hours',
       header: 'Total Hours',
       size: 150,
       cell: (info) => <span className="tabular-nums">{formatHours(info.getValue())}</span>,
     }),
-    ...(hasOrigTop ? [
-      columnHelper.accessor('original_total_hours', {
-        header: 'Original Total Hours',
-        size: 150,
-        cell: (info) => <span className="tabular-nums text-muted-foreground">{info.getValue() != null ? formatHours(info.getValue()) : '—'}</span>,
-      }),
-    ] : []),
     columnHelper.accessor('total_cost', {
       header: 'Total Cost',
       size: 160,
       cell: (info) => <span className="tabular-nums">{formatCurrency(info.getValue())}</span>,
     }),
-  ], [hasOrigTop]);
+  ], [isOriginal]);
 
   const visibleAllClientsColumns = useMemo(() => [
     columnHelper.accessor('client_name', {
@@ -172,24 +150,18 @@ const ClientCostAnalytics = () => {
       size: 280,
       cell: (info) => <div className="truncate font-medium max-w-[260px]" title={info.getValue()}>{info.getValue() || '—'}</div>,
     }),
-    columnHelper.accessor('total_hours', {
+    columnHelper.accessor((row) => (isOriginal ? (row.original_total_hours ?? row.total_hours) : row.total_hours), {
+      id: 'total_hours',
       header: 'Total Hours',
       size: 150,
       cell: (info) => <span className="tabular-nums">{formatHours(info.getValue())}</span>,
     }),
-    ...(hasOrigAll ? [
-      columnHelper.accessor('original_total_hours', {
-        header: 'Original Total Hours',
-        size: 150,
-        cell: (info) => <span className="tabular-nums text-muted-foreground">{info.getValue() != null ? formatHours(info.getValue()) : '—'}</span>,
-      }),
-    ] : []),
     columnHelper.accessor('total_cost', {
       header: 'Total Cost',
       size: 160,
       cell: (info) => <span className="tabular-nums">{formatCurrency(info.getValue())}</span>,
     }),
-  ], [hasOrigAll]);
+  ], [isOriginal]);
 
   // Category names aren't a fixed set — derive the union of keys seen across every row's
   // `categories` object at runtime, rather than hardcoding Billable/Non-Billable/etc.
@@ -255,9 +227,11 @@ const ClientCostAnalytics = () => {
   const activeFilterCount = (entityIds.length > 0 ? 1 : 0)
     + (buIds.length > 0 ? 1 : 0)
     + (clientIds.length > 0 ? 1 : 0)
-    + (periodMode === 'month' ? (monthYear ? 1 : 0) : (dateRange ? 1 : 0));
+    + (periodMode === 'month' ? (monthYear ? 1 : 0) : (dateRange ? 1 : 0))
+    + (hoursSource !== HOURS_ADJUSTED ? 1 : 0);
 
   const clearFilters = () => {
+    setHoursSource(HOURS_ADJUSTED);
     setEntityIds([]);
     setBuIds([]);
     setClientIds([]);
@@ -273,16 +247,6 @@ const ClientCostAnalytics = () => {
         description={`Showing: ${periodLabel}`}
         actions={
           <div className="flex flex-wrap items-center gap-2">
-            {canViewOriginal && (
-              <SegmentedToggle
-                options={[
-                  { value: 'O', label: 'Original' },
-                  { value: 'M', label: 'Published' },
-                ]}
-                value={hoursSource}
-                onChange={handleHoursSourceChange}
-              />
-            )}
             <FilterToggleButton
               isOpen={filtersOpen}
               onToggle={() => setFiltersOpen((p) => !p)}
@@ -292,7 +256,7 @@ const ClientCostAnalytics = () => {
               <Button
                 variant="outline"
                 size="toolbar"
-                onClick={() => exportToExcel({ topClients, clients, categoryMatrix, categoryNames })}
+                onClick={() => confirmExport(() => exportToExcel({ topClients, clients, categoryMatrix, categoryNames, isOriginal }))}
               >
                 <Download className="h-4 w-4" />Export Excel
               </Button>
@@ -335,6 +299,8 @@ const ClientCostAnalytics = () => {
             />
           )}
         </div>
+
+        <HoursBasisToggle value={hoursSource} onChange={handleHoursSourceChange} labelClassName="text-xs" />
 
         <EntityFilter multiple value={entityIds} onChange={handleEntityChange} />
 

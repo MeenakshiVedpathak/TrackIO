@@ -16,6 +16,8 @@ import DataTable from '@/components/common/DataTable';
 import StatusBadge from '@/components/common/StatusBadge';
 import EmptyState from '@/components/common/EmptyState';
 import RejectEntryDialog from '@/components/employee/RejectEntryDialog';
+import ApprovedEntryActions from '@/components/employee/ApprovedEntryActions';
+import { BucketActionsCell } from '@/components/employee/ApprovedBulkActions';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
@@ -312,9 +314,14 @@ const ManagerTeamTimesheetView = ({ employeeId, employeeName }) => {
     columnHelper.display({
       id: 'actions',
       header: 'Action',
-      size: 170,
-      cell: ({ row }) =>
-        isApprovable(row.original) ? (
+      size: 240,
+      cell: ({ row }) => (
+        <BucketActionsCell
+          row={{ employeeId, employeeName, ...row.original }}
+          logType={logType}
+          hasPendingActions={isApprovable(row.original)}
+        >
+        {isApprovable(row.original) ? (
           <div className="flex items-center gap-1.5">
             <Button
               variant="outline"
@@ -338,7 +345,9 @@ const ManagerTeamTimesheetView = ({ employeeId, employeeName }) => {
           </div>
         ) : (
           <span className="text-sm text-muted-foreground">—</span>
-        ),
+        )}
+        </BucketActionsCell>
+      ),
     }),
     columnHelper.display({
       id: 'expand',
@@ -460,6 +469,8 @@ const ManagerTeamTimesheetView = ({ employeeId, employeeName }) => {
                             {r.rejection_remark && <p className="mt-0.5">{r.rejection_remark}</p>}
                           </div>
                         )}
+
+                        <ApprovedEntryActions entry={r} />
 
                         {isEntryPending(r) && (
                           <div className="mt-2 flex justify-end gap-1.5">

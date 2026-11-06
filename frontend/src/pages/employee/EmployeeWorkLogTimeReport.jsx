@@ -26,6 +26,7 @@ import PageHeader from '@/components/common/PageHeader';
 import EmptyState from '@/components/common/EmptyState';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 
 // 'weekly' shares the same `range` state as 'range' below — WeekPicker just snaps selection to a
 // Mon-Sat business week instead of two free clicks, emitting the identical {startDate, endDate} shape, so
@@ -91,6 +92,7 @@ const TotalHoursBar = ({ totalHours }) => (
 // Employee column; a plain Employee only ever sees their own rows so that column is redundant
 // and left out.
 const EmployeeWorkLogTimeReport = () => {
+  const confirmExport = useExportConfirm();
   const { error: showError } = useNotification();
   const { hasRole } = useAuth();
   const isTeamLead = hasRole(ROLE_NAMES.TEAM_LEAD);
@@ -245,7 +247,7 @@ const EmployeeWorkLogTimeReport = () => {
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
                   {EXPORT_FORMATS.map(({ label, value }) => (
-                    <DropdownMenuItem key={value} onClick={() => handleExport(value)} className="cursor-pointer">
+                    <DropdownMenuItem key={value} onClick={() => confirmExport(() => handleExport(value))} className="cursor-pointer">
                       {label}
                     </DropdownMenuItem>
                   ))}

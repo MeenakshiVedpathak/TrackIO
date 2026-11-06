@@ -603,3 +603,60 @@ export const useTeamLeadEmployeeProjectHoursFilterOptions = (params) => {
   });
 };
 
+// Employee PO Hours matrix reports — `params` carries every filter plus hoursBasis, so the queryKey
+// changes (and refetches) on any of them, including the Original/Adjusted toggle.
+// Either month+year OR startDate+endDate — never both, never neither.
+const hasPoHoursPeriod = (params) =>
+  !!(params?.month && params?.year) !== !!(params?.startDate && params?.endDate);
+
+export const useTeamLeadEmployeePoHours = (params) =>
+  useQuery({
+    queryKey: QUERY_KEYS.REPORT_TEAM_LEAD_EMPLOYEE_PO_HOURS(params),
+    queryFn: () => reportsApi.getTeamLeadEmployeePoHours(params),
+    enabled: hasPoHoursPeriod(params),
+    staleTime: 0,
+    placeholderData: (prev) => prev,
+  });
+
+export const useTeamLeadEmployeePoHoursFilterOptions = (params) =>
+  useQuery({
+    queryKey: QUERY_KEYS.REPORT_TEAM_LEAD_EMPLOYEE_PO_HOURS_FILTER_OPTIONS(params),
+    queryFn: () => reportsApi.getTeamLeadEmployeePoHoursFilterOptions(params),
+    enabled: hasPoHoursPeriod(params),
+    staleTime: 0,
+  });
+
+export const useBuAdminEmployeePoHours = (params) =>
+  useQuery({
+    queryKey: QUERY_KEYS.REPORT_BU_ADMIN_EMPLOYEE_PO_HOURS(params),
+    queryFn: () => reportsApi.getBuAdminEmployeePoHours(params),
+    enabled: hasPoHoursPeriod(params),
+    staleTime: 0,
+    placeholderData: (prev) => prev,
+  });
+
+export const useBuAdminEmployeePoHoursFilterOptions = (params) =>
+  useQuery({
+    queryKey: QUERY_KEYS.REPORT_BU_ADMIN_EMPLOYEE_PO_HOURS_FILTER_OPTIONS(params),
+    queryFn: () => reportsApi.getBuAdminEmployeePoHoursFilterOptions(params),
+    enabled: hasPoHoursPeriod(params),
+    staleTime: 0,
+  });
+
+export const useProjectManagerEmployeePoHours = (params) =>
+  useQuery({
+    queryKey: QUERY_KEYS.REPORT_PROJECT_MANAGER_EMPLOYEE_PO_HOURS(params),
+    queryFn: () => reportsApi.getProjectManagerEmployeePoHours(params),
+    enabled: hasPoHoursPeriod(params),
+    staleTime: 0,
+    placeholderData: (prev) => prev,
+  });
+
+export const useProjectManagerEmployeePoHoursFilterOptions = (params) =>
+  useQuery({
+    queryKey: QUERY_KEYS.REPORT_PROJECT_MANAGER_EMPLOYEE_PO_HOURS_FILTER_OPTIONS(params),
+    queryFn: () => reportsApi.getProjectManagerEmployeePoHoursFilterOptions(params),
+    enabled: hasPoHoursPeriod(params),
+    staleTime: 0,
+  });
+

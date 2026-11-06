@@ -9,12 +9,14 @@ import { formatNumber, formatHours } from '@/utils/formatters';
 import { UtilizationCell } from '@/components/reports/UtilizationCell';
 import DataTable from '@/components/common/DataTable';
 import PageHeader from '@/components/common/PageHeader';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import EmptyState from '@/components/common/EmptyState';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
 import SearchInput from '@/components/common/SearchInput';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { MonthYearPicker } from '@/components/ui/month-year-picker';
@@ -108,17 +110,6 @@ const getColumns = (sortBy, sortOrder, onSort) => [
     enableSorting: false,
     cell: (info) => <span className="tabular-nums">{formatHours(info.getValue())}</span>,
   }),
-  columnHelper.accessor('original_total_logged_hours', {
-    header: 'Original Total Logged Hrs',
-    size: 180,
-    meta: { align: 'right' },
-    enableSorting: false,
-    cell: (info) => {
-      const value = info.getValue();
-      if (value == null || value === '') return null;
-      return <span className="tabular-nums text-muted-foreground">{formatHours(value)}</span>;
-    },
-  }),
   columnHelper.accessor('total_available_hours', {
     header: () => <SortableHeader label="Total Available Hrs" column={SORTABLE.AVAILABLE_HOURS} sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} align="right" />,
     size: 170,
@@ -142,17 +133,6 @@ const getColumns = (sortBy, sortOrder, onSort) => [
       );
     },
   }),
-  columnHelper.accessor('original_utilization_pct', {
-    header: 'Original Utilization %',
-    size: 170,
-    meta: { align: 'right' },
-    enableSorting: false,
-    cell: (info) => {
-      const value = info.getValue();
-      if (value == null || value === '') return null;
-      return <span className="tabular-nums text-muted-foreground">{Number(value).toFixed(2)}%</span>;
-    },
-  }),
 ];
 
 const SummaryItem = ({ label, value }) => (
@@ -162,10 +142,24 @@ const SummaryItem = ({ label, value }) => (
   </div>
 );
 
+// Hours basis: when 'Original' is selected, the logged-hours and utilization fields are swapped for
+// their original_* twins (falling back to the adjusted value when the API didn't send one), so the
+// table, summary strip and export all read the same two keys whichever basis is active.
+const withBasis = (r, hoursSource) => (
+  r && hoursSource === HOURS_ORIGINAL
+    ? {
+      ...r,
+      total_logged_hours: r.original_total_logged_hours ?? r.total_logged_hours,
+      utilization_pct: r.original_utilization_pct ?? r.utilization_pct,
+    }
+    : r
+);
+
 // Exports the current page only — this report is server-paginated, so the rest of the result
-// set is not in memory.
-const exportToExcel = (rows) => {
-  const header = ['Client', 'Project', 'Service PO Code', 'Service PO Name', 'No. of Resources', 'Total Logged Hrs', 'Total Available Hrs', 'Utilization %'];
+// set is not in memory. Rows arrive already mapped to the active hours basis.
+const exportToExcel = (rows, hoursSource) => {
+  const sfx = hoursSource === HOURS_ORIGINAL ? ' (Original)' : '';
+  const header = ['Client', 'Project', 'Service PO Code', 'Service PO Name', 'No. of Resources', `Total Logged Hrs${sfx}`, 'Total Available Hrs', `Utilization %${sfx}`];
   const dataRows = rows.map((r) => [
     r.client_name ?? '',
     r.project_name ?? '',
@@ -173,10 +167,8 @@ const exportToExcel = (rows) => {
     r.service_po_name ?? '',
     r.resource_count != null ? Number(r.resource_count) : '',
     r.total_logged_hours != null ? Number(r.total_logged_hours) : '',
-    r.original_total_logged_hours != null ? Number(r.original_total_logged_hours) : '',
     r.total_available_hours != null ? Number(r.total_available_hours) : '',
     r.utilization_pct != null ? Number(r.utilization_pct) : '',
-    r.original_utilization_pct != null ? Number(r.original_utilization_pct) : '',
   ]);
   const ws = XLSX.utils.aoa_to_sheet([header, ...dataRows]);
   const wb = XLSX.utils.book_new();
@@ -188,6 +180,7 @@ const exportToExcel = (rows) => {
 // utilization rolled up per PO across a month range. Same server-paginated/sorted/searched
 // contract as PmWiseUtilizationReport.
 const ProjectWiseUtilizationReport = () => {
+  const confirmExport = useExportConfirm();
   const [periodMode, setPeriodMode] = useState('range');
   const [monthYear, setMonthYear] = useState({ month: now.getMonth() + 1, year: now.getFullYear() });
   const [fromMonthYear, setFromMonthYear] = useState({ month: defaultFromDate.getMonth() + 1, year: defaultFromDate.getFullYear() });
@@ -203,6 +196,7 @@ const ProjectWiseUtilizationReport = () => {
   const [limit, setLimit] = useState(10);
   const [sortBy, setSortBy] = useState(SORTABLE.UTILIZATION);
   const [sortOrder, setSortOrder] = useState('DESC');
+  const [hoursSource, setHoursSource] = useState(HOURS_ADJUSTED);
 
   const debouncedSearch = useDebounce(search, 400);
 
@@ -211,6 +205,8 @@ const ProjectWiseUtilizationReport = () => {
     : !!(fromMonthYear?.month && fromMonthYear?.year && toMonthYear?.month && toMonthYear?.year);
 
   const params = {
+    // Original basis: the server then sorts, ranks and totals on original hours too.
+    ...(hoursSource === HOURS_ORIGINAL && { hoursSource: 'O' }),
     ...(periodMode === 'month'
       ? { month: monthYear.month, year: monthYear.year }
       : { startMonth: fromMonthYear.month, startYear: fromMonthYear.year, endMonth: toMonthYear.month, endYear: toMonthYear.year }),
@@ -235,12 +231,12 @@ const ProjectWiseUtilizationReport = () => {
 
   // Same envelope shape as PmWiseUtilizationReport — `meta` sits at the top level, `summary`
   // lives alongside the row array under `data.data`. Confirmed against a real response.
-  const records = extractReportRows(data);
+  const records = extractReportRows(data).map((r) => withBasis(r, hoursSource));
   const meta = data?.meta ?? {};
-  const summary = data?.data?.summary ?? null;
+  const summary = withBasis(data?.data?.summary ?? null, hoursSource);
   const showLoading = periodReady && isPending;
 
-  const activeFilterCount = (entityIds.length > 0 ? 1 : 0) + (buIds.length > 0 ? 1 : 0);
+  const activeFilterCount = (entityIds.length > 0 ? 1 : 0) + (buIds.length > 0 ? 1 : 0) + (hoursSource !== HOURS_ADJUSTED ? 1 : 0);
 
   const handleSort = (column) => {
     if (sortBy === column) {
@@ -255,7 +251,7 @@ const ProjectWiseUtilizationReport = () => {
   const columns = getColumns(sortBy, sortOrder, handleSort);
 
   // Exports the current page only — see exportToExcel's comment above.
-  const handleExport = () => exportToExcel(records);
+  const handleExport = () => exportToExcel(records, hoursSource);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -270,7 +266,7 @@ const ProjectWiseUtilizationReport = () => {
               className="w-full sm:w-full md:w-72"
             />
             {records.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport} className="order-2 md:order-none">
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)} className="order-2 md:order-none">
                 <Download className="h-4 w-4" />Export Excel
               </Button>
             )}
@@ -287,7 +283,7 @@ const ProjectWiseUtilizationReport = () => {
       <FilterPanel
         isOpen={filtersOpen}
         maxHeightClass="max-h-[300px]"
-        onClear={() => { setEntityIds([]); setBuIds([]); setPage(1); }}
+        onClear={() => { setEntityIds([]); setBuIds([]); setHoursSource(HOURS_ADJUSTED); setPage(1); }}
         showClear={activeFilterCount > 0}
       >
         <EntityFilter multiple value={entityIds} onChange={(v) => { setEntityIds(v); setBuIds([]); setPage(1); }} />
@@ -329,6 +325,8 @@ const ProjectWiseUtilizationReport = () => {
             />
           )}
         </div>
+
+        <HoursBasisToggle value={hoursSource} onChange={(v) => { setHoursSource(v); setPage(1); }} labelClassName="text-xs" />
       </FilterPanel>
 
       <DataTable
@@ -352,7 +350,6 @@ const ProjectWiseUtilizationReport = () => {
           <div className="flex flex-wrap gap-x-6 gap-y-2">
             <SummaryItem label="No. of Resources" value={formatNumber(summary.total_resource_count)} />
             <SummaryItem label="Total Logged Hrs" value={formatHours(summary.total_logged_hours)} />
-            {summary.original_total_logged_hours != null && <SummaryItem label="Original Total Logged Hrs" value={formatHours(summary.original_total_logged_hours)} />}
             <SummaryItem label="Total Available Hrs" value={formatHours(summary.total_available_hours)} />
             <SummaryItem
               label="Utilization %"
@@ -364,14 +361,6 @@ const ProjectWiseUtilizationReport = () => {
                 />
               )}
             />
-            {summary.original_utilization_pct != null && (
-              <SummaryItem
-                label="Original Utilization %"
-                value={(
-                  <span className="tabular-nums">{Number(summary.original_utilization_pct).toFixed(2)}%</span>
-                )}
-              />
-            )}
           </div>
         </div>
       )}

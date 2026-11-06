@@ -9,7 +9,6 @@ import { useActiveClients } from '@/hooks/useClients';
 import { useActiveServicePOs } from '@/hooks/useServicePOs';
 import { useActiveServiceTypes } from '@/hooks/useServiceTypes';
 import { useActiveEmployees } from '@/hooks/useEmployees';
-import { useCanViewOriginalData } from '@/hooks/usePermissions';
 import { useDebounce } from '@/hooks/useDebounce';
 import { extractApiError } from '@/services/apiClient';
 import { formatDate, formatHours } from '@/utils/formatters';
@@ -18,6 +17,8 @@ import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -37,10 +38,7 @@ const STATUS_OPTIONS = [
   { label: 'Closed', value: 'closed' },
 ];
 
-const getGridCols = (hasOriginal) =>
-  hasOriginal
-    ? 'grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)_110px_110px]'
-    : 'grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)_110px]';
+const GRID_COLS = 'grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)_110px]';
 
 const HOURS_NUMFMT = '#,##0.00';
 
@@ -49,16 +47,13 @@ const HOURS_NUMFMT = '#,##0.00';
 // survives) — only column widths, merges, and number formats actually persist. So this sticks
 // to those: a merged title/period row, sized columns, and a real 2-decimal number format on
 // Hours rather than a raw float.
-const exportToExcel = (clientGroups, periodLabel) => {
-  const hasOriginal = clientGroups.some((g) =>
-    g.original_total_hrs_of_client != null ||
-    (g.service_pos ?? []).some((po) => po.original_hours != null || po.original_actual_hours != null)
-  );
+// clientGroups arrive already mapped to the active Hours basis (see basisGroups below), so the
+// single Hours column is that basis' figure; the header names the basis only in Original mode.
+const exportToExcel = (clientGroups, periodLabel, hoursSource) => {
   const header = [
     'Client',
     'Service PO',
-    'Hours',
-    ...(hasOriginal ? ['Original Hours'] : []),
+    hoursSource === HOURS_ORIGINAL ? 'Hours (Original)' : 'Hours',
   ];
   const aoa = [
     ['Client Service PO Hours Report'],
@@ -71,12 +66,10 @@ const exportToExcel = (clientGroups, periodLabel) => {
   // collapsing into a separate subtotal row, so the Client column stays a plain, filterable list.
   clientGroups.forEach((group) => {
     (group.service_pos ?? []).forEach((po) => {
-      const origHours = po.original_hours ?? po.original_actual_hours;
       aoa.push([
         group.client_name,
         po.service_po_name ?? '',
         Number(po.hours ?? po.actual_hours) || 0,
-        ...(hasOriginal ? [origHours != null ? Number(origHours) : ''] : []),
       ]);
     });
   });
@@ -85,10 +78,9 @@ const exportToExcel = (clientGroups, periodLabel) => {
   ws['!cols'] = [
     { wch: 30 },
     { wch: 38 },
-    { wch: 12 },
-    ...(hasOriginal ? [{ wch: 14 }] : []),
+    { wch: hoursSource === HOURS_ORIGINAL ? 16 : 12 },
   ];
-  const mergeEndCol = hasOriginal ? 3 : 2;
+  const mergeEndCol = 2;
   ws['!merges'] = [
     { s: { r: 0, c: 0 }, e: { r: 0, c: mergeEndCol } },
     { s: { r: 1, c: 0 }, e: { r: 1, c: mergeEndCol } },
@@ -99,10 +91,6 @@ const exportToExcel = (clientGroups, periodLabel) => {
   for (let r = HEADER_ROW + 1; r < aoa.length; r++) {
     const ref = XLSX.utils.encode_cell({ r, c: HOURS_COL });
     if (ws[ref]) ws[ref].z = HOURS_NUMFMT;
-    if (hasOriginal) {
-      const origRef = XLSX.utils.encode_cell({ r, c: 3 });
-      if (ws[origRef]) ws[origRef].z = HOURS_NUMFMT;
-    }
   }
 
   const wb = XLSX.utils.book_new();
@@ -140,7 +128,7 @@ const getField = (row, ...keys) => {
 // Lazily fetches the employee-level hours breakdown for one Service PO, only once that PO
 // row is expanded — reuses /reports/resource-allocation (already scoped by poId/month/year)
 // rather than a new endpoint, so this needs no backend change.
-const ServicePoEmployeeBreakdown = ({ poId, monthYear, hoursSource, buId, hasOriginal }) => {
+const ServicePoEmployeeBreakdown = ({ poId, monthYear, hoursSource, buId }) => {
   const { data, isFetching, isError } = useQuery({
     queryKey: ['clientServicePoHours', 'employeeBreakdown', poId, monthYear?.month, monthYear?.year, hoursSource, buId],
     queryFn: () => reportsApi.getResourceAllocation({
@@ -163,11 +151,10 @@ const ServicePoEmployeeBreakdown = ({ poId, monthYear, hoursSource, buId, hasOri
   if (isFetching) {
     return (
       <>
-        <div className={cn('hidden md:grid gap-2 px-4 py-2 text-xs text-muted-foreground border-t', getGridCols(hasOriginal))}>
+        <div className={cn('hidden md:grid gap-2 px-4 py-2 text-xs text-muted-foreground border-t', GRID_COLS)}>
           <span />
           <span style={{ paddingLeft: 28 }}>Loading employees…</span>
           <span />
-          {hasOriginal && <span />}
         </div>
         <div className="px-4 py-2 text-xs text-muted-foreground border-t md:hidden">Loading employees…</div>
       </>
@@ -178,11 +165,10 @@ const ServicePoEmployeeBreakdown = ({ poId, monthYear, hoursSource, buId, hasOri
     const message = isError ? 'Failed to load employee hours.' : 'No employee hours found.';
     return (
       <>
-        <div className={cn('hidden md:grid gap-2 px-4 py-2 text-xs text-muted-foreground border-t', getGridCols(hasOriginal))}>
+        <div className={cn('hidden md:grid gap-2 px-4 py-2 text-xs text-muted-foreground border-t', GRID_COLS)}>
           <span />
           <span style={{ paddingLeft: 28 }}>{message}</span>
           <span />
-          {hasOriginal && <span />}
         </div>
         <div className="px-4 py-2 text-xs text-muted-foreground border-t md:hidden">{message}</div>
       </>
@@ -191,22 +177,20 @@ const ServicePoEmployeeBreakdown = ({ poId, monthYear, hoursSource, buId, hasOri
 
   return rows.map((row, i) => {
     const employee = getField(row, 'full_name', 'employee_name', 'resource_name') ?? 'Unassigned';
-    const hours = getField(row, 'total_hours_logged', 'hours_logged', 'hours', 'time_in_hrs');
-    const origHours = getField(row, 'original_total_hours_logged', 'original_hours_logged', 'original_hours');
+    // One hours value per employee, picked by the Hours basis switch — never Adjusted and Original together.
+    const adjustedHours = getField(row, 'total_hours_logged', 'hours_logged', 'hours', 'time_in_hrs');
+    const hours = hoursSource === HOURS_ORIGINAL
+      ? (getField(row, 'original_total_hours_logged', 'original_hours_logged', 'original_hours') ?? adjustedHours)
+      : adjustedHours;
     return (
       <div key={i}>
-        <div className={cn('hidden md:grid gap-2 px-4 py-1.5 text-xs bg-muted/20 border-t', getGridCols(hasOriginal))}>
+        <div className={cn('hidden md:grid gap-2 px-4 py-1.5 text-xs bg-muted/20 border-t', GRID_COLS)}>
           <span />
           <span className="flex items-center truncate text-muted-foreground" style={{ paddingLeft: 28 }}>
             <span className="mr-1.5">└</span>
             <span className="truncate">{employee}</span>
           </span>
           <span className="text-right tabular-nums">{formatHours(Number(hours) || 0)}</span>
-          {hasOriginal && (
-            <span className="text-right tabular-nums text-muted-foreground">
-              {origHours != null ? formatHours(Number(origHours) || 0) : '—'}
-            </span>
-          )}
         </div>
         <div className="flex items-center justify-between gap-2 px-4 py-1.5 text-xs bg-muted/20 border-t md:hidden">
           <span className="flex min-w-0 items-center truncate text-muted-foreground">
@@ -215,11 +199,6 @@ const ServicePoEmployeeBreakdown = ({ poId, monthYear, hoursSource, buId, hasOri
           </span>
           <span className="shrink-0 tabular-nums">
             {formatHours(Number(hours) || 0)}
-            {hasOriginal && origHours != null && (
-              <span className="text-muted-foreground text-[10px] ml-1">
-                (orig: {formatHours(Number(origHours) || 0)})
-              </span>
-            )}
           </span>
         </div>
       </div>
@@ -228,6 +207,7 @@ const ServicePoEmployeeBreakdown = ({ poId, monthYear, hoursSource, buId, hasOri
 };
 
 const ClientServicePOHoursReport = () => {
+  const confirmExport = useExportConfirm();
   const [monthYear, setMonthYear] = useState({
     month: prevMonth.getMonth() + 1,
     year: prevMonth.getFullYear(),
@@ -243,14 +223,8 @@ const ClientServicePOHoursReport = () => {
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [collapsedClientIds, setCollapsedClientIds] = useState(() => new Set());
   const [expandedPoIds, setExpandedPoIds] = useState(() => new Set());
-  const canViewOriginal = useCanViewOriginalData();
   const [hoursSource, setHoursSource] = useState('M');
 
-  // Role no longer grants Original-data visibility (e.g. role reassigned mid-session) — force
-  // back to Modified, same as every other report.
-  useEffect(() => {
-    if (!canViewOriginal) setHoursSource('M');
-  }, [canViewOriginal]);
   // 'client' | 'servicePO' | 'hours'. 'client'/'hours' reorder the client groups; 'servicePO'
   // (and 'hours' too) also reorders each group's own service_pos rows.
   const [sortBy, setSortBy] = useState('client');
@@ -296,9 +270,25 @@ const ClientServicePOHoursReport = () => {
   const { data, isPending, isError, error } = useClientServicePOHours(params);
   const clientGroups = Array.isArray(data?.data) ? data.data : [];
 
+  // Map every group/PO to the active Hours basis once, so sorting, search totals, rendering and
+  // export all read the single `hours` / `total_hrs_of_client` figure — Adjusted and Original are
+  // never shown side by side. In Original mode the original_* twin wins, falling back to the
+  // plain field (correct whether or not the server already put original values there).
+  const basisGroups = useMemo(() => {
+    if (hoursSource !== HOURS_ORIGINAL) return clientGroups;
+    return clientGroups.map((group) => ({
+      ...group,
+      total_hrs_of_client: group.original_total_hrs_of_client ?? group.total_hrs_of_client,
+      service_pos: (group.service_pos ?? []).map((po) => ({
+        ...po,
+        hours: po.original_hours ?? po.original_actual_hours ?? po.hours ?? po.actual_hours,
+      })),
+    }));
+  }, [clientGroups, hoursSource]);
+
   const sortedClientGroups = useMemo(() => {
     const dir = sortOrder === 'asc' ? 1 : -1;
-    const groups = clientGroups.map((group) => ({
+    const groups = basisGroups.map((group) => ({
       ...group,
       service_pos: [...(group.service_pos ?? [])].sort((a, b) => {
         if (sortBy === 'servicePO') return dir * String(a.service_po_name ?? '').localeCompare(String(b.service_po_name ?? ''));
@@ -312,14 +302,7 @@ const ClientServicePOHoursReport = () => {
       return 0;
     });
     return groups;
-  }, [clientGroups, sortBy, sortOrder]);
-
-  const hasOriginal = useMemo(() => {
-    return clientGroups.some((g) =>
-      g.original_total_hrs_of_client != null ||
-      (g.service_pos ?? []).some((po) => po.original_hours != null || po.original_actual_hours != null)
-    );
-  }, [clientGroups]);
+  }, [basisGroups, sortBy, sortOrder]);
 
   // The API has no `search` query param, so this filters client-side over the already-fetched
   // (unpaginated) result set — matches on client name or Service PO name. A client-name match
@@ -338,25 +321,16 @@ const ClientServicePOHoursReport = () => {
         const total = clientMatches
           ? group.total_hrs_of_client
           : pos.reduce((sum, po) => sum + (Number(po.hours ?? po.actual_hours) || 0), 0);
-        const origTotal = clientMatches
-          ? group.original_total_hrs_of_client
-          : (group.original_total_hrs_of_client != null || pos.some((po) => (po.original_hours ?? po.original_actual_hours) != null))
-            ? pos.reduce((sum, po) => sum + (Number(po.original_hours ?? po.original_actual_hours) || 0), 0)
-            : undefined;
         return {
           ...group,
           service_pos: pos,
           total_hrs_of_client: total,
-          original_total_hrs_of_client: origTotal,
         };
       })
       .filter(Boolean);
   }, [sortedClientGroups, debouncedSearch]);
 
   const grandTotal = visibleClientGroups.reduce((sum, g) => sum + (Number(g.total_hrs_of_client) || 0), 0);
-  const originalGrandTotal = hasOriginal
-    ? visibleClientGroups.reduce((sum, g) => sum + (Number(g.original_total_hrs_of_client) || 0), 0)
-    : null;
   const errorMessage = isError ? extractApiError(error) : null;
   const showLoading = periodReady && isPending;
 
@@ -377,9 +351,11 @@ const ClientServicePOHoursReport = () => {
     statuses.length > 0,
     entityIds.length > 0,
     buIds.length > 0,
+    hoursSource !== HOURS_ADJUSTED,
   ].filter(Boolean).length;
 
   const clearFilters = () => {
+    setHoursSource(HOURS_ADJUSTED);
     setClientIds([]);
     setPoIds([]);
     setServiceTypeIds([]);
@@ -422,32 +398,13 @@ const ClientServicePOHoursReport = () => {
                 className="h-[clamp(1.875rem,2vw,2.25rem)] pl-9 w-full bg-white text-[clamp(0.75rem,0.85vw,0.875rem)]"
               />
             </div>
-            {canViewOriginal && (
-              <div className="flex items-center gap-0.5 p-0.5 rounded-xl bg-muted border shrink-0">
-                {[
-                  { value: 'O', label: 'Original' },
-                  { value: 'M', label: 'Published' },
-                ].map(({ value, label }) => (
-                  <button
-                    key={value}
-                    type="button"
-                    onClick={() => setHoursSource(value)}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-                      hoursSource === value ? 'bg-card shadow-sm text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground hover:text-foreground'
-                    }`}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-            )}
             <FilterToggleButton
               isOpen={filtersOpen}
               onToggle={() => setFiltersOpen((p) => !p)}
               activeCount={activeFilterCount}
             />
             {visibleClientGroups.length > 0 && (
-              <Button variant="outline" size="sm" className="h-[clamp(1.875rem,2vw,2.25rem)]" onClick={() => exportToExcel(visibleClientGroups, periodLabel)}>
+              <Button variant="outline" size="sm" className="h-[clamp(1.875rem,2vw,2.25rem)]" onClick={() => confirmExport(() => exportToExcel(visibleClientGroups, periodLabel, hoursSource))}>
                 <Download className="mr-1.5 h-4 w-4" />Export Excel
               </Button>
             )}
@@ -477,6 +434,8 @@ const ClientServicePOHoursReport = () => {
                 className="w-full"
               />
             </div>
+
+            <HoursBasisToggle value={hoursSource} onChange={setHoursSource} labelClassName="text-xs" />
 
             <div className="flex flex-col gap-1.5">
               <Label className="text-xs">Client</Label>
@@ -565,13 +524,10 @@ const ClientServicePOHoursReport = () => {
           taller and letting the user scroll to it. This report has no internally-scrolling table
           area — it's a content-driven grouped list — so it should never shrink at all. */}
       <div className="hidden md:block shrink-0 rounded-lg border overflow-hidden">
-        <div className={cn('grid gap-2 bg-muted/50 px-4 py-2.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground border-b', getGridCols(hasOriginal))}>
+        <div className={cn('grid gap-2 bg-muted/50 px-4 py-2.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground border-b', GRID_COLS)}>
           <SortableHeader label="Client" column="client" sortBy={sortBy} sortOrder={sortOrder} onSort={handleSort} />
           <SortableHeader label="Service PO" column="servicePO" sortBy={sortBy} sortOrder={sortOrder} onSort={handleSort} />
           <SortableHeader label="Hours" column="hours" sortBy={sortBy} sortOrder={sortOrder} onSort={handleSort} align="right" />
-          {hasOriginal && (
-            <span className="text-right">Original Hours</span>
-          )}
         </div>
 
         {!periodReady && (
@@ -602,7 +558,7 @@ const ClientServicePOHoursReport = () => {
                 onClick={() => toggleClient(clientKey)}
                 className={cn(
                   'w-full grid gap-2 items-center px-4 py-2.5 text-left border-l-2 border-l-primary/40 hover:bg-muted/30 transition-colors',
-                  getGridCols(hasOriginal)
+                  GRID_COLS
                 )}
               >
                 <span className="flex items-center gap-2 font-semibold truncate">
@@ -619,11 +575,6 @@ const ClientServicePOHoursReport = () => {
                 <span className="text-right font-semibold tabular-nums">
                   {!isExpanded && formatHours(group.total_hrs_of_client)}
                 </span>
-                {hasOriginal && (
-                  <span className="text-right font-semibold tabular-nums text-muted-foreground">
-                    {!isExpanded && (group.original_total_hrs_of_client != null ? formatHours(group.original_total_hrs_of_client) : '—')}
-                  </span>
-                )}
               </button>
 
               <AnimatePresence initial={false}>
@@ -644,7 +595,7 @@ const ClientServicePOHoursReport = () => {
                             onClick={() => togglePo(po.service_po_id)}
                             className={cn(
                               'w-full grid gap-2 px-4 py-2 text-sm text-left bg-muted/10 border-t hover:bg-muted/20 transition-colors',
-                              getGridCols(hasOriginal)
+                              GRID_COLS
                             )}
                           >
                             <span className="text-muted-foreground truncate text-xs">{group.client_name}</span>
@@ -658,13 +609,6 @@ const ClientServicePOHoursReport = () => {
                               <span className="truncate">{po.service_po_name}</span>
                             </span>
                             <span className="text-right tabular-nums">{formatHours(po.hours ?? po.actual_hours)}</span>
-                            {hasOriginal && (
-                              <span className="text-right tabular-nums text-muted-foreground">
-                                {(po.original_hours ?? po.original_actual_hours) != null
-                                  ? formatHours(po.original_hours ?? po.original_actual_hours)
-                                  : '—'}
-                              </span>
-                            )}
                           </button>
 
                           <AnimatePresence initial={false}>
@@ -681,7 +625,6 @@ const ClientServicePOHoursReport = () => {
                                   monthYear={monthYear}
                                   hoursSource={hoursSource}
                                   buId={ALL_BUS}
-                                  hasOriginal={hasOriginal}
                                 />
                               </motion.div>
                             )}
@@ -689,15 +632,10 @@ const ClientServicePOHoursReport = () => {
                         </div>
                       );
                     })}
-                    <div className={cn('grid gap-2 px-4 py-2 text-sm font-semibold bg-muted/20 border-t', getGridCols(hasOriginal))}>
+                    <div className={cn('grid gap-2 px-4 py-2 text-sm font-semibold bg-muted/20 border-t', GRID_COLS)}>
                       <span className="pl-6">Total</span>
                       <span />
                       <span className="text-right tabular-nums">{formatHours(group.total_hrs_of_client)}</span>
-                      {hasOriginal && (
-                        <span className="text-right tabular-nums text-muted-foreground">
-                          {group.original_total_hrs_of_client != null ? formatHours(group.original_total_hrs_of_client) : '—'}
-                        </span>
-                      )}
                     </div>
                   </motion.div>
                 )}
@@ -750,11 +688,6 @@ const ClientServicePOHoursReport = () => {
                     </span>
                     <span className="shrink-0 text-sm font-semibold tabular-nums">
                       Total {formatHours(group.total_hrs_of_client)}
-                      {hasOriginal && group.original_total_hrs_of_client != null && (
-                        <span className="text-muted-foreground text-xs ml-1.5 font-normal">
-                          (Orig: {formatHours(group.original_total_hrs_of_client)})
-                        </span>
-                      )}
                     </span>
                   </button>
 
@@ -786,11 +719,6 @@ const ClientServicePOHoursReport = () => {
                                 </span>
                                 <div className="shrink-0 text-right">
                                   <span className="font-medium tabular-nums block">{formatHours(po.hours ?? po.actual_hours)}</span>
-                                  {hasOriginal && (po.original_hours ?? po.original_actual_hours) != null && (
-                                    <span className="text-muted-foreground text-xs block">
-                                      Orig: {formatHours(po.original_hours ?? po.original_actual_hours)}
-                                    </span>
-                                  )}
                                 </div>
                               </button>
 
@@ -808,7 +736,6 @@ const ClientServicePOHoursReport = () => {
                                       monthYear={monthYear}
                                       hoursSource={hoursSource}
                                       buId={ALL_BUS}
-                                      hasOriginal={hasOriginal}
                                     />
                                   </motion.div>
                                 )}
@@ -820,11 +747,6 @@ const ClientServicePOHoursReport = () => {
                           <span>Total</span>
                           <span className="tabular-nums">
                             {formatHours(group.total_hrs_of_client)}
-                            {hasOriginal && group.original_total_hrs_of_client != null && (
-                              <span className="text-muted-foreground text-xs ml-1.5 font-normal">
-                                (Orig: {formatHours(group.original_total_hrs_of_client)})
-                              </span>
-                            )}
                           </span>
                         </div>
                       </motion.div>
@@ -842,11 +764,6 @@ const ClientServicePOHoursReport = () => {
           <span className="text-sm font-semibold tabular-nums">
             Grand Total: {formatHours(grandTotal)}
           </span>
-          {hasOriginal && originalGrandTotal != null && (
-            <span className="text-sm font-semibold tabular-nums text-muted-foreground">
-              Original Grand Total: {formatHours(originalGrandTotal)}
-            </span>
-          )}
         </div>
       )}
     </div>

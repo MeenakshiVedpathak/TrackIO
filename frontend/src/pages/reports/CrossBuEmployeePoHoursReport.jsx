@@ -2,7 +2,6 @@ import { useState, useEffect, useMemo } from 'react';
 import { createColumnHelper } from '@tanstack/react-table';
 import { ChevronDown, ChevronUp, ChevronsUpDown, Download, AlertCircle } from 'lucide-react';
 import { useCrossBuEmployeePoHours } from '@/hooks/useReports';
-import { useCanViewOriginalData } from '@/hooks/usePermissions';
 import { reportsApi } from '@/api/reports.api';
 import { useActiveEmployees } from '@/hooks/useEmployees';
 import { useActiveClients } from '@/hooks/useClients';
@@ -20,6 +19,8 @@ import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import SearchInput from '@/components/common/SearchInput';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { Badge } from '@/components/ui/badge';
@@ -90,6 +91,7 @@ const StatPill = ({ label, value, tone }) => (
 );
 
 const CrossBuEmployeePoHoursReport = () => {
+  const confirmExport = useExportConfirm();
   const { error: showError } = useNotification();
 
   const [periodMode, setPeriodMode] = useState('month');
@@ -130,11 +132,7 @@ const CrossBuEmployeePoHoursReport = () => {
   const [sortOrder, setSortOrder] = useState('desc');
   const [isExporting, setIsExporting] = useState(false);
   const [hoursSource, setHoursSource] = useState('M');
-  const canViewOriginal = useCanViewOriginalData();
 
-  useEffect(() => {
-    if (!canViewOriginal) setHoursSource('M');
-  }, [canViewOriginal]);
 
   const empScope = useMemo(() => ({ entityIds: [], businessUnitIds: employeeBuValue }), [employeeBuValue]);
   const poScope = useMemo(() => ({ entityIds: [], businessUnitIds: poBuValue }), [poBuValue]);
@@ -228,6 +226,10 @@ const CrossBuEmployeePoHoursReport = () => {
 
   const records = Array.isArray(data?.data?.records) ? data.data.records : [];
   const totals = data?.data?.totals ?? {};
+  // Totals carry both bases side by side (`original_<key>` / `adjusted_<key>`); show the active one.
+  const basisTotal = (key) => (hoursSource === HOURS_ORIGINAL
+    ? (totals[`original_${key}`] ?? totals[key])
+    : (totals[`adjusted_${key}`] ?? totals[key]));
   const period = data?.data?.period ?? null;
   const meta = data?.meta ?? {};
   const showLoading = periodReady && isPending;
@@ -245,9 +247,11 @@ const CrossBuEmployeePoHoursReport = () => {
     poBuValue.length > 0,
     workType !== 'all',
     approvalStatus.length > 0,
+    hoursSource !== HOURS_ADJUSTED,
   ].filter(Boolean).length;
 
   const clearFilters = () => {
+    setHoursSource(HOURS_ADJUSTED);
     setEmployeeIds([]);
     setEmployeeBuValue([]);
     setClientIds([]);
@@ -345,42 +349,32 @@ const CrossBuEmployeePoHoursReport = () => {
         return <span className="block truncate text-sm" title={r.po_bu}>{r.po_bu || '—'}</span>;
       },
     }),
+    // One Hours column, its figure picked by the Hours basis switch in the Filters panel — the
+    // Adjusted (adjusted_hours) and Original (logged_hours, as entered) values are never shown
+    // side by side. In Adjusted mode a null adjusted_hours (not yet synced) renders as an em dash
+    // rather than falling back to logged_hours, so "not synced" stays visibly distinct from
+    // "synced with 0 adjusted hours".
     columnHelper.display({
       id: 'hours',
       header: () => (
         <Tooltip>
           <TooltipTrigger asChild>
-            <span><SortableHeader label="Original Hours" column={SORTABLE.HOURS} sortBy={sortBy} sortOrder={sortOrder} onSort={handleSort} align="right" /></span>
+            <span><SortableHeader label="Hours" column={SORTABLE.HOURS} sortBy={sortBy} sortOrder={sortOrder} onSort={handleSort} align="right" /></span>
           </TooltipTrigger>
-          <TooltipContent>Original hours as entered by the employee (before any adjustment)</TooltipContent>
+          <TooltipContent>
+            {hoursSource === HOURS_ORIGINAL
+              ? 'Original hours as entered by the employee (before any adjustment)'
+              : 'Hours after monthly-cap adjustment (synced work only)'}
+          </TooltipContent>
         </Tooltip>
       ),
       size: 110,
       meta: { align: 'right' },
       enableSorting: false,
-      cell: ({ row }) => (
-        <span className="tabular-nums">{formatHours(row.original.logged_hours)}</span>
-      ),
-    }),
-    // Always-visible, never toggled by the Adjusted/Original source switch above (hoursSource) —
-    // that switch changes which figure the "Hours" column itself shows; this is a separate,
-    // dedicated column for the new adjusted_hours field, null (not yet synced) rendered as an
-    // em dash rather than falling back to logged_hours, so "not synced" stays visibly distinct
-    // from "synced with 0 adjusted hours".
-    columnHelper.display({
-      id: 'adjusted_hours',
-      header: () => (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <span className="block text-right font-medium">Adjusted Hours</span>
-          </TooltipTrigger>
-          <TooltipContent>Hours after monthly-cap adjustment (synced work only)</TooltipContent>
-        </Tooltip>
-      ),
-      size: 130,
-      meta: { align: 'right' },
-      enableSorting: false,
       cell: ({ row }) => {
+        if (hoursSource === HOURS_ORIGINAL) {
+          return <span className="tabular-nums">{formatHours(row.original.logged_hours)}</span>;
+        }
         const val = row.original.adjusted_hours;
         if (val == null) {
           return (
@@ -415,7 +409,7 @@ const CrossBuEmployeePoHoursReport = () => {
         return r.month && r.year ? <span className="whitespace-nowrap text-sm">{String(r.month).padStart(2, '0')}/{r.year}</span> : '—';
       },
     }),
-  ], [sortBy, sortOrder]);
+  ], [sortBy, sortOrder, hoursSource]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -432,7 +426,7 @@ const CrossBuEmployeePoHoursReport = () => {
             />
             <FilterToggleButton isOpen={filtersOpen} onToggle={() => setFiltersOpen((p) => !p)} activeCount={activeFilterCount} />
             {periodReady && records.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport} disabled={isExporting}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)} disabled={isExporting}>
                 <Download className="h-4 w-4" />{isExporting ? 'Exporting…' : 'Export Excel'}
               </Button>
             )}
@@ -455,23 +449,6 @@ const CrossBuEmployeePoHoursReport = () => {
             ))}
           </TabsList>
         </Tabs>
-        {canViewOriginal && (
-          <div className="flex items-center gap-1 rounded-lg border bg-muted/40 p-0.5 text-xs">
-            {['M', 'O'].map((val) => (
-              <button
-                key={val}
-                type="button"
-                onClick={() => setHoursSource(val)}
-                className={cn(
-                  'rounded-md px-3 py-1 font-semibold transition-colors',
-                  hoursSource === val ? 'bg-card shadow-sm text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground hover:text-foreground'
-                )}
-              >
-                {val === 'O' ? 'Original' : 'Adjusted'}
-              </button>
-            ))}
-          </div>
-        )}
       </div>
 
       <FilterPanel isOpen={filtersOpen} onClear={clearFilters} showClear={activeFilterCount > 0}>
@@ -500,6 +477,8 @@ const CrossBuEmployeePoHoursReport = () => {
             <DateRangePicker value={dateRange} onChange={(v) => { setDateRange(v); setPage(1); }} className="w-full" />
           )}
         </div>
+
+        <HoursBasisToggle value={hoursSource} onChange={setHoursSource} labelClassName="text-xs" />
 
         {/* Employee BU and Service PO BU are two separate BusinessUnitFilter instances — never a
             single shared control — since the backend treats them as independent axes
@@ -584,23 +563,22 @@ const CrossBuEmployeePoHoursReport = () => {
                 ? `${totals.total_employees ?? 0} (${totals.cross_bu_employee_count} cross-BU)`
                 : (totals.total_employees ?? 0)}
             />
-            <StatPill tone="violet" label="Total Hours" value={formatHours(totals.total_hours)} />
-            <StatPill tone="blue" label="Adjusted Hours" value={formatHours(totals.adjusted_total_hours ?? 0)} />
+            <StatPill tone="violet" label="Total Hours" value={formatHours(basisTotal('total_hours') ?? 0)} />
             <StatPill
               tone="emerald"
               label="Own BU"
               value={totals.own_bu_percent != null
-                ? `${formatHours(totals.own_bu_hours)} (${formatPercentage(totals.own_bu_percent, 2)})`
-                : formatHours(totals.own_bu_hours)}
+                ? `${formatHours(basisTotal('own_bu_hours'))} (${formatPercentage(totals.own_bu_percent, 2)})`
+                : formatHours(basisTotal('own_bu_hours'))}
             />
             <StatPill
               tone="amber"
               label="Cross BU"
               value={totals.cross_bu_percent != null
-                ? `${formatHours(totals.cross_bu_hours)} (${formatPercentage(totals.cross_bu_percent, 2)})`
-                : formatHours(totals.cross_bu_hours)}
+                ? `${formatHours(basisTotal('cross_bu_hours'))} (${formatPercentage(totals.cross_bu_percent, 2)})`
+                : formatHours(basisTotal('cross_bu_hours'))}
             />
-            <StatPill tone="slate" label="Not Classified" value={formatHours(totals.unclassified_hours)} />
+            <StatPill tone="slate" label="Not Classified" value={formatHours(basisTotal('unclassified_hours'))} />
           </div>
 
 

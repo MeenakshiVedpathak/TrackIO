@@ -2,7 +2,6 @@ import { useState, useMemo, useEffect } from 'react';
 import * as XLSX from 'xlsx';
 import { Download } from 'lucide-react';
 import { useServicePOResourceReport, useResourceAllocationAllRows } from '@/hooks/useReports';
-import { useCanViewOriginalData } from '@/hooks/usePermissions';
 import { reportsApi } from '@/api/reports.api';
 import { useActiveEmployees } from '@/hooks/useEmployees';
 import { useActiveServicePOs } from '@/hooks/useServicePOs';
@@ -11,11 +10,13 @@ import { useActiveServiceCategories } from '@/hooks/useServiceCategories';
 import { useActiveClients } from '@/hooks/useClients';
 import { formatMonthYear } from '@/utils/formatters';
 import PageHeader from '@/components/common/PageHeader';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
 import SearchInput from '@/components/common/SearchInput';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
 import { Button } from '@/components/ui/button';
 import { MultiSelect } from '@/components/ui/multi-select';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
@@ -53,6 +54,9 @@ const getField = (row, ...keys) => {
 
 const getHours = (row) => getField(row, 'total_hours_logged', 'hours_logged', 'hours', 'time_in_hrs');
 const getOriginalHours = (row) => getField(row, 'original_actual_hours', 'original_total_hours_logged', 'original_hours_logged', 'original_hours', 'original_time_in_hrs');
+// One hours value per row, picked by the Hours basis switch — Adjusted and Original are never shown together.
+const getActiveHours = (row, hoursSource) =>
+  hoursSource === HOURS_ORIGINAL ? (getOriginalHours(row) ?? getHours(row)) : getHours(row);
 
 // The columns worth searching, each as the same key-alias list groupRows/exportToExcel use —
 // the API's field names vary by backend version, so search has to look through exactly the
@@ -95,10 +99,8 @@ const groupRows = (rows) => {
 
 const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 
-const exportToExcel = (rows, month, year) => {
+const exportToExcel = (rows, month, year, hoursSource) => {
   const monthLabel = MONTH_NAMES[(month - 1)] ?? month;
-
-  const hasOriginal = rows.some((r) => getOriginalHours(r) != null);
 
   const header = [
     'Sr. No.',
@@ -106,8 +108,7 @@ const exportToExcel = (rows, month, year) => {
     'Service PO Summary',
     'Service Type',
     'Resource',
-    'Time in Hrs',
-    ...(hasOriginal ? ['Original Time in Hrs'] : []),
+    hoursSource === HOURS_ORIGINAL ? 'Time in Hrs (Original)' : 'Time in Hrs',
     'Remarks',
   ];
   let srNo = 1;
@@ -117,8 +118,7 @@ const exportToExcel = (rows, month, year) => {
   groups.forEach((group) => {
     group.rows.forEach((row, i) => {
       const employee  = getField(row, 'full_name', 'employee_name', 'resource_name');
-      const hours     = getHours(row);
-      const origHours = getOriginalHours(row);
+      const hours     = getActiveHours(row, hoursSource);
       const remarks   = getField(row, 'remarks') ?? '';
 
       dataRows.push([
@@ -128,7 +128,6 @@ const exportToExcel = (rows, month, year) => {
         i === 0 ? (group.service_type ?? '') : '',
         employee ?? '',
         hours != null ? Number(hours) : '',
-        ...(hasOriginal ? [origHours != null ? Number(origHours) : ''] : []),
         remarks,
       ]);
     });
@@ -142,6 +141,7 @@ const exportToExcel = (rows, month, year) => {
 
 // ─── main component ──────────────────────────────────────────────────────────
 const ServicePOResource = () => {
+  const confirmExport = useExportConfirm();
   const [monthYear, setMonthYear] = useState(() => {
     const now = new Date();
     const prevMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
@@ -152,12 +152,8 @@ const ServicePOResource = () => {
   const [typeIds, setTypeIds] = useState([]);
   const [poIds, setPoIds] = useState([]);
   const [clientIds, setClientIds] = useState([]);
-  const canViewOriginal = useCanViewOriginalData();
   const [hoursSource, setHoursSource] = useState('M');
 
-  useEffect(() => {
-    if (!canViewOriginal) setHoursSource('M');
-  }, [canViewOriginal]);
 
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(1);
@@ -165,7 +161,8 @@ const ServicePOResource = () => {
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [entityIds, setEntityIds] = useState([]);
   const [buIds, setBuIds] = useState([]);
-  const [exporting, setExporting] = useState(false);  const scope = useMemo(() => ({ entityIds, businessUnitIds: buIds }), [entityIds, buIds]);
+  const [exporting, setExporting] = useState(false);
+  const scope = useMemo(() => ({ entityIds, businessUnitIds: buIds }), [entityIds, buIds]);
 
 
   const { data: activeEmployees = [] } = useActiveEmployees(undefined, scope);
@@ -267,7 +264,7 @@ const ServicePOResource = () => {
       const all = isSearching
         ? searchedRows
         : (fullRows ?? await reportsApi.fetchAllResourceAllocationRows(params));
-      exportToExcel(all, monthYear?.month, monthYear?.year);
+      exportToExcel(all, monthYear?.month, monthYear?.year, hoursSource);
     } finally {
       setExporting(false);
     }
@@ -276,17 +273,9 @@ const ServicePOResource = () => {
   const monthLabel  = monthYear ? formatMonthYear(monthYear.month, monthYear.year) : '';
   const allRecords  = isSearching ? searchedRows : (fullRows ?? rows);
   const totalHours  = allRecords.reduce((sum, r) => {
-    const h = getHours(r);
+    const h = getActiveHours(r, hoursSource);
     return sum + (h ? Number(h) : 0);
   }, 0);
-  const totalOriginalHours = allRecords.reduce((sum, r) => {
-    const h = getOriginalHours(r);
-    return sum + (h ? Number(h) : 0);
-  }, 0);
-  const hasOriginal = useMemo(
-    () => (fullRows ?? rows).some((r) => getOriginalHours(r) != null),
-    [fullRows, rows]
-  );
 
   const activeFilterCount = [
     entityIds.length > 0 ? 1 : 0,
@@ -296,6 +285,7 @@ const ServicePOResource = () => {
     typeIds.length > 0 ? 1 : 0,
     poIds.length > 0 ? 1 : 0,
     clientIds.length > 0 ? 1 : 0,
+    hoursSource !== HOURS_ADJUSTED ? 1 : 0,
   ].reduce((a, b) => a + b, 0);
 
   const clearFilters = () => {
@@ -306,6 +296,7 @@ const ServicePOResource = () => {
     setTypeIds([]);
     setPoIds([]);
     setClientIds([]);
+    setHoursSource(HOURS_ADJUSTED);
     setPage(1);
   };
 
@@ -315,25 +306,6 @@ const ServicePOResource = () => {
         title="Service PO vs Resource"
         actions={
           <div className="flex flex-wrap items-center gap-2">
-            {canViewOriginal && (
-              <div className="flex items-center gap-0.5 p-0.5 rounded-xl bg-muted border shrink-0">
-                {[
-                  { value: 'O', label: 'Original' },
-                  { value: 'M', label: 'Published' },
-                ].map(({ value, label }) => (
-                  <button
-                    key={value}
-                    type="button"
-                    onClick={() => { setHoursSource(value); setPage(1); }}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-                      hoursSource === value ? 'bg-card shadow-sm text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground hover:text-foreground'
-                    }`}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-            )}
             <SearchInput
               value={search}
               onChange={(e) => { setSearch(e.target.value); setPage(1); }}
@@ -346,7 +318,7 @@ const ServicePOResource = () => {
               activeCount={activeFilterCount}
             />
             {visibleRows.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport} disabled={exporting}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)} disabled={exporting}>
                 <Download className="h-4 w-4" />{exporting ? 'Exporting…' : 'Export Excel'}
               </Button>
             )}
@@ -375,6 +347,8 @@ const ServicePOResource = () => {
               className="w-full"
             />
           </div>
+
+          <HoursBasisToggle value={hoursSource} onChange={(v) => { setHoursSource(v); setPage(1); }} />
 
           <div className="flex flex-col gap-1.5">
             <Label className="text-xs font-medium">Client</Label>
@@ -492,7 +466,6 @@ const ServicePOResource = () => {
                 <TableHead className="w-[150px]">Service Type</TableHead>
                 <TableHead className="min-w-[180px]">Resource</TableHead>
                 <TableHead className="w-[110px] text-right">Time (hrs)</TableHead>
-                {hasOriginal && <TableHead className="w-[160px] text-right whitespace-nowrap">Original Time (hrs)</TableHead>}
                 <TableHead className="w-[160px]">Remarks</TableHead>
               </TableRow>
             </TableHeader>
@@ -502,8 +475,7 @@ const ServicePOResource = () => {
                   const isFirst    = ri === 0;
                   const rowCount   = group.rows.length;
                   const employee   = getField(row, 'employee_name', 'full_name', 'resource_name');
-                  const hours      = getHours(row);
-                  const origHours  = getOriginalHours(row);
+                  const hours      = getActiveHours(row, hoursSource);
                   const remarks    = getField(row, 'remarks');
 
                   return (
@@ -557,16 +529,6 @@ const ServicePOResource = () => {
                           <span className="text-muted-foreground">—</span>
                         )}
                       </TableCell>
-                      {/* Original Hours */}
-                      {hasOriginal && (
-                        <TableCell className="text-right">
-                          {origHours != null ? (
-                            <span className="tabular-nums font-medium text-muted-foreground">{Number(origHours).toFixed(1)}</span>
-                          ) : (
-                            <span className="text-muted-foreground">—</span>
-                          )}
-                        </TableCell>
-                      )}
                       {/* Remarks */}
                       <TableCell className="text-muted-foreground">
                         {remarks || '—'}
@@ -600,8 +562,7 @@ const ServicePOResource = () => {
                 <div className="divide-y">
                   {group.rows.map((row, ri) => {
                     const employee = getField(row, 'employee_name', 'full_name', 'resource_name');
-                    const hours = getHours(row);
-                    const origHours = getOriginalHours(row);
+                    const hours = getActiveHours(row, hoursSource);
                     const remarks = getField(row, 'remarks');
                     return (
                       <div key={ri} className="flex items-center justify-between gap-2 p-3.5">
@@ -617,11 +578,6 @@ const ServicePOResource = () => {
                           <span className="text-sm font-semibold tabular-nums">
                             {hours != null ? Number(hours).toFixed(1) : '—'}
                           </span>
-                          {hasOriginal && (
-                            <div className="text-xs text-muted-foreground tabular-nums">
-                              Orig: {origHours != null ? Number(origHours).toFixed(1) : '—'}
-                            </div>
-                          )}
                         </div>
                       </div>
                     );

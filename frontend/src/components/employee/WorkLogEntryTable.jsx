@@ -2,12 +2,14 @@ import {
   useMemo, useState, useEffect, useLayoutEffect, useRef,
 } from 'react';
 import {
-  ChevronUp, ChevronDown, Folder, Minus, Plus, UnfoldVertical, FoldVertical,
+  ChevronUp, ChevronDown, Folder, Minus, Plus, UnfoldVertical, FoldVertical, Lock,
 } from 'lucide-react';
 import { Card } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Textarea } from '@/components/ui/textarea';
 import EmptyState from '@/components/common/EmptyState';
+import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
+import { APPROVED_LOCK_TOOLTIP } from '@/utils/approvedWorkLog';
 import { cn } from '@/utils/cn';
 import { formatHoursMinutes, parseHourMinuteInput, formatHourMinuteValue, sumHours } from '@/utils/formatters';
 import { DAILY_HOURS_CAP } from './WorkLogEntryModal';
@@ -132,6 +134,24 @@ const HourStepper = ({ value, onChange, disabled, hoursCap = DAILY_HOURS_CAP }) 
   );
 };
 
+// Shown on a Service PO (and its rows) that already has an approved log for the selected date —
+// those lines are read-only until the approver reverts them. `span` (not `button`) as the trigger so
+// it can sit inside the folder header's own button without nesting interactive elements.
+const ApprovedLockBadge = ({ label = 'Approved' }) => (
+  <Tooltip>
+    <TooltipTrigger asChild>
+      <span
+        className="inline-flex shrink-0 items-center gap-0.5 rounded-full bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400"
+        aria-label={APPROVED_LOCK_TOOLTIP}
+      >
+        <Lock className="h-2.5 w-2.5" />
+        {label}
+      </span>
+    </TooltipTrigger>
+    <TooltipContent>{APPROVED_LOCK_TOOLTIP}</TooltipContent>
+  </Tooltip>
+);
+
 // One Service PO folder — its own row plus every hierarchy node beneath it (Parent/Child,
 // indented, "Task / Feature" being the node's name since our data has no separate module
 // concept). Open/closed is controlled by the parent (see collapsedGroupKeys) so Expand All /
@@ -180,6 +200,7 @@ const ProjectGroup = ({
           <Folder className="h-3 w-3" />
         </span>
         <span className="flex-1 truncate text-xs font-semibold" title={poRow.label}>{poRow.label}</span>
+        {poRow.lockedByDay?.[day] && <ApprovedLockBadge />}
         <span className="text-xs font-semibold text-primary">{formatHoursMinutes(groupTotal)}</span>
         {isOpen ? <ChevronUp className="h-3.5 w-3.5 text-muted-foreground" /> : <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />}
       </button>
@@ -204,7 +225,9 @@ const ProjectGroup = ({
             // parent's own hours on top of the children already carrying them. Expand to edit.
             const isRolledUp = hasChildren && isRowCollapsed;
             const value = isRolledUp ? subtreeValueOf(row) : cellValueOf(row);
-            const canEditRow = row.editable && isPastOrToday && !isRolledUp;
+            // Per PO per date: any approved line locks every row of that PO for this date.
+            const isLocked = !!row.lockedByDay?.[day];
+            const canEditRow = row.editable && isPastOrToday && !isRolledUp && !isLocked;
             const descriptionValue = descriptionValueOf(row);
 
             return (
@@ -248,6 +271,7 @@ const ProjectGroup = ({
                         </button>
                       )}
                       <span className="truncate" title={row.label}>{row.label}</span>
+                      {row.approvedByDay?.[day] && row.depth !== 0 && <ApprovedLockBadge />}
                       {isDirty && <span className="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-amber-400" title="Unsaved change" />}
                     </span>
                   </div>
@@ -341,22 +365,51 @@ const WorkLogEntryTable = ({
     });
   }, [topLevelRows]);
 
+  // Every descendant rowKey of a node (children, grandchildren, …).
+  const descendantKeysOf = (rowKey) => {
+    const keys = [];
+    const stack = [...(childrenByParent.get(rowKey) ?? [])];
+    while (stack.length) {
+      const child = stack.pop();
+      keys.push(child.rowKey);
+      stack.push(...(childrenByParent.get(child.rowKey) ?? []));
+    }
+    return keys;
+  };
+
+  // Expanding a node opens its WHOLE subtree, not just one level — otherwise a node collapsed by
+  // Collapse All (or earlier) keeps its own sub-tasks folded, and each level has to be opened one
+  // click at a time. Collapsing only folds the node itself (its subtree is hidden either way).
   const toggleRowCollapse = (rowKey) => {
     setCollapsedKeys((prev) => {
       const next = new Set(prev);
-      if (next.has(rowKey)) next.delete(rowKey);
-      else next.add(rowKey);
+      if (next.has(rowKey)) {
+        next.delete(rowKey);
+        descendantKeysOf(rowKey).forEach((key) => next.delete(key));
+      } else {
+        next.add(rowKey);
+      }
       return next;
     });
   };
 
+  // Opening a Service PO folder likewise shows its full hierarchy, every sub-task included.
   const toggleGroupOpen = (rowKey) => {
+    const opening = collapsedGroupKeys.has(rowKey);
     setCollapsedGroupKeys((prev) => {
       const next = new Set(prev);
       if (next.has(rowKey)) next.delete(rowKey);
       else next.add(rowKey);
       return next;
     });
+    if (opening) {
+      setCollapsedKeys((prev) => {
+        const next = new Set(prev);
+        next.delete(rowKey);
+        descendantKeysOf(rowKey).forEach((key) => next.delete(key));
+        return next;
+      });
+    }
   };
 
   const expandAll = () => {

@@ -14,12 +14,14 @@ import { downloadBlob } from '@/utils/download';
 import { ROLE_NAMES } from '@/constants/roleHierarchy';
 import { formatCurrency } from '@/utils/formatters';
 import PageHeader from '@/components/common/PageHeader';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import EmptyState from '@/components/common/EmptyState';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
 import SearchInput from '@/components/common/SearchInput';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter from '@/components/common/EntityFilter';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
 import MobilePagination from '@/components/common/MobilePagination';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
@@ -98,6 +100,10 @@ const formatPercent2dp = (value) => {
   return Number.isNaN(n) ? '—' : `${n.toFixed(2)}%`;
 };
 
+// One value per metric, chosen by the Hours basis switch — never Adjusted and Original side by
+// side. In Original mode read the original* twin (falling back to the plain field).
+const pickBasis = (obj, field, originalField, isOriginal) => (isOriginal ? (obj?.[originalField] ?? obj?.[field]) : obj?.[field]);
+
 const th = (...cls) =>
   cn('px-2.5 py-2 text-left text-xs font-semibold border-r border-border whitespace-nowrap last:border-r-0', ...cls);
 const td = (...cls) =>
@@ -127,6 +133,7 @@ const SortableHeader = ({ label, column, sortBy, sortOrder, onSort, align }) => 
 // month-group columns (Hours/Logged Hrs/Projection %/Actual %/Contribution per month), sticky
 // Emp Code/Emp Name, server-side Excel export preserving the current filters and month range.
 const ResourceCostUtilizationReport = () => {
+  const confirmExport = useExportConfirm();
   const { error: showError } = useNotification();
   const [fromMonthYear, setFromMonthYear] = useState({ month: defaultFrom.getMonth() + 1, year: defaultFrom.getFullYear() });
   const [toMonthYear, setToMonthYear] = useState({ month: now.getMonth() + 1, year: now.getFullYear() });
@@ -140,6 +147,8 @@ const ResourceCostUtilizationReport = () => {
   const [poIds, setPoIds] = useState([]);
   const [pmIds, setPmIds] = useState([]);
   const [search, setSearch] = useState('');
+  const [hoursSource, setHoursSource] = useState(HOURS_ADJUSTED);
+  const isOriginal = hoursSource === HOURS_ORIGINAL;
 
   const [sortBy, setSortBy] = useState(SORTABLE.EMPLOYEE_NAME);
   const [sortOrder, setSortOrder] = useState('ASC');
@@ -168,6 +177,8 @@ const ResourceCostUtilizationReport = () => {
     && (toMonthYear.year * 12 + toMonthYear.month) >= (fromMonthYear.year * 12 + fromMonthYear.month);
 
   const params = {
+    // Original basis: the server then sorts, ranks and totals on original hours too.
+    ...(hoursSource === HOURS_ORIGINAL && { hoursSource: 'O' }),
     startMonth: fromMonthYear.month,
     startYear: fromMonthYear.year,
     endMonth: toMonthYear.month,
@@ -215,11 +226,13 @@ const ResourceCostUtilizationReport = () => {
   const activeFilterCount = [
     entityIds.length > 0, buIds.length > 0, employeeIds.length > 0, clientIds.length > 0,
     projectIds.length > 0, poIds.length > 0, pmIds.length > 0, !!search.trim(),
+    hoursSource !== HOURS_ADJUSTED,
   ].filter(Boolean).length;
 
   const clearFilters = () => {
     setEntityIds([]); setBuIds([]); setEmployeeIds([]); setClientIds([]);
     setProjectIds([]); setPoIds([]); setPmIds([]); setSearch('');
+    setHoursSource(HOURS_ADJUSTED);
     setPage(1);
   };
 
@@ -267,7 +280,7 @@ const ResourceCostUtilizationReport = () => {
               onToggle={() => setFiltersOpen((p) => !p)}
               activeCount={activeFilterCount}
             />
-            <Button variant="outline" size="sm" className="h-[clamp(1.875rem,2vw,2.25rem)]" onClick={handleExport} disabled={isExporting}>
+            <Button variant="outline" size="sm" className="h-[clamp(1.875rem,2vw,2.25rem)]" onClick={() => confirmExport(handleExport)} disabled={isExporting}>
               <Download className="mr-1.5 h-4 w-4" />{isExporting ? 'Exporting…' : 'Export Excel'}
             </Button>
           </div>
@@ -294,6 +307,8 @@ const ResourceCostUtilizationReport = () => {
             className="w-full"
           />
         </div>
+
+        <HoursBasisToggle value={hoursSource} onChange={(v) => { setHoursSource(v); setPage(1); }} labelClassName="text-xs font-medium" />
 
         <div className="flex flex-col gap-1.5">
           <Label className="text-xs font-medium">Employee</Label>
@@ -395,7 +410,7 @@ const ResourceCostUtilizationReport = () => {
                     {months.map((m) => (
                       <th
                         key={m.key}
-                        colSpan={8}
+                        colSpan={5}
                         style={monthHeaderStyle(m.month)}
                         className="border-r border-border px-3 py-1.5 text-center text-xs font-semibold"
                       >
@@ -434,12 +449,9 @@ const ResourceCostUtilizationReport = () => {
                       <Fragment key={m.key}>
                         <th style={monthHeaderStyle(m.month)} className={th('w-[75px] text-right')}>Hours</th>
                         <th style={monthHeaderStyle(m.month)} className={th('w-[90px] text-right')}>Logged Hrs</th>
-                        <th style={monthHeaderStyle(m.month)} className={th('w-[90px] text-right text-muted-foreground')}>Original Logged Hrs</th>
                         <th style={monthHeaderStyle(m.month)} className={th('w-[100px] text-right')}>Projection %</th>
                         <th style={monthHeaderStyle(m.month)} className={th('w-[100px] text-right')}>Actual %</th>
-                        <th style={monthHeaderStyle(m.month)} className={th('w-[100px] text-right text-muted-foreground')}>Original Actual %</th>
                         <th style={monthHeaderStyle(m.month)} className={th('w-[110px] text-right')}>Contribution</th>
-                        <th style={monthHeaderStyle(m.month)} className={th('w-[110px] text-right text-muted-foreground')}>Original Contribution</th>
                       </Fragment>
                     ))}
                   </tr>
@@ -490,19 +502,15 @@ const ResourceCostUtilizationReport = () => {
                         <td className={td('truncate max-w-[140px]')} title={row.spo}>{row.spo || <span className="text-muted-foreground">—</span>}</td>
                         {months.map((m) => {
                           const cell = monthsByKey.get(m.key);
+                          const contribution = pickBasis(cell, 'contribution', 'originalContribution', isOriginal);
                           return (
                             <Fragment key={m.key}>
                               <td style={monthBodyStyle(m.month)} className={td('text-right tabular-nums')}>{formatHours2dp(cell?.cappedHours)}</td>
-                              <td style={monthBodyStyle(m.month)} className={td('text-right tabular-nums')}>{formatHours2dp(cell?.loggedHours)}</td>
-                              <td style={monthBodyStyle(m.month)} className={td('text-right tabular-nums text-muted-foreground')}>{formatHours2dp(cell?.originalLoggedHours)}</td>
+                              <td style={monthBodyStyle(m.month)} className={td('text-right tabular-nums')}>{formatHours2dp(pickBasis(cell, 'loggedHours', 'originalLoggedHours', isOriginal))}</td>
                               <td style={monthBodyStyle(m.month)} className={td('text-right tabular-nums')}>{formatPercent2dp(cell?.projectionPercentage)}</td>
-                              <td style={monthBodyStyle(m.month)} className={td('text-right tabular-nums')}>{formatPercent2dp(cell?.actualPercentage)}</td>
-                              <td style={monthBodyStyle(m.month)} className={td('text-right tabular-nums text-muted-foreground')}>{formatPercent2dp(cell?.originalActualPercentage)}</td>
+                              <td style={monthBodyStyle(m.month)} className={td('text-right tabular-nums')}>{formatPercent2dp(pickBasis(cell, 'actualPercentage', 'originalActualPercentage', isOriginal))}</td>
                               <td style={monthBodyStyle(m.month)} className={td('text-right tabular-nums font-medium')}>
-                                {cell?.contribution != null ? formatCurrency(cell.contribution) : <span className="text-muted-foreground">—</span>}
-                              </td>
-                              <td style={monthBodyStyle(m.month)} className={td('text-right tabular-nums text-muted-foreground')}>
-                                {cell?.originalContribution != null ? formatCurrency(cell.originalContribution) : '—'}
+                                {contribution != null ? formatCurrency(contribution) : <span className="text-muted-foreground">—</span>}
                               </td>
                             </Fragment>
                           );
@@ -520,19 +528,15 @@ const ResourceCostUtilizationReport = () => {
                       <td colSpan={9} className={td()} />
                       {months.map((m) => {
                         const s = summaryByKey.get(m.key);
+                        const totalContribution = pickBasis(s, 'totalContribution', 'originalTotalContribution', isOriginal);
                         return (
                           <Fragment key={m.key}>
                             <td style={monthBodyStyle(m.month)} className={td('text-right tabular-nums')}>{formatHours2dp(s?.totalCappedHours)}</td>
-                            <td style={monthBodyStyle(m.month)} className={td('text-right tabular-nums')}>{formatHours2dp(s?.totalLoggedHours)}</td>
-                            <td style={monthBodyStyle(m.month)} className={td('text-right tabular-nums text-muted-foreground')}>{formatHours2dp(s?.originalTotalLoggedHours)}</td>
+                            <td style={monthBodyStyle(m.month)} className={td('text-right tabular-nums')}>{formatHours2dp(pickBasis(s, 'totalLoggedHours', 'originalTotalLoggedHours', isOriginal))}</td>
                             <td style={monthBodyStyle(m.month)} className={td('text-right tabular-nums')}>—</td>
                             <td style={monthBodyStyle(m.month)} className={td('text-right tabular-nums')}>—</td>
-                            <td style={monthBodyStyle(m.month)} className={td('text-right tabular-nums text-muted-foreground')}>—</td>
                             <td style={monthBodyStyle(m.month)} className={td('text-right tabular-nums')}>
-                              {s?.totalContribution != null ? formatCurrency(s.totalContribution) : <span className="text-muted-foreground">—</span>}
-                            </td>
-                            <td style={monthBodyStyle(m.month)} className={td('text-right tabular-nums text-muted-foreground')}>
-                              {s?.originalTotalContribution != null ? formatCurrency(s.originalTotalContribution) : '—'}
+                              {totalContribution != null ? formatCurrency(totalContribution) : <span className="text-muted-foreground">—</span>}
                             </td>
                           </Fragment>
                         );

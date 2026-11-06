@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { useNavigate, Outlet } from 'react-router-dom';
 import { createColumnHelper } from '@tanstack/react-table';
 import { useIsMutating } from '@tanstack/react-query';
@@ -38,6 +38,7 @@ import FilterPanel from '@/components/common/FilterPanel';
 import SearchInput from '@/components/common/SearchInput';
 import SegmentedToggle from '@/components/common/SegmentedToggle';
 import EmptyState from '@/components/common/EmptyState';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
 } from '@/components/ui/dialog';
@@ -67,6 +68,7 @@ import {
 } from '@/components/ui/table';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
+import { LoadingBlock, Spinner } from '@/components/ui/spinner';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 import { Skeleton } from '@/components/ui/skeleton';
 
@@ -76,6 +78,8 @@ const columnHelper = createColumnHelper();
 // container to be the Table's own wrapper (via containerClassName) — sticky resolves against the
 // nearest scrolling ancestor, so an extra overflow div around the Table would break it.
 const STICKY_HEAD = 'sticky top-0 z-10 bg-background';
+
+const OWN_MAPPING_BLOCKED_MESSAGE = "You can't change your own roles, Business Units or Service POs. Ask another admin to update your mapping.";
 
 // Sentinel for the mapping dialog's own Entity filter (local to this dialog — narrows which rows
 // the Business Units table below it shows, same "All X" convention as EntityFilter.jsx's own
@@ -102,7 +106,7 @@ const TruncatedCell = ({ value, maxWidth = '150px', className }) => {
 // field set via the Service PO Form's own "Delivery Head" dropdown — so it never appears as a
 // checkbox here; once the backend adds it into the same unrestricted bucket as Service PO Admin,
 // only the eligibility response's `unrestricted` flag changes, not this UI.)
-const RoleBuMappingDialog = ({ employee, actorRoleName, allRoles, businessUnits, onOpenChange }) => {
+const RoleBuMappingDialog = ({ employee, actorRoleName, allRoles, rolesLoading, businessUnits, businessUnitsLoading, onOpenChange }) => {
   const { success, error: showError } = useNotification();
   const updateMutation = useUpdateEmployee(employee?.id);
   const saveServicePoMutation = useSaveEmployeeServicePOMapping(employee?.id);
@@ -504,7 +508,15 @@ const RoleBuMappingDialog = ({ employee, actorRoleName, allRoles, businessUnits,
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {roleRows.map((r) => (
+                  {/* Checkbox state comes from the employee's own mappings — rendering the rows
+                      before those arrive would show every role unchecked for a moment. */}
+                  {rolesLoading || mappingsLoading ? (
+                    <TableRow>
+                      <TableCell colSpan={2} className="p-0">
+                        <LoadingBlock label="Loading roles…" />
+                      </TableCell>
+                    </TableRow>
+                  ) : roleRows.map((r) => (
                     <TableRow key={r.id}>
                       <TableCell>
                         <Checkbox
@@ -554,7 +566,13 @@ const RoleBuMappingDialog = ({ employee, actorRoleName, allRoles, businessUnits,
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {buRows.length === 0 ? (
+                {businessUnitsLoading || mappingsLoading ? (
+                  <TableRow>
+                    <TableCell colSpan={2} className="p-0">
+                      <LoadingBlock label="Loading business units…" />
+                    </TableCell>
+                  </TableRow>
+                ) : buRows.length === 0 ? (
                   <TableRow>
                     <TableCell colSpan={2} className="text-center text-sm text-muted-foreground py-6">
                       No Business Units for this Entity.
@@ -664,8 +682,8 @@ const RoleBuMappingDialog = ({ employee, actorRoleName, allRoles, businessUnits,
                 <TableBody>
                   {activePOsLoading ? (
                     <TableRow>
-                      <TableCell colSpan={4} className="text-center text-sm text-muted-foreground py-6">
-                        Loading…
+                      <TableCell colSpan={4} className="p-0">
+                        <LoadingBlock label="Loading Service POs…" />
                       </TableCell>
                     </TableRow>
                   ) : filteredPOs.length === 0 ? (
@@ -763,6 +781,7 @@ const RoleBuMappingDialog = ({ employee, actorRoleName, allRoles, businessUnits,
             Cancel
           </Button>
           <Button size="sm" onClick={handleSave} disabled={isSaving || mappingsLoading}>
+            {isSaving && <Spinner className="mr-1.5 h-3.5 w-3.5 text-current" />}
             {isSaving ? 'Saving…' : 'Save'}
           </Button>
         </DialogFooter>
@@ -1072,6 +1091,7 @@ const StatusToggle = ({ employee, disabled = false }) => {
 
 
 const EmployeeList = () => {
+  const confirmExport = useExportConfirm();
   const navigate = useNavigate();
   const { success, error: showError, warning } = useNotification();
 
@@ -1170,7 +1190,7 @@ const EmployeeList = () => {
   };
 
   const { data, isPending, isFetching } = useEmployees(params);
-  const { data: rolesData } = useRoles({ limit: 100 });
+  const { data: rolesData, isLoading: rolesLoading } = useRoles({ limit: 100 });
   // Sourced for the "Map Roles & Business Units" dialog's Business Units table — same
   // cross-BU-vs-own-mapping split as the list scoping above, so a BU-scoped actor (HR, BU Admin,
   // BU Head, ...) can only ever assign an employee to one of THEIR OWN mapped BUs, not every BU in
@@ -1182,7 +1202,9 @@ const EmployeeList = () => {
   // this fix — a BU-scoped actor's own mapped units carry no entity_name, so the Entity sub-filter
   // simply doesn't render for them (buEntities comes back empty), which is fine given how few BUs
   // that login is ever mapped to.
-  const { data: companiesData } = useCompanies({ status: 'active', limit: 200 }, { enabled: isCrossBu });
+  // isLoading (not isPending) — this query is disabled for BU-scoped actors, and a disabled query
+  // stays "pending" forever, which would leave the dialog's BU table spinning.
+  const { data: companiesData, isLoading: companiesLoading } = useCompanies({ status: 'active', limit: 200 }, { enabled: isCrossBu });
   const mappingDialogBusinessUnits = useMemo(
     () => (isCrossBu
       ? companiesData?.data ?? []
@@ -1199,7 +1221,18 @@ const EmployeeList = () => {
   const [importResult, setImportResult] = useState(null);
   const [previewLimit, setPreviewLimit] = useState(5);
 
-  const { role: actorRoleName } = useAuth();
+  const { role: actorRoleName, employee: currentEmployee } = useAuth();
+  // A BU Admin may not change their OWN roles, Business Units or Service POs — the Map action is
+  // disabled on their own row (and the dialog never opens for it). The backend enforces the same.
+  const isOwnMappingBlocked = useCallback(
+    (emp) => actorRoleName === ROLE_NAMES.BU_ADMIN
+      && currentEmployee?.id != null
+      && String(emp?.id) === String(currentEmployee.id),
+    [actorRoleName, currentEmployee?.id]
+  );
+  const openMapping = (emp) => {
+    if (!isOwnMappingBlocked(emp)) setMappingTarget(emp);
+  };
   const employees = data?.data ?? [];
   const meta = data?.meta ?? {};
   // BU Admin sits below Admin/Entity Admin in the hierarchy and can't manage senior-tier
@@ -1273,14 +1306,28 @@ const EmployeeList = () => {
               </Button>
             )}
             {isHR && !protectedRow && (
-              <Button
-                size="sm"
-                className="h-6 w-6 p-0 bg-teal-600 hover:bg-teal-700 text-white rounded transition-colors"
-                title="Map Roles & Business Units"
-                onClick={() => setMappingTarget(row.original)}
-              >
-                <UserCog className="h-3 w-3" />
-              </Button>
+              isOwnMappingBlocked(row.original) ? (
+                // Wrapper carries the tooltip — a disabled <button> doesn't receive hover events.
+                <span title={OWN_MAPPING_BLOCKED_MESSAGE} className="inline-flex cursor-not-allowed">
+                  <Button
+                    size="sm"
+                    disabled
+                    aria-label={OWN_MAPPING_BLOCKED_MESSAGE}
+                    className="h-6 w-6 p-0 bg-teal-600 text-white rounded"
+                  >
+                    <UserCog className="h-3 w-3" />
+                  </Button>
+                </span>
+              ) : (
+                <Button
+                  size="sm"
+                  className="h-6 w-6 p-0 bg-teal-600 hover:bg-teal-700 text-white rounded transition-colors"
+                  title="Map Roles & Business Units"
+                  onClick={() => setMappingTarget(row.original)}
+                >
+                  <UserCog className="h-3 w-3" />
+                </Button>
+              )
             )}
           </div>
         );
@@ -1399,7 +1446,7 @@ const EmployeeList = () => {
         );
       },
     }),
-  ], [navigate, isHR, canManageEmployees, entityIdByBuId, entityNameById]);
+  ], [navigate, isHR, canManageEmployees, entityIdByBuId, entityNameById, isOwnMappingBlocked]);
 
   const handleSearch = (e) => {
     setSearch(e.target.value);
@@ -1867,11 +1914,11 @@ const EmployeeList = () => {
                     </Button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end">
-                    <DropdownMenuItem onClick={handleExportExcel} className="cursor-pointer">
+                    <DropdownMenuItem onClick={() => confirmExport(handleExportExcel)} className="cursor-pointer">
                       <FileSpreadsheet className="mr-2 h-4 w-4 text-green-600" />
                       Excel
                     </DropdownMenuItem>
-                    <DropdownMenuItem onClick={handleExportPDF} className="cursor-pointer">
+                    <DropdownMenuItem onClick={() => confirmExport(handleExportPDF)} className="cursor-pointer">
                       <FileText className="mr-2 h-4 w-4 text-red-500" />
                       PDF
                     </DropdownMenuItem>
@@ -1958,10 +2005,10 @@ const EmployeeList = () => {
               <DropdownMenuContent align="end">
                 {isHR && (
                   <>
-                    <DropdownMenuItem onClick={handleExportExcel} className="cursor-pointer">
+                    <DropdownMenuItem onClick={() => confirmExport(handleExportExcel)} className="cursor-pointer">
                       <FileSpreadsheet className="h-4 w-4 text-green-600" /> Export Excel
                     </DropdownMenuItem>
-                    <DropdownMenuItem onClick={handleExportPDF} className="cursor-pointer">
+                    <DropdownMenuItem onClick={() => confirmExport(handleExportPDF)} className="cursor-pointer">
                       <FileText className="h-4 w-4 text-red-500" /> Export PDF
                     </DropdownMenuItem>
                     <DropdownMenuItem onClick={handlePrint} className="cursor-pointer">
@@ -2179,8 +2226,15 @@ const EmployeeList = () => {
                           </DropdownMenuItem>
                         )}
                         {isHR && !isProtectedSuperAdmin(emp) && (
-                          <DropdownMenuItem onClick={() => setMappingTarget(emp)}>
+                          <DropdownMenuItem
+                            disabled={isOwnMappingBlocked(emp)}
+                            onClick={() => openMapping(emp)}
+                            title={isOwnMappingBlocked(emp) ? OWN_MAPPING_BLOCKED_MESSAGE : undefined}
+                          >
                             <UserCog className="h-4 w-4" /> Manage Roles / Permissions
+                            {isOwnMappingBlocked(emp) && (
+                              <span className="ml-auto pl-2 text-[10px] text-muted-foreground">Not allowed</span>
+                            )}
                           </DropdownMenuItem>
                         )}
                       </DropdownMenuContent>
@@ -2230,10 +2284,12 @@ const EmployeeList = () => {
       )}
 
       <RoleBuMappingDialog
-        employee={mappingTarget}
+        employee={mappingTarget && !isOwnMappingBlocked(mappingTarget) ? mappingTarget : null}
         actorRoleName={actorRoleName}
         allRoles={rolesData?.data ?? []}
+        rolesLoading={rolesLoading}
         businessUnits={mappingDialogBusinessUnits}
+        businessUnitsLoading={companiesLoading}
         onOpenChange={(open) => !open && setMappingTarget(null)}
       />
 

@@ -13,6 +13,8 @@ import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
 import SearchInput from '@/components/common/SearchInput';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { MonthYearPicker } from '@/components/ui/month-year-picker';
@@ -48,7 +50,11 @@ const benchColorClass = (value) => {
   return 'text-emerald-600 dark:text-emerald-400';
 };
 
-const columns = [
+// Bench hours and Bench % each carry an `original_*` twin (hours as logged, before the
+// monthly-cap sync); the "Hours basis" switch picks which one the table/export shows.
+const basisValue = (r, key, isOriginal) => (isOriginal ? r[`original_${key}`] : r[key]);
+
+const buildColumns = (isOriginal) => [
   columnHelper.accessor((row) => shortMonthLabel(row.month, row.year), {
     id: 'month',
     header: 'Month',
@@ -61,21 +67,12 @@ const columns = [
     meta: { align: 'right' },
     cell: (info) => <span className="tabular-nums">{formatNumber(info.getValue())}</span>,
   }),
-  columnHelper.accessor('total_bench_hours', {
+  columnHelper.accessor((row) => basisValue(row, 'total_bench_hours', isOriginal), {
+    id: 'total_bench_hours',
     header: 'Total Bench Hrs',
     size: 160,
     meta: { align: 'right' },
     cell: (info) => <span className="tabular-nums">{formatHours(info.getValue())}</span>,
-  }),
-  columnHelper.accessor('original_total_bench_hours', {
-    header: 'Original Total Bench Hrs',
-    size: 190,
-    meta: { align: 'right' },
-    cell: (info) => {
-      const value = info.getValue();
-      if (value == null || value === '') return null;
-      return <span className="tabular-nums text-muted-foreground">{formatHours(value)}</span>;
-    },
   }),
   columnHelper.accessor('total_available_hours', {
     header: 'Total Available Hrs (Org)',
@@ -83,7 +80,8 @@ const columns = [
     meta: { align: 'right' },
     cell: (info) => <span className="tabular-nums">{formatHours(info.getValue())}</span>,
   }),
-  columnHelper.accessor('bench_pct', {
+  columnHelper.accessor((row) => basisValue(row, 'bench_pct', isOriginal), {
+    id: 'bench_pct',
     header: 'Bench %',
     size: 130,
     meta: { align: 'right' },
@@ -95,19 +93,22 @@ const columns = [
   }),
 ];
 
-const exportToExcel = (rows) => {
-  const header = ['Month', 'No. of Resources on Bench', 'Total Bench Hrs', 'Total Available Hrs (Org)', 'Bench %'];
+const exportToExcel = (rows, isOriginal) => {
+  const sfx = isOriginal ? ' (Original)' : '';
+  const num = (r, key) => {
+    const v = basisValue(r, key, isOriginal);
+    return v != null ? Number(v) : '';
+  };
+  const header = ['Month', 'No. of Resources on Bench', `Total Bench Hrs${sfx}`, 'Total Available Hrs (Org)', `Bench %${sfx}`];
   const dataRows = rows.map((r) => [
     shortMonthLabel(r.month, r.year),
     r.resources_on_bench != null ? Number(r.resources_on_bench) : '',
-    r.total_bench_hours != null ? Number(r.total_bench_hours) : '',
-    r.original_total_bench_hours != null ? Number(r.original_total_bench_hours) : '',
+    num(r, 'total_bench_hours'),
     r.total_available_hours != null ? Number(r.total_available_hours) : '',
-    r.bench_pct != null ? Number(r.bench_pct) : '',
-    r.original_bench_pct != null ? Number(r.original_bench_pct) : '',
+    num(r, 'bench_pct'),
   ]);
   const ws = XLSX.utils.aoa_to_sheet([header, ...dataRows]);
-  ws['!cols'] = [{ wch: 14 }, { wch: 24 }, { wch: 18 }, { wch: 24 }, { wch: 12 }];
+  ws['!cols'] = [{ wch: 14 }, { wch: 24 }, { wch: isOriginal ? 28 : 18 }, { wch: 24 }, { wch: isOriginal ? 20 : 12 }];
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Month-wise Bench');
   XLSX.writeFile(wb, 'Month_Wise_Bench_Report.xlsx');
@@ -121,6 +122,7 @@ const exportToExcel = (rows) => {
 // (ResourceWiseBenchReport.jsx, GET /reports/resource-wise-bench) rather than here, since each is
 // its own Management Report.
 const MonthWiseBenchReport = () => {
+  const confirmExport = useExportConfirm();
   const [periodMode, setPeriodMode] = useState('range');
   const [monthYear, setMonthYear] = useState({ month: now.getMonth() + 1, year: now.getFullYear() });
   const [fromMonthYear, setFromMonthYear] = useState({ month: defaultFromDate.getMonth() + 1, year: defaultFromDate.getFullYear() });
@@ -131,13 +133,17 @@ const MonthWiseBenchReport = () => {
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(1);
   const [limit, setLimit] = useState(10);
+  const [hoursSource, setHoursSource] = useState(HOURS_ADJUSTED);
 
   const periodReady = periodMode === 'month'
     ? !!(monthYear?.month && monthYear?.year)
     : !!(fromMonthYear?.month && fromMonthYear?.year && toMonthYear?.month && toMonthYear?.year);
-  const activeFilterCount = (entityIds.length > 0 ? 1 : 0) + (buIds.length > 0 ? 1 : 0);
+  const activeFilterCount = (entityIds.length > 0 ? 1 : 0) + (buIds.length > 0 ? 1 : 0)
+    + (hoursSource !== HOURS_ADJUSTED ? 1 : 0);
 
   const params = {
+    // Original basis: the server then sorts, ranks and totals on original hours too.
+    ...(hoursSource === HOURS_ORIGINAL && { hoursSource: 'O' }),
     ...(periodMode === 'month'
       ? { month: monthYear.month, year: monthYear.year }
       : { startMonth: fromMonthYear.month, startYear: fromMonthYear.year, endMonth: toMonthYear.month, endYear: toMonthYear.year }),
@@ -154,6 +160,11 @@ const MonthWiseBenchReport = () => {
   const { data, isPending } = useMonthWiseBench(params);
   const rows = extractReportRows(data);
 
+  // Rows without any original_* data -> the report behaves exactly as Adjusted.
+  const hasOriginal = rows.some((r) => r.original_total_bench_hours != null || r.original_bench_pct != null);
+  const isOriginal = hasOriginal && hoursSource === HOURS_ORIGINAL;
+  const columns = useMemo(() => buildColumns(isOriginal), [isOriginal]);
+
   const filteredRows = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return rows;
@@ -161,7 +172,7 @@ const MonthWiseBenchReport = () => {
   }, [rows, search]);
   const pagedRows = filteredRows.slice((page - 1) * limit, page * limit);
 
-  const handleExport = () => exportToExcel(filteredRows);
+  const handleExport = () => exportToExcel(filteredRows, isOriginal);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -181,7 +192,7 @@ const MonthWiseBenchReport = () => {
               activeCount={activeFilterCount}
             />
             {filteredRows.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)}>
                 <Download className="h-4 w-4" />Export Excel
               </Button>
             )}
@@ -192,7 +203,7 @@ const MonthWiseBenchReport = () => {
       <FilterPanel
         isOpen={filtersOpen}
         maxHeightClass="max-h-[300px]"
-        onClear={() => { setEntityIds([]); setBuIds([]); }}
+        onClear={() => { setEntityIds([]); setBuIds([]); setHoursSource(HOURS_ADJUSTED); setPage(1); }}
         showClear={activeFilterCount > 0}
       >
         <EntityFilter multiple value={entityIds} onChange={(v) => { setEntityIds(v); setBuIds([]); setPage(1); }} />
@@ -234,6 +245,12 @@ const MonthWiseBenchReport = () => {
             />
           )}
         </div>
+
+        <HoursBasisToggle
+          value={hoursSource}
+          onChange={(v) => { setHoursSource(v); setPage(1); }}
+          labelClassName="text-xs"
+        />
       </FilterPanel>
 
       <DataTable

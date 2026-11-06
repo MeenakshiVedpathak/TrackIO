@@ -21,6 +21,7 @@ import SearchInput from '@/components/common/SearchInput';
 import EmptyState from '@/components/common/EmptyState';
 import BusinessUnitFilter from '@/components/common/BusinessUnitFilter';
 import EntityFilter from '@/components/common/EntityFilter';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { useMasterBuFilter } from '@/hooks/useMasterBuFilter';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -57,6 +58,7 @@ const TruncatedCell = ({ value, maxWidth = '150px', className }) => {
 };
 
 const ServiceTypeList = () => {
+  const confirmExport = useExportConfirm();
   const navigate = useNavigate();
 
   const [search, setSearch] = useState('');
@@ -180,7 +182,7 @@ const ServiceTypeList = () => {
                 activeCount={activeFilterCount}
               />
               {rows.length > 0 && (
-                <Button variant="outline" size="sm" className="h-[clamp(1.875rem,2vw,2.25rem)] gap-1.5" onClick={handleExport}>
+                <Button variant="outline" size="sm" className="h-[clamp(1.875rem,2vw,2.25rem)] gap-1.5" onClick={() => confirmExport(handleExport)}>
                   <Download className="h-4 w-4" /> Export Excel
                 </Button>
               )}
@@ -228,7 +230,7 @@ const ServiceTypeList = () => {
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuItem onClick={handleExport} className="cursor-pointer">
+                <DropdownMenuItem onClick={() => confirmExport(handleExport)} className="cursor-pointer">
                   <Download className="h-4 w-4" /> Export Excel
                 </DropdownMenuItem>
               </DropdownMenuContent>

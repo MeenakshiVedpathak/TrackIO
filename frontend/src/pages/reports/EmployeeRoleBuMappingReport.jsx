@@ -17,6 +17,7 @@ import FilterPanel from '@/components/common/FilterPanel';
 import EntityFilter from '@/components/common/EntityFilter';
 import { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import SearchInput from '@/components/common/SearchInput';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { MultiSelect } from '@/components/ui/multi-select';
@@ -55,6 +56,7 @@ const columns = [
 // params, so this reads `units` straight off useSelectableBusinessUnits itself and splits it by
 // `parentId` locally instead.
 const EmployeeRoleBuMappingReport = () => {
+  const confirmExport = useExportConfirm();
   const [entityIds, setEntityIds] = useState([]);
   const [buIds, setBuIds] = useState([]);
   const [subBuIds, setSubBuIds] = useState([]);
@@ -168,7 +170,7 @@ const EmployeeRoleBuMappingReport = () => {
               className="w-full sm:w-full md:w-72"
             />
             {records.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport} disabled={isExporting} className="order-2 md:order-none">
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)} disabled={isExporting} className="order-2 md:order-none">
                 <Download className="h-4 w-4" />{isExporting ? 'Exporting…' : 'Export Excel'}
               </Button>
             )}

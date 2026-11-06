@@ -2,7 +2,6 @@ import { useState, useMemo, useEffect } from 'react';
 import * as XLSX from 'xlsx';
 import { Download, ChevronRight, Clock, IndianRupee, TrendingUp, FileX, Users, ArrowUpDown } from 'lucide-react';
 import { useResourceProjectUtilization } from '@/hooks/useReports';
-import { useCanViewOriginalData } from '@/hooks/usePermissions';
 import { reportsApi } from '@/api/reports.api';
 import { useDebounce } from '@/hooks/useDebounce';
 import { useActiveEmployees } from '@/hooks/useEmployees';
@@ -12,12 +11,14 @@ import { useActiveServiceTypes } from '@/hooks/useServiceTypes';
 import { useActiveServiceCategories } from '@/hooks/useServiceCategories';
 import { formatHours, formatCurrency, formatMonthYear, getInitials } from '@/utils/formatters';
 import PageHeader from '@/components/common/PageHeader';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import EmptyState from '@/components/common/EmptyState';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter from '@/components/common/EntityFilter';
 import SearchInput from '@/components/common/SearchInput';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { MultiSelect } from '@/components/ui/multi-select';
@@ -95,24 +96,37 @@ const isBillable = (p) => p.category?.toLowerCase() === 'billable';
 const isCustomerNonBillable = (p) => p.category?.toLowerCase() === 'customer non-billable';
 const isNonBillable = (p) => !isBillable(p) && !isCustomerNonBillable(p);
 
-const exportToExcel = (rows, monthLabel) => {
-  const hasOriginalTotalHours = rows.some((r) => r.originalTotalHours != null);
-  const hasOriginalProjectHours = rows.some((r) => r.projects?.some((p) => p.originalProjectHours != null));
+// One value per metric, chosen by the Hours basis switch — never Adjusted and Original side by
+// side. In Original mode each row's totalHours / per-project projectHours are swapped for their
+// original* twins (falling back to the plain field, which the API may already have filled with
+// original values for hoursSource=O), so every downstream total/sum/sort reads the active basis.
+const applyHoursBasis = (r, isOriginal) => (
+  isOriginal
+    ? {
+        ...r,
+        totalHours: r.originalTotalHours ?? r.totalHours,
+        projects: r.projects?.map((p) => ({ ...p, projectHours: p.originalProjectHours ?? p.projectHours })),
+      }
+    : r
+);
+
+const exportToExcel = (sourceRows, monthLabel, isOriginal = false) => {
+  // Only the active hours basis is exported — one column per metric.
+  const rows = sourceRows.map((r) => applyHoursBasis(r, isOriginal));
+  const suffix = isOriginal ? ' (Original)' : '';
 
   const header = [
     'Employee',
-    'Total Hours',
-    ...(hasOriginalTotalHours ? ['Original Total Hours'] : []),
-    'Billable Hours',
-    'Non-Billable Hours',
-    'Customer Non-Billable Hours',
+    `Total Hours${suffix}`,
+    `Billable Hours${suffix}`,
+    `Non-Billable Hours${suffix}`,
+    `Customer Non-Billable Hours${suffix}`,
     'Billable Amount',
     'Client',
     'Project',
     'Project Type',
     'Category',
-    'Project Hours',
-    ...(hasOriginalProjectHours ? ['Original Project Hours'] : []),
+    `Project Hours${suffix}`,
     'Project Billable Amount',
   ];
 
@@ -128,7 +142,6 @@ const exportToExcel = (rows, monthLabel) => {
       dataRows.push([
         r.employeeName ?? '',
         r.totalHours ?? '',
-        ...(hasOriginalTotalHours ? [r.originalTotalHours ?? ''] : []),
         billableHours,
         nonBillableHours,
         customerNonBillableHours,
@@ -138,7 +151,6 @@ const exportToExcel = (rows, monthLabel) => {
         '',
         '',
         '',
-        ...(hasOriginalProjectHours ? [''] : []),
         '',
       ]);
       return;
@@ -148,7 +160,6 @@ const exportToExcel = (rows, monthLabel) => {
       dataRows.push([
         i === 0 ? (r.employeeName ?? '') : '',
         i === 0 ? (r.totalHours ?? '') : '',
-        ...(hasOriginalTotalHours ? [i === 0 ? (r.originalTotalHours ?? '') : ''] : []),
         i === 0 ? billableHours : '',
         i === 0 ? nonBillableHours : '',
         i === 0 ? customerNonBillableHours : '',
@@ -158,7 +169,6 @@ const exportToExcel = (rows, monthLabel) => {
         p.projectType ?? '',
         p.category ?? '',
         p.projectHours ?? '',
-        ...(hasOriginalProjectHours ? [p.originalProjectHours ?? ''] : []),
         p.billableAmount ?? '',
       ]);
     });
@@ -193,7 +203,7 @@ const PROJECT_SORT_OPTIONS = [
   { label: 'Project (A–Z)',       fn: (a, b) => (a.projectName ?? '').localeCompare(b.projectName ?? '')     },
 ];
 
-const DrawerContent = ({ selectedRow, monthLabel, hasOriginalTotalHours, hasOriginalProjectHours }) => {
+const DrawerContent = ({ selectedRow, monthLabel }) => {
   const [sortIdx, setSortIdx] = useState(0);
 
   const sortedProjects = useMemo(() => {
@@ -216,37 +226,22 @@ const DrawerContent = ({ selectedRow, monthLabel, hasOriginalTotalHours, hasOrig
       </SheetHeader>
 
       <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4">
-        {/* Stat cards — row 1: Total Hours + [Original Hours] + Billable Amount */}
-        <div className={cn('grid gap-2.5', hasOriginalTotalHours ? 'grid-cols-3' : 'grid-cols-2')}>
-          {STAT_CARDS.slice(0, 2).map(({ key, label, icon: Icon, color }, idx) => {
+        {/* Stat cards — row 1: Total Hours + Billable Amount */}
+        <div className="grid grid-cols-2 gap-2.5">
+          {STAT_CARDS.slice(0, 2).map(({ key, label, icon: Icon, color }) => {
             const c = STAT_COLORS[color];
             const isMoney = key === 'billableAmount';
             const value = isMoney ? formatCurrency(selectedRow[key]) : formatHours(selectedRow[key]);
             return (
-              <>
-                <div key={key} className={cn('rounded-xl border px-2.5 py-2.5 flex items-center gap-2', c.bg)}>
-                  <div className={cn('flex h-7 w-7 shrink-0 items-center justify-center rounded-full', c.icon)}>
-                    <Icon className="h-3.5 w-3.5" />
-                  </div>
-                  <div className="min-w-0">
-                    <p className="text-[10px] text-muted-foreground leading-tight">{label}</p>
-                    <p className={cn('text-sm font-bold tabular-nums leading-tight', c.val)}>{value}</p>
-                  </div>
+              <div key={key} className={cn('rounded-xl border px-2.5 py-2.5 flex items-center gap-2', c.bg)}>
+                <div className={cn('flex h-7 w-7 shrink-0 items-center justify-center rounded-full', c.icon)}>
+                  <Icon className="h-3.5 w-3.5" />
                 </div>
-                {idx === 0 && hasOriginalTotalHours && (
-                  <div key="originalTotalHours" className={cn('rounded-xl border px-2.5 py-2.5 flex items-center gap-2', STAT_COLORS.blue.bg)}>
-                    <div className={cn('flex h-7 w-7 shrink-0 items-center justify-center rounded-full', STAT_COLORS.blue.icon)}>
-                      <Clock className="h-3.5 w-3.5" />
-                    </div>
-                    <div className="min-w-0">
-                      <p className="text-[10px] text-muted-foreground leading-tight">Original Hours</p>
-                      <p className={cn('text-sm font-bold tabular-nums leading-tight', STAT_COLORS.blue.val)}>
-                        {formatHours(selectedRow.originalTotalHours)}
-                      </p>
-                    </div>
-                  </div>
-                )}
-              </>
+                <div className="min-w-0">
+                  <p className="text-[10px] text-muted-foreground leading-tight">{label}</p>
+                  <p className={cn('text-sm font-bold tabular-nums leading-tight', c.val)}>{value}</p>
+                </div>
+              </div>
             );
           })}
         </div>
@@ -317,11 +312,6 @@ const DrawerContent = ({ selectedRow, monthLabel, hasOriginalTotalHours, hasOrig
                     <p className="flex items-center justify-end gap-1 text-sm font-bold tabular-nums text-foreground">
                       <Clock className="h-3.5 w-3.5 text-muted-foreground" />{formatHours(p.projectHours)}
                     </p>
-                    {hasOriginalProjectHours && (
-                      <p className="text-[11px] text-muted-foreground tabular-nums">
-                        Original: {formatHours(p.originalProjectHours)}
-                      </p>
-                    )}
                     {p.billableAmount ? (
                       <p className="text-[11px] text-muted-foreground tabular-nums">{formatCurrency(p.billableAmount)}</p>
                     ) : null}
@@ -340,6 +330,7 @@ const now = new Date();
 const prevMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
 
 const ResourceProjectUtilization = () => {
+  const confirmExport = useExportConfirm();
   const [monthYear, setMonthYear] = useState({
     month: prevMonth.getMonth() + 1,
     year: prevMonth.getFullYear(),
@@ -349,12 +340,8 @@ const ResourceProjectUtilization = () => {
   const [poIds, setPoIds] = useState([]);
   const [category, setCategory] = useState([]);
   const [typeIds, setTypeIds] = useState([]);
-  const canViewOriginal = useCanViewOriginalData();
   const [hoursSource, setHoursSource] = useState('M');
 
-  useEffect(() => {
-    if (!canViewOriginal) setHoursSource('M');
-  }, [canViewOriginal]);
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(1);
   const [limit, setLimit] = useState(10);
@@ -438,9 +425,10 @@ const ResourceProjectUtilization = () => {
   // fetch the full filtered dataset in parallel (mirrors what handleExport does).
   const allDataParams = { ...params, page: 1, limit: 1000 };
   const { data: fullData } = useResourceProjectUtilization(allDataParams);
-  const fullRows = Array.isArray(fullData?.data) ? fullData.data : null;
+  const isOriginal = hoursSource === HOURS_ORIGINAL;
+  const fullRows = Array.isArray(fullData?.data) ? fullData.data.map((r) => applyHoursBasis(r, isOriginal)) : null;
 
-  const allRows = Array.isArray(data?.data) ? data.data : [];
+  const allRows = Array.isArray(data?.data) ? data.data.map((r) => applyHoursBasis(r, isOriginal)) : [];
   const meta = data?.meta ?? {};
   const monthLabel = formatMonthYear(monthYear.month, monthYear.year);
 
@@ -466,17 +454,6 @@ const ResourceProjectUtilization = () => {
     };
   });
 
-  const hasOriginalTotalHours = useMemo(
-    () => allRows.some((r) => r.originalTotalHours != null) || (fullRows?.some((r) => r.originalTotalHours != null) ?? false),
-    [allRows, fullRows]
-  );
-  const hasOriginalProjectHours = useMemo(
-    () =>
-      allRows.some((r) => r.projects?.some((p) => p.originalProjectHours != null)) ||
-      (fullRows?.some((r) => r.projects?.some((p) => p.originalProjectHours != null)) ?? false),
-    [allRows, fullRows]
-  );
-
   // Prefer totals over the full filtered dataset; fall back to the current page's
   // totals only until the full-dataset fetch resolves.
   const totalsSource = fullRows
@@ -485,7 +462,6 @@ const ResourceProjectUtilization = () => {
           const projects = r.projects ?? [];
           return {
             totalHours: Number(r.totalHours) || 0,
-            originalTotalHours: r.originalTotalHours != null ? Number(r.originalTotalHours) : null,
             billableHours: sumBy(projects, isBillable),
             nonBillableHours: sumBy(projects, isNonBillable),
             customerNonBillableHours: sumBy(projects, isCustomerNonBillable),
@@ -497,16 +473,13 @@ const ResourceProjectUtilization = () => {
   const pageTotals = totalsSource.reduce(
     (acc, r) => {
       acc.totalHours += Number(r.totalHours) || 0;
-      if (r.originalTotalHours != null) {
-        acc.originalTotalHours = (acc.originalTotalHours ?? 0) + (Number(r.originalTotalHours) || 0);
-      }
       acc.billableHours += r.billableHours;
       acc.nonBillableHours += r.nonBillableHours;
       acc.customerNonBillableHours += r.customerNonBillableHours;
       acc.billableAmount += r.billableAmount;
       return acc;
     },
-    { totalHours: 0, originalTotalHours: null, billableHours: 0, nonBillableHours: 0, customerNonBillableHours: 0, billableAmount: 0 }
+    { totalHours: 0, billableHours: 0, nonBillableHours: 0, customerNonBillableHours: 0, billableAmount: 0 }
   );
 
   // Export pulls every matching record (not just the current page) with one extra request.
@@ -519,7 +492,7 @@ const ResourceProjectUtilization = () => {
       const exportRows = searchTerm
         ? all.filter((r) => r.employeeName?.toLowerCase().includes(searchTerm))
         : all;
-      exportToExcel(exportRows, monthLabel);
+      exportToExcel(exportRows, monthLabel, isOriginal);
     } finally {
       setExporting(false);
     }
@@ -535,6 +508,7 @@ const ResourceProjectUtilization = () => {
     category.length > 0 ? 1 : 0,
     typeIds.length > 0 ? 1 : 0,
     poIds.length > 0 ? 1 : 0,
+    hoursSource !== HOURS_ADJUSTED ? 1 : 0,
   ].reduce((a, b) => a + b, 0);
 
   const clearFilters = () => {
@@ -545,6 +519,7 @@ const ResourceProjectUtilization = () => {
     setCategory([]);
     setTypeIds([]);
     setPoIds([]);
+    setHoursSource(HOURS_ADJUSTED);
     setPage(1);
   };
 
@@ -563,32 +538,13 @@ const ResourceProjectUtilization = () => {
               placeholder="Search employee…"
               className="w-full sm:w-full md:w-56"
             />
-            {canViewOriginal && (
-              <div className="flex items-center gap-0.5 p-0.5 rounded-xl bg-muted border shrink-0">
-                {[
-                  { value: 'O', label: 'Original' },
-                  { value: 'M', label: 'Published' },
-                ].map(({ value, label }) => (
-                  <button
-                    key={value}
-                    type="button"
-                    onClick={() => { setHoursSource(value); setPage(1); }}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-                      hoursSource === value ? 'bg-card shadow-sm text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground hover:text-foreground'
-                    }`}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-            )}
             <FilterToggleButton
               isOpen={filtersOpen}
               onToggle={() => setFiltersOpen((prev) => !prev)}
               activeCount={activeFilterCount}
             />
             {(meta.total ?? rows.length) > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport} disabled={exporting}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)} disabled={exporting}>
                 <Download className="h-4 w-4" />{exporting ? 'Exporting…' : 'Export Excel'}
               </Button>
             )}
@@ -617,6 +573,8 @@ const ResourceProjectUtilization = () => {
               className="w-full"
             />
           </div>
+
+          <HoursBasisToggle value={hoursSource} onChange={(v) => { setHoursSource(v); setPage(1); }} />
 
           <div className="flex flex-col gap-1.5">
             <Label className="text-xs font-medium">Employee</Label>
@@ -695,12 +653,6 @@ const ResourceProjectUtilization = () => {
               Total Hours&nbsp;
               <span className="font-semibold tabular-nums">{pageTotals.totalHours.toFixed(1)} hrs</span>
             </div>
-            {hasOriginalTotalHours && pageTotals.originalTotalHours != null && (
-              <div className="rounded-md border bg-blue-500/10 px-3 py-1.5 text-xs text-blue-700 dark:text-blue-400">
-                Original Total Hours&nbsp;
-                <span className="font-semibold tabular-nums">{pageTotals.originalTotalHours.toFixed(1)} hrs</span>
-              </div>
-            )}
             <div className="rounded-md border bg-emerald-500/10 px-3 py-1.5 text-xs text-emerald-700 dark:text-emerald-400">
               Billable&nbsp;
               <span className="font-semibold tabular-nums">{pageTotals.billableHours.toFixed(1)} hrs</span>
@@ -726,12 +678,18 @@ const ResourceProjectUtilization = () => {
               already applied to the shared DataTable component. ── */}
           <div className="hidden md:flex min-h-0 flex-col rounded-lg border overflow-hidden">
             <div className="flex-1 min-h-0 overflow-auto">
-              <table className="min-w-full w-full table-fixed border-collapse text-sm">
+              {/* Every column but Employee has a fixed width, so Employee (the lone auto column) absorbs
+                  all the squeeze and collapsed to ~0 on a narrow viewport / zoomed page, wrapping the
+                  name and letting its header spill over "Total Hours". The min-width is the fixed
+                  columns' sum plus 200px for Employee; below that the box scrolls sideways instead. */}
+              <table
+                className="min-w-full w-full table-fixed border-collapse text-sm"
+                style={{ minWidth: 1035 }}
+              >
                 <colgroup>
                   <col className="w-9" />
                   <col />
                   <col className="w-[110px]" />
-                  {hasOriginalTotalHours && <col className="w-[165px]" />}
                   <col className="w-[110px]" />
                   <col className="w-[130px]" />
                   <col className="w-[165px]" />
@@ -743,9 +701,6 @@ const ResourceProjectUtilization = () => {
                     <th className="px-2.5 py-2 text-left text-xs font-semibold" />
                     <th className="px-2.5 py-2 text-left text-xs font-semibold">Employee</th>
                     <th className="px-2.5 py-2 text-right text-xs font-semibold">Total Hours</th>
-                    {hasOriginalTotalHours && (
-                      <th className="px-2.5 py-2 text-right text-xs font-semibold">Original Total Hours</th>
-                    )}
                     <th className="px-2.5 py-2 text-right text-xs font-semibold">Billable</th>
                     <th className="px-2.5 py-2 text-right text-xs font-semibold">Non-Billable</th>
                     <th className="px-2.5 py-2 text-right text-xs font-semibold">Customer Non-Billable</th>
@@ -775,9 +730,6 @@ const ResourceProjectUtilization = () => {
                         </div>
                       </td>
                       <td className="px-2.5 py-2 text-right tabular-nums font-medium">{formatHours(row.totalHours)}</td>
-                      {hasOriginalTotalHours && (
-                        <td className="px-2.5 py-2 text-right tabular-nums font-medium">{formatHours(row.originalTotalHours)}</td>
-                      )}
                       <td className="px-2.5 py-2 text-right tabular-nums text-emerald-700 dark:text-emerald-400">{formatHours(row.billableHours)}</td>
                       <td className="px-2.5 py-2 text-right tabular-nums text-orange-700 dark:text-orange-400">{formatHours(row.nonBillableHours)}</td>
                       <td className="px-2.5 py-2 text-right tabular-nums text-sky-700 dark:text-sky-400">{formatHours(row.customerNonBillableHours)}</td>
@@ -809,11 +761,6 @@ const ResourceProjectUtilization = () => {
                 </div>
                 <div className="shrink-0 text-right">
                   <span className="text-sm font-semibold tabular-nums">{formatHours(row.totalHours)}</span>
-                  {hasOriginalTotalHours && (
-                    <span className="block text-[11px] text-muted-foreground tabular-nums">
-                      Orig: {formatHours(row.originalTotalHours)}
-                    </span>
-                  )}
                 </div>
                 <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
               </button>
@@ -880,8 +827,6 @@ const ResourceProjectUtilization = () => {
             <DrawerContent
               selectedRow={selectedRow}
               monthLabel={monthLabel}
-              hasOriginalTotalHours={hasOriginalTotalHours}
-              hasOriginalProjectHours={hasOriginalProjectHours}
             />
           )}
         </SheetContent>

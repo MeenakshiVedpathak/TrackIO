@@ -21,6 +21,11 @@ export const servicePOsApi = {
     apiClient
       .get('/service-pos/active/list', { ...crossBuScopeForAdmin(), ...explicitBuScope(buId), params: scopeToParams(scope) })
       .then((r) => r.data?.data ?? []),
+  // Distinct creators ({ id, full_name }) of Service POs in the caller's scope — feeds the "Created By" filter.
+  getCreators: (params) =>
+    apiClient
+      .get('/service-pos/creators', { ...crossBuScopeForAdmin(), params })
+      .then((r) => r.data?.data ?? []),
   getById: (id) => apiClient.get(`/service-pos/${id}`, { ...crossBuScopeForAdmin() }).then((r) => r.data?.data),
   create: (payload) => apiClient.post('/service-pos', payload).then((r) => r.data),
   update: (id, payload) => apiClient.put(`/service-pos/${id}`, payload).then((r) => r.data),

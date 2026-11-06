@@ -2,6 +2,7 @@ import { Navigate, Outlet } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { useAuth } from '@/hooks/useAuth';
 import AuthHeroWaves from '@/components/auth/AuthHeroWaves';
+import SiteLogo from '@/components/common/SiteLogo';
 
 const AuthLayout = () => {
   const { isAuthenticated, homeRoute } = useAuth();
@@ -31,9 +32,8 @@ const AuthLayout = () => {
           animate={{ opacity: 1, y: 0, scale: 1 }}
           transition={{ duration: 0.7, ease: 'easeOut' }}
         >
-          <motion.img
-            src="/logo-dark.png"
-            alt="Trackio"
+          <SiteLogo
+            as={motion.img}
             className="h-[clamp(3.5rem,7vw,5rem)] object-contain"
             animate={{
               scale: [1, 1.05, 1],
@@ -111,7 +111,7 @@ const AuthLayout = () => {
             animate={{ opacity: 1, y: 0, scale: 1 }}
             transition={{ duration: 0.7, ease: 'easeOut' }}
           >
-            <img src="/logo-dark.png" alt="Trackio" className="h-[clamp(2.5rem,6vw,3rem)] object-contain" />
+            <SiteLogo className="h-[clamp(2.5rem,6vw,3rem)] object-contain" />
             <p className="mt-1.5 text-[clamp(0.625rem,1.8vw,0.6875rem)] font-semibold uppercase tracking-[0.2em] text-white/50">
               Workforce Intelligence
             </p>

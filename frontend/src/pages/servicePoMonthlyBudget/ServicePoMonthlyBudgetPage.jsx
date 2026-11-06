@@ -6,6 +6,7 @@ import FilterPanel from '@/components/common/FilterPanel';
 import SearchInput from '@/components/common/SearchInput';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
@@ -26,6 +27,7 @@ const CURRENT_MONTH = now.getMonth() + 1;
 const CURRENT_YEAR = now.getFullYear();
 
 const ServicePoMonthlyBudgetPage = () => {
+  const confirmExport = useExportConfirm();
   const [year, setYear] = useState(CURRENT_YEAR);
   const [selectedMonth, setSelectedMonth] = useState(CURRENT_MONTH);
   // null = sheet closed, otherwise { servicePoId, month, year } for the PO card that was clicked.
@@ -232,7 +234,7 @@ const ServicePoMonthlyBudgetPage = () => {
               variant="outline"
               size="toolbar"
               disabled={!canExport}
-              onClick={() => monthlyListRef.current?.exportExcel()}
+              onClick={() => confirmExport(() => monthlyListRef.current?.exportExcel())}
             >
               <Download className="h-4 w-4" /> Export Excel
             </Button>

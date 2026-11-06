@@ -3,7 +3,6 @@ import * as XLSX from 'xlsx';
 import { createColumnHelper } from '@tanstack/react-table';
 import { ChevronDown, ChevronUp, ChevronsUpDown, Download, Info } from 'lucide-react';
 import { useServicePOHoursBudget } from '@/hooks/useReports';
-import { useCanViewOriginalData } from '@/hooks/usePermissions';
 import { useAuth } from '@/hooks/useAuth';
 import { useActiveEmployees } from '@/hooks/useEmployees';
 import { useActiveClients } from '@/hooks/useClients';
@@ -12,11 +11,13 @@ import { useActiveServiceTypes } from '@/hooks/useServiceTypes';
 import { formatCurrency, formatHours } from '@/utils/formatters';
 import DataTable from '@/components/common/DataTable';
 import PageHeader from '@/components/common/PageHeader';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import EmptyState from '@/components/common/EmptyState';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { MultiSelect } from '@/components/ui/multi-select';
@@ -99,7 +100,12 @@ const SortableHeader = ({ label, column, sortBy, sortOrder, onSort, align, help 
 
 // enableSorting is false throughout: sorting is the SERVER's (sortBy/sortOrder), so TanStack must
 // not also reorder the page it was handed — the header buttons drive the request instead.
-const getColumns = (sortBy, sortOrder, onSort, { hasOrigTotalHours } = {}) => [
+// One Total PO Hours value per row, picked by the Hours basis switch — Adjusted and Original are
+// never shown side by side.
+const getTotalHours = (row, hoursSource) =>
+  hoursSource === HOURS_ORIGINAL ? (row.original_total_hours ?? row.total_hours) : row.total_hours;
+
+const getColumns = (sortBy, sortOrder, onSort, hoursSource) => [
   columnHelper.accessor('month', {
     header: 'Month',
     size: 110,
@@ -132,7 +138,8 @@ const getColumns = (sortBy, sortOrder, onSort, { hasOrigTotalHours } = {}) => [
       <div className="truncate max-w-[180px]" title={info.getValue()}>{info.getValue() || '—'}</div>
     ),
   }),
-  columnHelper.accessor('total_hours', {
+  columnHelper.accessor((row) => getTotalHours(row, hoursSource), {
+    id: 'total_hours',
     header: () => (
       <SortableHeader label="Total PO Hours" column={SORTABLE.TOTAL_HOURS} sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} align="right" />
     ),
@@ -141,18 +148,6 @@ const getColumns = (sortBy, sortOrder, onSort, { hasOrigTotalHours } = {}) => [
     enableSorting: false,
     cell: (info) => <ZeroableNumber value={info.getValue()} format="hours" />,
   }),
-  ...(hasOrigTotalHours ? [
-    columnHelper.accessor('original_total_hours', {
-      header: 'Original Total PO Hours',
-      size: 180,
-      meta: { align: 'right' },
-      enableSorting: false,
-      cell: (info) => {
-        const val = info.getValue();
-        return val != null ? <span className="text-muted-foreground"><ZeroableNumber value={val} format="hours" /></span> : <span className="text-muted-foreground">—</span>;
-      },
-    }),
-  ] : []),
   columnHelper.accessor('cost_budget', {
     header: () => (
       <SortableHeader
@@ -172,15 +167,13 @@ const getColumns = (sortBy, sortOrder, onSort, { hasOrigTotalHours } = {}) => [
   }),
 ];
 
-const exportToExcel = (rows) => {
-  const hasOrigTotalHours = rows.some((r) => r.original_total_hours != null);
+const exportToExcel = (rows, hoursSource) => {
   const header = [
     'Month',
     'PO Code',
     'Service PO',
     'Client',
-    'Total PO Hours',
-    ...(hasOrigTotalHours ? ['Original Total PO Hours'] : []),
+    hoursSource === HOURS_ORIGINAL ? 'Total PO Hours (Original)' : 'Total PO Hours',
     'Cost Budget',
   ];
   const dataRows = rows.map((r) => [
@@ -189,8 +182,7 @@ const exportToExcel = (rows) => {
     r.service_po_name ?? '',
     r.client_name ?? '',
     // Zeros are meaningful here (see ZeroableNumber) — exported as 0, never as a blank cell.
-    Number(r.total_hours ?? 0),
-    ...(hasOrigTotalHours ? [r.original_total_hours != null ? Number(r.original_total_hours) : ''] : []),
+    Number(getTotalHours(r, hoursSource) ?? 0),
     Number(r.cost_budget ?? 0),
   ]);
   const ws = XLSX.utils.aoa_to_sheet([header, ...dataRows]);
@@ -200,6 +192,7 @@ const exportToExcel = (rows) => {
 };
 
 const ServicePOHoursBudget = () => {
+  const confirmExport = useExportConfirm();
   const [periodMode, setPeriodMode] = useState('month');
   const [monthYear, setMonthYear] = useState({
     month: prevMonth.getMonth() + 1,
@@ -221,14 +214,9 @@ const ServicePOHoursBudget = () => {
   const [sortBy, setSortBy] = useState(SORTABLE.TOTAL_HOURS);
   const [sortOrder, setSortOrder] = useState('DESC');
 
-  const canViewOriginal = useCanViewOriginalData();
   const { roleObjects } = useAuth();
 
-  // Original hours are a privileged view; if the permission is lost mid-session the toggle
-  // disappears and the request must fall back to Published rather than keep asking for 'O'.
-  useEffect(() => {
-    if (!canViewOriginal) setHoursSource('M');
-  }, [canViewOriginal]);  const scope = useMemo(() => ({ entityIds, businessUnitIds: buIds }), [entityIds, buIds]);
+  const scope = useMemo(() => ({ entityIds, businessUnitIds: buIds }), [entityIds, buIds]);
 
 
   const { data: activeEmployees = [] } = useActiveEmployees(undefined, scope);
@@ -275,6 +263,7 @@ const ServicePOHoursBudget = () => {
     clientId.length > 0,
     poId.length > 0,
     serviceTypeId.length > 0,
+    hoursSource !== HOURS_ADJUSTED,
   ].filter(Boolean).length;
 
   const clearFilters = () => {
@@ -284,6 +273,7 @@ const ServicePOHoursBudget = () => {
     setClientId([]);
     setPoId([]);
     setServiceTypeId([]);
+    setHoursSource(HOURS_ADJUSTED);
     setPage(1);
   };
 
@@ -306,13 +296,11 @@ const ServicePOHoursBudget = () => {
 
   // Exports the current page only — this report is server-paginated, so the rest of the result
   // set is not in memory.
-  const handleExport = () => exportToExcel(records);
-
-  const hasOrigTotalHours = useMemo(() => records.some((r) => r.original_total_hours != null), [records]);
+  const handleExport = () => exportToExcel(records, hoursSource);
 
   const columns = useMemo(() => {
-    return getColumns(sortBy, sortOrder, handleSort, { hasOrigTotalHours });
-  }, [sortBy, sortOrder, hasOrigTotalHours]);
+    return getColumns(sortBy, sortOrder, handleSort, hoursSource);
+  }, [sortBy, sortOrder, hoursSource]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -320,32 +308,13 @@ const ServicePOHoursBudget = () => {
         title="PO Hours & Budget"
         actions={
           <div className="flex flex-wrap items-center gap-2">
-            {canViewOriginal && (
-              <div className="flex items-center gap-0.5 p-0.5 rounded-xl bg-muted border shrink-0">
-                {[
-                  { value: 'O', label: 'Original' },
-                  { value: 'M', label: 'Published' },
-                ].map(({ value, label }) => (
-                  <button
-                    key={value}
-                    type="button"
-                    onClick={() => { setHoursSource(value); setPage(1); }}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-                      hoursSource === value ? 'bg-card shadow-sm text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground hover:text-foreground'
-                    }`}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-            )}
             <FilterToggleButton
               isOpen={filtersOpen}
               onToggle={() => setFiltersOpen((p) => !p)}
               activeCount={activeFilterCount}
             />
             {records.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)}>
                 <Download className="h-4 w-4" />Export Excel
               </Button>
             )}
@@ -426,6 +395,12 @@ const ServicePOHoursBudget = () => {
             />
           )}
         </div>
+
+        <HoursBasisToggle
+          value={hoursSource}
+          onChange={(v) => { setHoursSource(v); setPage(1); }}
+          labelClassName={FILTER_LABEL}
+        />
 
         <div className="flex flex-col gap-1.5">
           <Label className={FILTER_LABEL}>Resource</Label>

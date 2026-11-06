@@ -7,7 +7,6 @@ import { useActiveClients } from '@/hooks/useClients';
 import { useActiveServicePOs } from '@/hooks/useServicePOs';
 import { useActiveServiceTypes } from '@/hooks/useServiceTypes';
 import { useActiveEmployees } from '@/hooks/useEmployees';
-import { useCanViewOriginalData } from '@/hooks/usePermissions';
 import { formatCurrency, formatHours, formatPercentage } from '@/utils/formatters';
 import { cn } from '@/utils/cn';
 import DataTable from '@/components/common/DataTable';
@@ -17,6 +16,8 @@ import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
 import EmptyState from '@/components/common/EmptyState';
+import HoursBasisToggle, { HOURS_ADJUSTED } from '@/components/common/HoursBasisToggle';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
@@ -241,6 +242,7 @@ const ReportSection = ({ title, children }) => (
 );
 
 const MonthlyHoursTrend = () => {
+  const confirmExport = useExportConfirm();
   const [periodMode, setPeriodMode] = useState('month');
   const [monthYear, setMonthYear] = useState({
     month: prevMonth.getMonth() + 1,
@@ -256,14 +258,8 @@ const MonthlyHoursTrend = () => {
   const [entityIds, setEntityIds] = useState([]);
   const [buIds, setBuIds] = useState([]);
 
-  const canViewOriginal = useCanViewOriginalData();
   const [hoursSource, setHoursSource] = useState('M');
 
-  // Role no longer grants Original-data visibility (e.g. role reassigned mid-session) — force
-  // back to Modified, same as every other report.
-  useEffect(() => {
-    if (!canViewOriginal) setHoursSource('M');
-  }, [canViewOriginal]);
 
   const scope = useMemo(() => ({ entityIds, businessUnitIds: buIds }), [entityIds, buIds]);
   const { data: activeClients = [] } = useActiveClients(scope);
@@ -360,9 +356,11 @@ const MonthlyHoursTrend = () => {
     clientIds.length > 0,
     poIds.length > 0,
     serviceTypeIds.length > 0,
+    hoursSource !== HOURS_ADJUSTED,
   ].filter(Boolean).length;
 
   const clearFilters = () => {
+    setHoursSource(HOURS_ADJUSTED);
     setEntityIds([]);
     setBuIds([]);
     setEmployeeIds([]);
@@ -380,37 +378,13 @@ const MonthlyHoursTrend = () => {
         title="Monthly Hours Trend"
         actions={
           <div className="flex flex-wrap items-center gap-2">
-            {canViewOriginal && (
-              <div className="flex flex-col items-end gap-0.5">
-                <div className="flex items-center gap-0.5 p-0.5 rounded-xl bg-muted border shrink-0">
-                  {[
-                    { value: 'O', label: 'Original' },
-                    { value: 'M', label: 'Adjusted' },
-                  ].map(({ value, label }) => (
-                    <button
-                      key={value}
-                      type="button"
-                      onClick={() => setHoursSource(value)}
-                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-                        hoursSource === value ? 'bg-card shadow-sm text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground hover:text-foreground'
-                      }`}
-                    >
-                      {label}
-                    </button>
-                  ))}
-                </div>
-                <span className="text-[10px] text-muted-foreground">
-                  {hoursSource === 'O' ? 'Original (as logged, before the monthly cap)' : 'Adjusted (after sync)'}
-                </span>
-              </div>
-            )}
             <FilterToggleButton
               isOpen={filtersOpen}
               onToggle={() => setFiltersOpen((p) => !p)}
               activeCount={activeFilterCount}
             />
             {hasAnyData && (
-              <Button variant="outline" size="toolbar" onClick={handleExport}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)}>
                 <Download className="h-4 w-4" />Export Excel
               </Button>
             )}
@@ -488,6 +462,8 @@ const MonthlyHoursTrend = () => {
             />
           )}
         </div>
+
+        <HoursBasisToggle value={hoursSource} onChange={setHoursSource} labelClassName={FILTER_LABEL} />
 
         <div className="flex flex-col gap-1.5">
           <Label className={FILTER_LABEL}>Client</Label>

@@ -23,6 +23,7 @@ import EntityFilter from '@/components/common/EntityFilter';
 import BulkReminderProgressModal from '@/components/common/BulkReminderProgressModal';
 import EmptyState from '@/components/common/EmptyState';
 import MobilePagination from '@/components/common/MobilePagination';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -221,6 +222,7 @@ const columns = buildColumns();
 // ── Main component ────────────────────────────────────────────────────────────
 
 const EmployeeWorkLogComplianceReport = () => {
+  const confirmExport = useExportConfirm();
   const { success: toastSuccess, error: toastError } = useNotification();
 
   // ── Filter state ──
@@ -558,7 +560,7 @@ const EmployeeWorkLogComplianceReport = () => {
 
             {/* Export */}
             {hasRecords && (
-              <Button variant="outline" size="toolbar" onClick={handleExport}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)}>
                 <Download className="h-4 w-4" />Export Excel
               </Button>
             )}

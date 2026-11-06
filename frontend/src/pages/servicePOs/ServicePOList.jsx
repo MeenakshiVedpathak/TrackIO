@@ -3,7 +3,7 @@ import * as XLSX from 'xlsx';
 import { useLocation, useNavigate, useSearchParams, Outlet } from 'react-router-dom';
 import { createColumnHelper } from '@tanstack/react-table';
 import { Plus, Pencil, Eye, Download, Upload, Users, GitBranch, MoreVertical, ChevronLeft, ChevronRight } from 'lucide-react';
-import { useServicePOs } from '@/hooks/useServicePOs';
+import { useServicePOs, useServicePOCreators } from '@/hooks/useServicePOs';
 import { servicePOsApi } from '@/api/servicePOs.api';
 import { useActiveClients } from '@/hooks/useClients';
 import { useCompanies } from '@/hooks/useCompanies';
@@ -19,7 +19,7 @@ import { useDebounce } from '@/hooks/useDebounce';
 import { useMasterBuFilter } from '@/hooks/useMasterBuFilter';
 import { dedupeBusinessUnitIds } from '@/components/common/HierarchicalBuSelector';
 import { buildPath, ROUTES } from '@/constants/routes';
-import { formatCurrency, formatDate, getInitials } from '@/utils/formatters';
+import { formatDate, getInitials } from '@/utils/formatters';
 import DataTable from '@/components/common/DataTable';
 import EmptyState from '@/components/common/EmptyState';
 import PageHeader from '@/components/common/PageHeader';
@@ -30,6 +30,7 @@ import SearchInput from '@/components/common/SearchInput';
 import BusinessUnitFilter from '@/components/common/BusinessUnitFilter';
 import { toHierarchicalBuOptions } from '@/utils/buHierarchy';
 import EntityFilter from '@/components/common/EntityFilter';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import ServicePOHierarchyDrawer from './ServicePOHierarchyDrawer';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
@@ -56,7 +57,7 @@ const exportToExcel = (rows, categoryByTypeId, buOpts) => {
   const { isCompanyLessActor, buRootNameById, subBuNameById, buNameById } = buOpts ?? {};
   const header = [
     'Service PO Number', 'Service PO Name', 'Client', 'Project', 'Service Category', 'Service Type', 'Account Manager',
-    'Description', 'PO Value', 'Invoice Frequency', 'Invoice Amount',
+    'Description', 'Invoice Frequency', 'Invoice Amount',
     'Start Date', 'End Date', 'Status', 'Created By',
     ...(isCompanyLessActor ? ['BU Name', 'Sub BU'] : []),
     'Project Manager',
@@ -70,7 +71,6 @@ const exportToExcel = (rows, categoryByTypeId, buOpts) => {
     r.serviceType?.service_type_name ?? '',
     r.account_manager ?? '',
     r.service_description ?? '',
-    r.po_value != null ? Number(r.po_value) : '',
     r.invoice_frequency ?? '',
     r.invoice_amount != null ? Number(r.invoice_amount) : '',
     r.start_date ? formatDate(r.start_date) : '',
@@ -116,6 +116,7 @@ const TruncatedCell = ({ value, maxWidth = '150px', className, wrap = false }) =
 };
 
 const ServicePOList = () => {
+  const confirmExport = useExportConfirm();
   const navigate = useNavigate();
   const location = useLocation();
   const { hasRole } = useAuth();
@@ -226,6 +227,7 @@ const ServicePOList = () => {
   const [categoryFilter, setCategoryFilter] = useState(categoryIdParam || 'all');
   const [typeFilter, setTypeFilter] = useState(() => searchParams.get('service_type_id') || 'all');
   const [poFilter, setPoFilter] = useState(servicePoIdParam || 'all');
+  const [createdByFilter, setCreatedByFilter] = useState(() => searchParams.get('created_by') || 'all');
   const [buFilters, setBuFilters] = useState(() => (businessUnitIdsParam ? businessUnitIdsParam.split(',') : []));
   // Sending a Parent BU id together with one of its own Sub-BU ids makes the backend resolve the
   // Parent back to "itself + every child", silently re-widening the result right back to the whole
@@ -296,6 +298,7 @@ const ServicePOList = () => {
     if (categoryFilter !== 'all') next.set('service_category_id', categoryFilter);
     if (typeFilter !== 'all') next.set('service_type_id', typeFilter);
     if (poFilter !== 'all') next.set('service_po_id', poFilter);
+    if (createdByFilter !== 'all') next.set('created_by', createdByFilter);
     if (sorting[0]) {
       next.set('sortBy', sorting[0].id);
       next.set('sortOrder', sorting[0].desc ? 'desc' : 'asc');
@@ -310,7 +313,7 @@ const ServicePOList = () => {
     setSearchParams(next, { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
-    page, limit, debouncedSearch, statusFilter, clientFilter, categoryFilter, typeFilter, poFilter,
+    page, limit, debouncedSearch, statusFilter, clientFilter, categoryFilter, typeFilter, poFilter, createdByFilter,
     sorting, isAdminActor, adminEntityFilters, dedupedBuFilters, entityId, buId,
   ]);
 
@@ -324,6 +327,7 @@ const ServicePOList = () => {
     ...(categoryFilter !== 'all' && { service_category_id: categoryFilter }),
     ...(typeFilter !== 'all' && { service_type_id: typeFilter }),
     ...(poFilter !== 'all' && { service_po_id: poFilter }),
+    ...(createdByFilter !== 'all' && { created_by: createdByFilter }),
     // Admin-only — no X-Company-Id is sent for them, so this is the only BU/Entity narrowing they
     // get. Same `entityIds`/`businessUnitIds` (comma-separated) convention the non-Admin path uses
     // just above via useMasterBuFilter — GET /service-pos already supports both independently, so
@@ -338,9 +342,34 @@ const ServicePOList = () => {
   const { data: activePOs = [] } = useActiveServicePOs();
   const { data: serviceTypes = [] } = useActiveServiceTypes();
   const { data: serviceCategories = [] } = useActiveServiceCategories();
+  const creatorScopeParams = {
+    ...buParams,
+    ...(isAdminActor && adminEntityFilters.length > 0 && { entityIds: adminEntityFilters.join(',') }),
+    ...(isAdminActor && dedupedBuFilters.length > 0 && { businessUnitIds: dedupedBuFilters.join(',') }),
+  };
+  const { data: creators = [] } = useServicePOCreators(creatorScopeParams);
 
   const servicePOs = data?.data ?? [];
   const meta = data?.meta ?? {};
+
+  // Only people who actually created a Service PO (GET /service-pos/creators). Creators visible in
+  // the current list are merged in as a fallback so the filter still works before the endpoint exists.
+  const creatorOptions = useMemo(() => {
+    const map = new Map();
+    creators.forEach((c) => {
+      if (c?.id) map.set(String(c.id), c.full_name || c.name || `Employee #${c.id}`);
+    });
+    servicePOs.forEach((po) => {
+      const creatorId = po.created_by ?? po.creator?.id;
+      const creatorName = po.creator?.full_name;
+      if (creatorId && creatorName && !map.has(String(creatorId))) {
+        map.set(String(creatorId), creatorName);
+      }
+    });
+    return Array.from(map.entries())
+      .map(([value, label]) => ({ label, value }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+  }, [creators, servicePOs]);
 
   // Category → Type: only show types belonging to the selected category
   const filteredServiceTypes = categoryFilter === 'all'
@@ -390,6 +419,7 @@ const ServicePOList = () => {
     typeFilter !== 'all' ? 1 : 0,
     poFilter !== 'all' ? 1 : 0,
     statusFilter !== 'all' ? 1 : 0,
+    createdByFilter !== 'all' ? 1 : 0,
     isAdminActor && buFilters.length > 0 ? 1 : 0,
     isAdminActor && adminEntityFilters.length > 0 ? 1 : 0,
     isEntityFiltered ? 1 : 0,
@@ -402,6 +432,7 @@ const ServicePOList = () => {
     setTypeFilter('all');
     setPoFilter('all');
     setStatusFilter('all');
+    setCreatedByFilter('all');
     setBuFilters([]);
     setAdminEntityFilters([]);
     resetEntityId();
@@ -591,16 +622,6 @@ const ServicePOList = () => {
       size: 200,
       cell: (info) => <TruncatedCell value={info.getValue()} maxWidth="180px" className="text-muted-foreground" />,
     }),
-    columnHelper.accessor('po_value', {
-      header: 'PO Value',
-      size: 130,
-      cell: (info) =>
-        info.getValue() != null ? (
-          formatCurrency(info.getValue())
-        ) : (
-          <span className="text-muted-foreground">—</span>
-        ),
-    }),
     columnHelper.accessor('invoice_frequency', {
       header: 'Invoice Freq.',
       size: 150,
@@ -661,7 +682,7 @@ const ServicePOList = () => {
                 activeCount={activeFilterCount}
               />
               {servicePOs.length > 0 && (
-                <Button variant="outline" size="toolbar" onClick={handleExport} disabled={exporting}>
+                <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)} disabled={exporting}>
                   <Download className="h-4 w-4" /> {exporting ? 'Exporting…' : 'Export Excel'}
                 </Button>
               )}
@@ -721,7 +742,7 @@ const ServicePOList = () => {
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
                 {servicePOs.length > 0 && (
-                  <DropdownMenuItem onClick={handleExport} disabled={exporting} className="cursor-pointer">
+                  <DropdownMenuItem onClick={() => confirmExport(handleExport)} disabled={exporting} className="cursor-pointer">
                     <Download className="h-4 w-4" /> {exporting ? 'Exporting…' : 'Export Excel'}
                   </DropdownMenuItem>
                 )}
@@ -741,15 +762,13 @@ const ServicePOList = () => {
         </div>
       </div>
 
-      {/* Up to seven filters (Entity, Business Unit, Client, Category, Service Type, Service PO,
-          Status) on one row for an Admin whose BUs span more than one Entity — the panel's default
-          caps at 4 per row, which wrapped the extras onto a second line. Steps down on narrower
-          viewports rather than squeezing seven selects into a phone width. A single-BU login has
-          five (no Entity/BU cells) and still fills one row. */}
+      {/* Up to eight filters (Entity, Business Unit, Client, Category, Service Type, Service PO,
+          Status, Created By) on one row for an Admin whose BUs span more than one Entity — steps down
+          on narrower viewports rather than squeezing selects into a phone width. */}
       <FilterPanel
         isOpen={filtersOpen}
         maxHeightClass="max-h-[460px]"
-        gridClassName="grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-7 gap-[clamp(0.5rem,0.8vw,0.75rem)] w-full"
+        gridClassName="grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-8 gap-[clamp(0.5rem,0.8vw,0.75rem)] w-full"
         onClear={clearFilters}
         showClear={activeFilterCount > 0}
       >
@@ -887,6 +906,20 @@ const ServicePOList = () => {
               value={statusFilter}
               onValueChange={(v) => { setStatusFilter(v); setPage(1); }}
               placeholder="All statuses"
+              className="h-[clamp(1.875rem,2vw,2.25rem)] w-full text-[clamp(0.75rem,0.85vw,0.875rem)] bg-white"
+            />
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <Label className="text-xs">Created By</Label>
+            <SearchableSelect
+              options={[
+                { label: "All Creators", value: "all" },
+                ...creatorOptions,
+              ]}
+              value={createdByFilter}
+              onValueChange={(v) => { setCreatedByFilter(v); setPage(1); }}
+              placeholder="All Creators"
+              searchPlaceholder="Search creator..."
               className="h-[clamp(1.875rem,2vw,2.25rem)] w-full text-[clamp(0.75rem,0.85vw,0.875rem)] bg-white"
             />
           </div>

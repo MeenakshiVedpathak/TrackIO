@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import { AnimatePresence, motion } from 'framer-motion';
+import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
 import dayjs from 'dayjs';
-import { Bot, X } from 'lucide-react';
+import { Sparkles, X } from 'lucide-react';
 import AICopilotBubble from './AICopilotBubble';
 import AIChatPanel from './AIChatPanel';
 import { useAICopilot } from '@/hooks/useAICopilot';
@@ -33,6 +33,7 @@ const AICopilotWidget = () => {
   const displayName = employee?.full_name ?? employee?.email?.split('@')[0] ?? 'there';
   const copilot = useAICopilot();
   const widgetRef = useRef(null);
+  const reduceMotion = useReducedMotion();
   const [chatOpen, setChatOpen] = useState(false);
   const [bubbleVisible, setBubbleVisible] = useState(false);
   // Lazy-init from a sessionStorage cache: MainLayout (and this widget along with it) gets
@@ -138,25 +139,62 @@ const AICopilotWidget = () => {
         )}
       </AnimatePresence>
 
+      {/* Pill launcher: icon-only at rest, label slides open on hover/focus. */}
       <motion.button
+        type="button"
         onClick={toggleChat}
-        whileHover={{ scale: 1.05 }}
-        whileTap={{ scale: 0.95 }}
+        whileHover={reduceMotion ? undefined : { y: -2 }}
+        whileTap={reduceMotion ? undefined : { scale: 0.95 }}
+        aria-label={chatOpen ? 'Close AI Copilot' : 'Open AI Copilot'}
+        aria-expanded={chatOpen}
         className={cn(
-          'relative h-14 w-14 rounded-2xl shadow-xl flex items-center justify-center shrink-0',
-          'text-white',
+          'group relative flex shrink-0 items-center overflow-hidden rounded-full text-white',
+          'h-[clamp(2.75rem,3.4vw,3.5rem)] pl-[clamp(0.75rem,1vw,1rem)] pr-[clamp(0.75rem,1vw,1rem)]',
+          'shadow-[0_8px_24px_-6px_rgba(79,70,229,0.55)] ring-1 ring-white/25',
+          'transition-shadow duration-200 hover:shadow-[0_12px_30px_-6px_rgba(79,70,229,0.7)]',
+          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 focus-visible:ring-offset-indigo-600',
         )}
-        style={{ background: 'linear-gradient(135deg, #7c3aed, #4f46e5 55%, #2563eb)' }}
-        title="AI Copilot"
+        style={{ background: 'linear-gradient(135deg, #8b5cf6, #6366f1 50%, #3b82f6)' }}
       >
-        {!chatOpen && (
+        {/* Soft pulse ring while idle — skipped for reduced-motion users. */}
+        {!chatOpen && !reduceMotion && (
           <motion.span
-            className="absolute inset-0 rounded-2xl"
-            animate={{ boxShadow: ['0 0 0 0 rgba(124,58,237,0.35)', '0 0 0 10px rgba(124,58,237,0)', '0 0 0 0 rgba(124,58,237,0)'] }}
-            transition={{ duration: 2.4, repeat: Infinity, ease: 'easeInOut' }}
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-0 rounded-full"
+            animate={{ boxShadow: ['0 0 0 0 rgba(139,92,246,0.45)', '0 0 0 12px rgba(139,92,246,0)'] }}
+            transition={{ duration: 2.2, repeat: Infinity, ease: 'easeOut' }}
           />
         )}
-        {chatOpen ? <X className="h-6 w-6" /> : <Bot className="h-6 w-6" />}
+        {/* Top-left glass highlight */}
+        <span aria-hidden="true" className="pointer-events-none absolute inset-0 rounded-full bg-gradient-to-b from-white/25 to-transparent" />
+
+        <span className="relative flex h-[clamp(1.25rem,1.6vw,1.5rem)] w-[clamp(1.25rem,1.6vw,1.5rem)] items-center justify-center">
+          <AnimatePresence mode="wait" initial={false}>
+            <motion.span
+              key={chatOpen ? 'close' : 'open'}
+              initial={reduceMotion ? false : { rotate: -90, opacity: 0, scale: 0.6 }}
+              animate={{ rotate: 0, opacity: 1, scale: 1 }}
+              exit={reduceMotion ? { opacity: 0 } : { rotate: 90, opacity: 0, scale: 0.6 }}
+              transition={{ duration: 0.18 }}
+              className="absolute inset-0 flex items-center justify-center"
+            >
+              {chatOpen ? <X className="h-full w-full" /> : <Sparkles className="h-full w-full" />}
+            </motion.span>
+          </AnimatePresence>
+        </span>
+
+        <span
+          className={cn(
+            'relative max-w-0 overflow-hidden whitespace-nowrap font-semibold opacity-0',
+            'text-[clamp(0.75rem,0.85vw,0.875rem)]',
+            'transition-all duration-300 ease-out',
+            'group-hover:ml-2 group-hover:max-w-[8rem] group-hover:opacity-100',
+            'group-focus-visible:ml-2 group-focus-visible:max-w-[8rem] group-focus-visible:opacity-100',
+          )}
+        >
+          {chatOpen ? 'Close' : 'Ask AI'}
+        </span>
+
       </motion.button>
     </div>
   );

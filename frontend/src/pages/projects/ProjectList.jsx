@@ -19,6 +19,7 @@ import BusinessUnitFilter from '@/components/common/BusinessUnitFilter';
 import EntityFilter from '@/components/common/EntityFilter';
 import SearchInput from '@/components/common/SearchInput';
 import EmptyState from '@/components/common/EmptyState';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { useMasterBuFilter } from '@/hooks/useMasterBuFilter';
 import {
   DropdownMenu,
@@ -108,6 +109,7 @@ const StatusToggle = ({ project, canManage }) => {
 };
  
 const ProjectList = () => {
+  const confirmExport = useExportConfirm();
   const navigate = useNavigate();
   const { error: showError } = useNotification();
  
@@ -502,7 +504,7 @@ const ProjectList = () => {
                 activeCount={activeFilterCount}
               />
               {projects.length > 0 && (
-                <Button variant="outline" size="toolbar" className="bg-white" onClick={handleExport} disabled={exporting}>
+                <Button variant="outline" size="toolbar" className="bg-white" onClick={() => confirmExport(handleExport)} disabled={exporting}>
                   <Download className="h-4 w-4" /> {exporting ? 'Exporting…' : 'Export Excel'}
                 </Button>
               )}
@@ -581,7 +583,7 @@ const ProjectList = () => {
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
                 {projects.length > 0 && (
-                  <DropdownMenuItem onClick={handleExport} disabled={exporting} className="cursor-pointer">
+                  <DropdownMenuItem onClick={() => confirmExport(handleExport)} disabled={exporting} className="cursor-pointer">
                     <Download className="h-4 w-4" /> {exporting ? 'Exporting…' : 'Export Excel'}
                   </DropdownMenuItem>
                 )}

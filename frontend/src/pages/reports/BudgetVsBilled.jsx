@@ -19,6 +19,7 @@ import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
 import EmptyState from '@/components/common/EmptyState';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { MultiSelect } from '@/components/ui/multi-select';
@@ -90,6 +91,7 @@ const SortableHeader = ({ label, column, sortBy, sortOrder, onSort }) => {
 };
 
 const BudgetVsBilled = () => {
+  const confirmExport = useExportConfirm();
   const [periodMode, setPeriodMode] = useState('month');
   const [monthYear, setMonthYear] = useState({
     month: prevMonth.getMonth() + 1,
@@ -341,7 +343,7 @@ const BudgetVsBilled = () => {
               activeCount={activeFilterCount}
             />
             {(byServicePO.length > 0 || monthly.length > 0) && (
-              <Button variant="outline" size="toolbar" onClick={handleExport} disabled={exporting}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)} disabled={exporting}>
                 <Download className="h-4 w-4" />{exporting ? 'Exporting…' : 'Export Excel'}
               </Button>
             )}
@@ -406,11 +408,7 @@ const BudgetVsBilled = () => {
           <Label className="text-xs">Client</Label>
           <MultiSelect
             options={[
-              ...activeClients.map((c) => ({ label: c.client_name, value: String(c.id) , 
-            ...(c.original_total_hours != null ? {'Original Total Hours': c.original_total_hours} : {}),
-            ...(c.original_billable_hours != null ? {'Original Billable Hours': c.original_billable_hours} : {}),
-            ...(c.original_hours != null ? {'Original Hours': c.original_hours} : {})
-          })),
+              ...activeClients.map((c) => ({ label: c.client_name, value: String(c.id) })),
             ]}
             value={clientIds}
             onValueChange={(v) => { setClientIds(v); setPage(1); }}
@@ -424,11 +422,7 @@ const BudgetVsBilled = () => {
           <Label className="text-xs">Service Type</Label>
           <MultiSelect
             options={[
-              ...activeServiceTypes.map((st) => ({ label: st.service_type_name, value: String(st.id) , 
-            ...(st.original_total_hours != null ? {'Original Total Hours': st.original_total_hours} : {}),
-            ...(st.original_billable_hours != null ? {'Original Billable Hours': st.original_billable_hours} : {}),
-            ...(st.original_hours != null ? {'Original Hours': st.original_hours} : {})
-          })),
+              ...activeServiceTypes.map((st) => ({ label: st.service_type_name, value: String(st.id) })),
             ]}
             value={serviceTypeIds}
             onValueChange={handleServiceTypeChange}
@@ -445,10 +439,7 @@ const BudgetVsBilled = () => {
               ...filteredPOs.map((po) => ({
                 label: po.service_po_name || po.service_po_code || String(po.id),
                 value: String(po.id),
-                  ...(po.original_total_hours != null ? {'Original Total Hours': po.original_total_hours} : {}),
-            ...(po.original_billable_hours != null ? {'Original Billable Hours': po.original_billable_hours} : {}),
-            ...(po.original_hours != null ? {'Original Hours': po.original_hours} : {})
-          })),
+              })),
             ]}
             value={poIds}
             onValueChange={(v) => { setPoIds(v); setPage(1); }}

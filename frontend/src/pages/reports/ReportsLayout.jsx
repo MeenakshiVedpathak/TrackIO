@@ -34,6 +34,9 @@ const NAV = [
   { label: 'Employee Work Log Hours Summary', to: ROUTES.REPORT_EMPLOYEE_WORK_LOG_HOURS_SUMMARY },
   { label: 'Employee Role & Organization Mapping', to: ROUTES.REPORT_EMPLOYEE_ROLE_BU_MAPPING },
   { label: 'Team Lead Employee Project Hours', to: ROUTES.REPORT_TEAM_LEAD_EMPLOYEE_PROJECT_HOURS },
+  { label: 'Team Lead Employee PO Hours', to: ROUTES.REPORT_TEAM_LEAD_EMPLOYEE_PO_HOURS },
+  { label: 'BU Employee PO Hours', to: ROUTES.REPORT_BU_ADMIN_EMPLOYEE_PO_HOURS },
+  { label: 'Project Manager Employee PO Hours', to: ROUTES.REPORT_PROJECT_MANAGER_EMPLOYEE_PO_HOURS },
   { label: 'Cross-BU Employee & PO Hours', to: ROUTES.REPORT_CROSS_BU_EMPLOYEE_PO_HOURS },
 ];
 

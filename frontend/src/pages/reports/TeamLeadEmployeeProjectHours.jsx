@@ -10,6 +10,7 @@ import { useNotification } from '@/hooks/useNotification';
 import { downloadBlob } from '@/utils/download';
 import { formatDate } from '@/utils/formatters';
 import PageHeader from '@/components/common/PageHeader';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import FilterPanel from '@/components/common/FilterPanel';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import SearchInput from '@/components/common/SearchInput';
@@ -154,6 +155,7 @@ const columns = [
 ];
 
 const TeamLeadEmployeeProjectHours = () => {
+  const confirmExport = useExportConfirm();
   const { error: showError } = useNotification();
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
@@ -355,7 +357,7 @@ const TeamLeadEmployeeProjectHours = () => {
               activeCount={activeFilterCount}
             />
             {records.length > 0 && (
-              <Button variant="outline" size="sm" onClick={handleExport} disabled={isExporting}>
+              <Button variant="outline" size="sm" onClick={() => confirmExport(handleExport)} disabled={isExporting}>
                 <Download className="mr-1.5 h-4 w-4" />{isExporting ? 'Exporting…' : 'Export Excel'}
               </Button>
             )}

@@ -20,6 +20,7 @@ import PageHeader from '@/components/common/PageHeader';
 import EmptyState from '@/components/common/EmptyState';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 
 // 'weekly' reuses useEmployeeRangeReport exactly like 'range' does — WeekPicker just snaps
 // selection to a Mon-Sat business week instead of two free clicks, writing the same `range` state, so
@@ -65,6 +66,7 @@ const TotalHoursBar = ({ totalHours }) => (
 );
 
 const EmployeeReports = () => {
+  const confirmExport = useExportConfirm();
   const { error: showError } = useNotification();
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
@@ -124,7 +126,7 @@ const EmployeeReports = () => {
               onToggle={() => setFiltersOpen((prev) => !prev)}
             />
             {rows.length > 0 && (
-              <Button variant="outline" size="toolbar" disabled={isExporting} onClick={handleExport}>
+              <Button variant="outline" size="toolbar" disabled={isExporting} onClick={() => confirmExport(handleExport)}>
                 <Download className="h-4 w-4" />
                 {isExporting ? 'Exporting…' : 'Export Excel'}
               </Button>

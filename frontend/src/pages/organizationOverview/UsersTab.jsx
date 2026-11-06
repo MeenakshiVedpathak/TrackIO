@@ -8,6 +8,7 @@ import { FileDown, FileSpreadsheet, FileText } from 'lucide-react';
 import DataTable from '@/components/common/DataTable';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
@@ -57,6 +58,7 @@ const TruncatedCell = ({ value, maxWidth = '150px', className }) => {
 // Tab 4 — all data comes from the same normalized `users` array the parent already holds (one
 // API call); search/filters below are pure client-side derivation, no requests.
 const UsersTab = ({ users, search, isLoading, toolbarSlot }) => {
+  const confirmExport = useExportConfirm();
   const { success, error: showError } = useNotification();
   const [filtersOpen, setFiltersOpen] = useState(false);
   // Multi-select — purely client-side, no backend param involved.
@@ -253,11 +255,11 @@ const UsersTab = ({ users, search, isLoading, toolbarSlot }) => {
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
-              <DropdownMenuItem onClick={handleExportExcel} className="cursor-pointer">
+              <DropdownMenuItem onClick={() => confirmExport(handleExportExcel)} className="cursor-pointer">
                 <FileSpreadsheet className="mr-2 h-4 w-4 text-green-600" />
                 Excel
               </DropdownMenuItem>
-              <DropdownMenuItem onClick={handleExportPDF} className="cursor-pointer">
+              <DropdownMenuItem onClick={() => confirmExport(handleExportPDF)} className="cursor-pointer">
                 <FileText className="mr-2 h-4 w-4 text-red-500" />
                 PDF
               </DropdownMenuItem>

@@ -20,6 +20,8 @@ import DataTable from '@/components/common/DataTable';
 import StatusBadge from '@/components/common/StatusBadge';
 import EmptyState from '@/components/common/EmptyState';
 import RejectEntryDialog from '@/components/employee/RejectEntryDialog';
+import ApprovedEntryActions from '@/components/employee/ApprovedEntryActions';
+import { ApprovedBulkActions, BucketActionsCell, bucketHasApprovedLogs } from '@/components/employee/ApprovedBulkActions';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
@@ -160,6 +162,20 @@ const ManagerAllEmployeesTimesheetView = ({ employeeIds, buId, logType, dateRang
 
   const rowFromCache = (key) => rowsCache.get(key);
 
+  // A date can be selected when it has something to approve OR approved, unsynced logs that can
+  // be reverted/deleted (daily only — the revert/delete endpoints are date-based). The two bulk
+  // groups are derived from the same selection: Approve acts on the still-pending dates, the
+  // Revert/Delete toolbar on the dates that hold approved logs. A mixed date counts in both.
+  const canBulkAct = (r) => logType === 'daily' && bucketHasApprovedLogs(r);
+  const approveTargets = Array.from(selected.values()).filter((t) => {
+    const r = rowFromCache(rowKeyOf(logType, t));
+    return !r || isApprovable(r);
+  });
+  const approvedItems = Array.from(selected.values())
+    .map((t) => rowFromCache(rowKeyOf(logType, t)))
+    .filter((r) => r && canBulkAct(r))
+    .map((r) => ({ employeeId: r.employeeId, employeeName: r.employeeName, date: r.date }));
+
   const anySelected = selected.size > 0;
   const pageSelectedCount = pageRows.filter((r) => isApprovable(r) && selected.has(rowKeyOf(logType, r))).length;
   const pagePendingCount = pageRows.filter(isApprovable).length;
@@ -266,7 +282,7 @@ const ManagerAllEmployeesTimesheetView = ({ employeeIds, buId, logType, dateRang
   };
 
   const handleApproveSelected = () => {
-    const targets = Array.from(selected.values());
+    const targets = approveTargets;
     if (targets.length === 0) return;
     const unit = logType === 'daily' ? 'date' : 'month';
     runApprove(targets, `${targets.length} ${unit}${targets.length === 1 ? '' : 's'} approved.`, { isBulk: true });
@@ -417,7 +433,7 @@ const ManagerAllEmployeesTimesheetView = ({ employeeIds, buId, logType, dateRang
         <Checkbox
           checked={selected.has(rowKeyOf(logType, row.original))}
           onCheckedChange={() => toggleOne(row.original, row.index)}
-          disabled={!isApprovable(row.original)}
+          disabled={!isApprovable(row.original) && !canBulkAct(row.original)}
           onClick={(e) => e.stopPropagation()}
           aria-label="Select row"
         />
@@ -426,9 +442,14 @@ const ManagerAllEmployeesTimesheetView = ({ employeeIds, buId, logType, dateRang
     columnHelper.display({
       id: 'actions',
       header: 'Action',
-      size: 80,
-      cell: ({ row }) =>
-        isApprovable(row.original) ? (
+      size: 180,
+      cell: ({ row }) => (
+        <BucketActionsCell
+          row={row.original}
+          logType={logType}
+          hasPendingActions={isApprovable(row.original)}
+        >
+        {isApprovable(row.original) ? (
           <div className="flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
             <Button
               size="sm"
@@ -451,7 +472,9 @@ const ManagerAllEmployeesTimesheetView = ({ employeeIds, buId, logType, dateRang
           </div>
         ) : (
           <span className="text-sm text-muted-foreground">—</span>
-        ),
+        )}
+        </BucketActionsCell>
+      ),
     }),
     columnHelper.accessor((row) => sortValueOf('employee', row), {
       id: 'employee',
@@ -508,7 +531,7 @@ const ManagerAllEmployeesTimesheetView = ({ employeeIds, buId, logType, dateRang
       <Checkbox
         checked={selected.has(rowKeyOf(logType, rowData))}
         onCheckedChange={() => toggleOne(rowData, row.index)}
-        disabled={!isApprovable(rowData)}
+        disabled={!isApprovable(rowData) && !canBulkAct(rowData)}
         onClick={(e) => e.stopPropagation()}
         aria-label="Select row"
       />
@@ -579,15 +602,16 @@ const ManagerAllEmployeesTimesheetView = ({ employeeIds, buId, logType, dateRang
       {anySelected && (
         <div className="shrink-0 flex flex-wrap items-center justify-between gap-2 rounded-lg border bg-muted/30 px-3 py-2">
           <span className="text-sm font-medium">
-            {selected.size} pending {logType === 'daily' ? 'date' : 'month'}{selected.size === 1 ? '' : 's'} selected
+            {selected.size} {logType === 'daily' ? 'date' : 'month'}{selected.size === 1 ? '' : 's'} selected
             {selectedPageCount > 1 && ` across ${selectedPageCount} pages`}
             {offPageSelectedCount > 0 && ` — ${offPageSelectedCount} not on this page`}
           </span>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <ApprovedBulkActions items={approvedItems} onDone={resetSelection} disabled={isApproving || isRejecting} />
             <Button variant="outline" size="sm" onClick={resetSelection} disabled={isApproving}>
               Clear
             </Button>
-            <Button size="sm" className="gap-1.5" onClick={handleApproveSelected} disabled={isApproving}>
+            <Button size="sm" className="gap-1.5" onClick={handleApproveSelected} disabled={isApproving || approveTargets.length === 0}>
               {isApproving ? (
                 <>
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -707,6 +731,8 @@ const ManagerAllEmployeesTimesheetView = ({ employeeIds, buId, logType, dateRang
                             {r.rejection_remark && <p className="mt-0.5">{r.rejection_remark}</p>}
                           </div>
                         )}
+
+                        <ApprovedEntryActions entry={r} />
 
                         {isEntryPending(r) && (
                           <div className="mt-2 flex justify-end gap-1.5">

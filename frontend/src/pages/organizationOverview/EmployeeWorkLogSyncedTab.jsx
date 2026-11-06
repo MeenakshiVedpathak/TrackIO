@@ -10,6 +10,7 @@ import { useNotification } from '@/hooks/useNotification';
 import { extractApiError } from '@/services/apiClient';
 import { downloadBlob } from '@/utils/download';
 import DataTable from '@/components/common/DataTable';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
@@ -43,6 +44,7 @@ const currentMonthYear = () => {
 // total_hours are sortable, matching the backend's accepted enum; Admin/Entity Name/BU Name have
 // `enableSorting: false`.
 const EmployeeWorkLogSyncedTab = ({ toolbarSlot }) => {
+  const confirmExport = useExportConfirm();
   const { error: showError } = useNotification();
   const [monthYear, setMonthYear] = useState(currentMonthYear);
   const [page, setPage] = useState(1);
@@ -188,7 +190,7 @@ const EmployeeWorkLogSyncedTab = ({ toolbarSlot }) => {
             variant="outline"
             size="toolbar"
             className="bg-white"
-            onClick={handleExport}
+            onClick={() => confirmExport(handleExport)}
             disabled={isExporting}
           >
             <Download className="h-4 w-4" /> {isExporting ? 'Exporting…' : 'Export Excel'}

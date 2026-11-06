@@ -3,7 +3,6 @@ import * as XLSX from 'xlsx';
 import { createColumnHelper } from '@tanstack/react-table';
 import { ChevronDown, ChevronUp, ChevronsUpDown, Download } from 'lucide-react';
 import { useResourceUtilizationTrend } from '@/hooks/useReports';
-import { useCanViewOriginalData } from '@/hooks/usePermissions';
 import { useAuth } from '@/hooks/useAuth';
 import { useActiveEmployees } from '@/hooks/useEmployees';
 import { useActiveClients } from '@/hooks/useClients';
@@ -12,11 +11,13 @@ import { useActiveServiceTypes } from '@/hooks/useServiceTypes';
 import { formatHours, formatPercentage, formatNumber } from '@/utils/formatters';
 import DataTable from '@/components/common/DataTable';
 import PageHeader from '@/components/common/PageHeader';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import EmptyState from '@/components/common/EmptyState';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter from '@/components/common/EntityFilter';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { MultiSelect } from '@/components/ui/multi-select';
@@ -83,7 +84,11 @@ const SortableHeader = ({ label, column, sortBy, sortOrder, onSort, align }) => 
 
 // enableSorting is false throughout: sorting is the SERVER's (sortBy/sortOrder), so TanStack must
 // not also reorder the page it was handed — the header buttons drive the request instead.
-const getColumns = (sortBy, sortOrder, onSort, { hasOrigTotalHours, hasOrigBillableHours, hasOrigUtilization } = {}) => [
+// One value per metric, chosen by the Hours basis switch — in Original mode read the original_*
+// twin (falling back to the plain field, which the API may already fill with original values).
+const pickBasis = (row, field, isOriginal) => (isOriginal ? (row[`original_${field}`] ?? row[field]) : row[field]);
+
+const getColumns = (sortBy, sortOrder, onSort, isOriginal = false) => [
   columnHelper.accessor('month', {
     header: 'Month',
     size: 110,
@@ -110,7 +115,8 @@ const getColumns = (sortBy, sortOrder, onSort, { hasOrigTotalHours, hasOrigBilla
       );
     },
   }),
-  columnHelper.accessor('total_hours', {
+  columnHelper.accessor((row) => pickBasis(row, 'total_hours', isOriginal), {
+    id: 'total_hours',
     header: () => (
       <SortableHeader label="Total Hours" column={SORTABLE.TOTAL_HOURS} sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} align="right" />
     ),
@@ -119,19 +125,8 @@ const getColumns = (sortBy, sortOrder, onSort, { hasOrigTotalHours, hasOrigBilla
     enableSorting: false,
     cell: (info) => <span className="tabular-nums">{formatHours(info.getValue())}</span>,
   }),
-  ...(hasOrigTotalHours ? [
-    columnHelper.accessor('original_total_hours', {
-      header: 'Original Total Hours',
-      size: 160,
-      meta: { align: 'right' },
-      enableSorting: false,
-      cell: (info) => {
-        const val = info.getValue();
-        return <span className="tabular-nums text-muted-foreground">{val != null ? formatHours(val) : '—'}</span>;
-      },
-    }),
-  ] : []),
-  columnHelper.accessor('billable_hours', {
+  columnHelper.accessor((row) => pickBasis(row, 'billable_hours', isOriginal), {
+    id: 'billable_hours',
     header: () => (
       <SortableHeader label="Billable Hours" column={SORTABLE.BILLABLE_HOURS} sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} align="right" />
     ),
@@ -140,19 +135,8 @@ const getColumns = (sortBy, sortOrder, onSort, { hasOrigTotalHours, hasOrigBilla
     enableSorting: false,
     cell: (info) => <span className="tabular-nums">{formatHours(info.getValue())}</span>,
   }),
-  ...(hasOrigBillableHours ? [
-    columnHelper.accessor('original_billable_hours', {
-      header: 'Original Billable Hours',
-      size: 170,
-      meta: { align: 'right' },
-      enableSorting: false,
-      cell: (info) => {
-        const val = info.getValue();
-        return <span className="tabular-nums text-muted-foreground">{val != null ? formatHours(val) : '—'}</span>;
-      },
-    }),
-  ] : []),
-  columnHelper.accessor('utilization_percentage', {
+  columnHelper.accessor((row) => pickBasis(row, 'utilization_percentage', isOriginal), {
+    id: 'utilization_percentage',
     header: () => (
       <SortableHeader label="Utilization %" column={SORTABLE.UTILIZATION} sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} align="right" />
     ),
@@ -169,51 +153,31 @@ const getColumns = (sortBy, sortOrder, onSort, { hasOrigTotalHours, hasOrigBilla
       );
     },
   }),
-  ...(hasOrigUtilization ? [
-    columnHelper.accessor('original_utilization_percentage', {
-      header: 'Original Utilization %',
-      size: 170,
-      meta: { align: 'right' },
-      enableSorting: false,
-      cell: (info) => {
-        const value = info.getValue();
-        if (value == null || value === '') return <span className="text-muted-foreground">—</span>;
-        return (
-          <span className={cn('tabular-nums font-medium', utilizationColorClass(value))}>
-            {formatPercentage(value, 2)}
-          </span>
-        );
-      },
-    }),
-  ] : []),
 ];
 
-const exportToExcel = (rows) => {
-  const hasOrigTotalHours = rows.some((r) => r.original_total_hours != null);
-  const hasOrigBillableHours = rows.some((r) => r.original_billable_hours != null);
-  const hasOrigUtilization = rows.some((r) => r.original_utilization_percentage != null);
+const exportToExcel = (rows, isOriginal = false) => {
+  // Only the active hours basis is exported — one column per metric.
+  const suffix = isOriginal ? ' (Original)' : '';
+  const num = (r, field) => {
+    const v = pickBasis(r, field, isOriginal);
+    return v != null ? Number(v) : '';
+  };
 
   const header = [
     'Month',
     'Employee Code',
     'Resource',
-    'Total Hours',
-    ...(hasOrigTotalHours ? ['Original Total Hours'] : []),
-    'Billable Hours',
-    ...(hasOrigBillableHours ? ['Original Billable Hours'] : []),
-    'Utilization %',
-    ...(hasOrigUtilization ? ['Original Utilization %'] : []),
+    `Total Hours${suffix}`,
+    `Billable Hours${suffix}`,
+    `Utilization %${suffix}`,
   ];
   const dataRows = rows.map((r) => [
     r.month ?? '',
     r.employee_code ?? '',
     r.full_name ?? '',
-    r.total_hours != null ? Number(r.total_hours) : '',
-    ...(hasOrigTotalHours ? [r.original_total_hours != null ? Number(r.original_total_hours) : ''] : []),
-    r.billable_hours != null ? Number(r.billable_hours) : '',
-    ...(hasOrigBillableHours ? [r.original_billable_hours != null ? Number(r.original_billable_hours) : ''] : []),
-    r.utilization_percentage != null ? Number(r.utilization_percentage) : '',
-    ...(hasOrigUtilization ? [r.original_utilization_percentage != null ? Number(r.original_utilization_percentage) : ''] : []),
+    num(r, 'total_hours'),
+    num(r, 'billable_hours'),
+    num(r, 'utilization_percentage'),
   ]);
   const ws = XLSX.utils.aoa_to_sheet([header, ...dataRows]);
   const wb = XLSX.utils.book_new();
@@ -222,6 +186,7 @@ const exportToExcel = (rows) => {
 };
 
 const ResourceUtilizationTrend = () => {
+  const confirmExport = useExportConfirm();
   const [periodMode, setPeriodMode] = useState('month');
   const [monthYear, setMonthYear] = useState({
     month: prevMonth.getMonth() + 1,
@@ -245,14 +210,9 @@ const ResourceUtilizationTrend = () => {
   const [sortBy, setSortBy] = useState(SORTABLE.UTILIZATION);
   const [sortOrder, setSortOrder] = useState('DESC');
 
-  const canViewOriginal = useCanViewOriginalData();
   const { roleObjects } = useAuth();
 
-  // Original hours are a privileged view; if the permission is lost mid-session the toggle
-  // disappears and the request must fall back to Published rather than keep asking for 'O'.
-  useEffect(() => {
-    if (!canViewOriginal) setHoursSource('M');
-  }, [canViewOriginal]);  const scope = useMemo(() => ({ entityIds, businessUnitIds: buIds }), [entityIds, buIds]);
+  const scope = useMemo(() => ({ entityIds, businessUnitIds: buIds }), [entityIds, buIds]);
 
 
   const { data: activeEmployees = [] } = useActiveEmployees(undefined, scope);
@@ -299,6 +259,7 @@ const ResourceUtilizationTrend = () => {
     clientIds.length > 0,
     poIds.length > 0,
     serviceTypeIds.length > 0,
+    hoursSource !== HOURS_ADJUSTED,
   ].filter(Boolean).length;
 
   const clearFilters = () => {
@@ -308,6 +269,7 @@ const ResourceUtilizationTrend = () => {
     setClientIds([]);
     setPoIds([]);
     setServiceTypeIds([]);
+    setHoursSource(HOURS_ADJUSTED);
     setPage(1);
   };
 
@@ -330,19 +292,12 @@ const ResourceUtilizationTrend = () => {
 
   // Exports the current page only — this report is server-paginated, so the rest of the result
   // set is not in memory.
-  const handleExport = () => exportToExcel(records);
-
-  const hasOrigTotalHours = useMemo(() => records.some((r) => r.original_total_hours != null), [records]);
-  const hasOrigBillableHours = useMemo(() => records.some((r) => r.original_billable_hours != null), [records]);
-  const hasOrigUtilization = useMemo(() => records.some((r) => r.original_utilization_percentage != null), [records]);
+  const isOriginal = hoursSource === HOURS_ORIGINAL;
+  const handleExport = () => exportToExcel(records, isOriginal);
 
   const columns = useMemo(() => {
-    return getColumns(sortBy, sortOrder, handleSort, {
-      hasOrigTotalHours,
-      hasOrigBillableHours,
-      hasOrigUtilization,
-    });
-  }, [sortBy, sortOrder, hasOrigTotalHours, hasOrigBillableHours, hasOrigUtilization]);
+    return getColumns(sortBy, sortOrder, handleSort, isOriginal);
+  }, [sortBy, sortOrder, isOriginal]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -350,32 +305,13 @@ const ResourceUtilizationTrend = () => {
         title="Resource Utilization Trend"
         actions={
           <div className="flex flex-wrap items-center gap-2">
-            {canViewOriginal && (
-              <div className="flex items-center gap-0.5 p-0.5 rounded-xl bg-muted border shrink-0">
-                {[
-                  { value: 'O', label: 'Original' },
-                  { value: 'M', label: 'Published' },
-                ].map(({ value, label }) => (
-                  <button
-                    key={value}
-                    type="button"
-                    onClick={() => { setHoursSource(value); setPage(1); }}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-                      hoursSource === value ? 'bg-card shadow-sm text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground hover:text-foreground'
-                    }`}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-            )}
             <FilterToggleButton
               isOpen={filtersOpen}
               onToggle={() => setFiltersOpen((p) => !p)}
               activeCount={activeFilterCount}
             />
             {records.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)}>
                 <Download className="h-4 w-4" />Export Excel
               </Button>
             )}
@@ -456,6 +392,12 @@ const ResourceUtilizationTrend = () => {
             />
           )}
         </div>
+
+        <HoursBasisToggle
+          value={hoursSource}
+          onChange={(v) => { setHoursSource(v); setPage(1); }}
+          labelClassName={FILTER_LABEL}
+        />
 
         <div className="flex flex-col gap-1.5">
           <Label className={FILTER_LABEL}>Resource</Label>

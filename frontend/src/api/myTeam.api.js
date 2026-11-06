@@ -200,6 +200,29 @@ export const myTeamApi = {
   // would otherwise be the only option and doesn't distinguish per-entry status).
   approveTimesheetEntry: (id) =>
     apiClient.put(`/my-team/timesheets/${id}/approve`).then((r) => r.data),
+  // Approved-log correction (approver side). `id` = employee_work_logs.id, same as approve/reject.
+  // Only an approved, not-yet-synced log qualifies (409 otherwise). `reason` is mandatory server-side
+  // (422 when empty) and the UI also blocks an empty one. Response `data.email_status` is
+  // 'sent' | 'failed' | 'no_email' — the action succeeded in all three cases.
+  // Revert: approved -> pending (the Employee can edit it again).
+  revertApprovedTimesheetEntry: (id, reason) =>
+    apiClient.patch(`/my-team/timesheets/${id}/revert`, { reason }).then((r) => r.data),
+  // Delete: the reason goes in the request BODY (axios needs `data`, not `params`, on a DELETE).
+  deleteApprovedTimesheetEntry: (id, reason) =>
+    apiClient.delete(`/my-team/timesheets/${id}`, { data: { reason } }).then((r) => r.data),
+  // Day-wise bulk Revert / Delete of approved logs. `selections` = [{ employee_id, dates: ['YYYY-MM-DD'] }]
+  // (1-62 dates per employee, up to 100 employees). ONE `reason` covers everything. The backend acts on
+  // EVERY approved + unsynced log of each employee on each selected date; pending/rejected/synced logs
+  // and unselected dates are never touched. HTTP 200 does not always mean something happened — callers
+  // must read `data` (total_logs_affected, employees_failed, per-employee results).
+  revertApprovedByDate: ({ selections, reason }) =>
+    apiClient.patch('/my-team/timesheets/revert-by-date', { selections, reason }).then((r) => r.data),
+  // Irreversible: `confirm: true` is mandatory server-side (422 without it) and is only ever sent
+  // after the user explicitly ticks the "cannot be undone" confirmation.
+  deleteApprovedByDate: ({ selections, reason, confirm }) => {
+    if (confirm !== true) return Promise.reject(new Error('Delete requires explicit confirmation.'));
+    return apiClient.delete('/my-team/timesheets/by-date', { data: { selections, reason, confirm: true } }).then((r) => r.data);
+  },
   getServicePos: () => {
     if (RBAC_MOCK_ENABLED) return mockGetServicePos();
     return apiClient.get('/my-team/service-pos').then((r) => r.data?.data ?? []);

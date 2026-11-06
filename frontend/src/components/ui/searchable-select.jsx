@@ -15,6 +15,10 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover"
+import { DELAYED_REVEAL, Spinner } from "@/components/ui/spinner"
+import { useLazyOptions, useOptionsLoading } from "@/components/ui/use-select-options"
+
+const optionSearchText = (opt) => opt.searchValue ?? String(opt.label)
 
 export function SearchableSelect({
   options = [],
@@ -31,10 +35,23 @@ export function SearchableSelect({
   // "no filter" sentinel (e.g. 'all') passes that as `clearValue` so the button round-trips to it.
   clearable = false,
   clearValue = "",
+  // Shows a spinner in the trigger and a "Loading…" row in the list. Left undefined, it's inferred
+  // (no options yet while a query is still loading) — see use-select-options.js.
+  loading,
+  loadingMessage = "Loading…",
 }) {
   const [open, setOpen] = React.useState(false)
+  const [search, setSearch] = React.useState("")
 
   const shouldShowSearch = showSearch !== undefined ? showSearch : true;
+  const isLoading = useOptionsLoading(loading, options.length)
+  // Filtering is done here rather than by cmdk so only a window of the matches is ever mounted —
+  // the rest render as the list scrolls (see useLazyOptions).
+  const { visible, hasMore, onScroll } = useLazyOptions(options, { search, open, getText: optionSearchText })
+
+  React.useEffect(() => {
+    if (!open) setSearch("")
+  }, [open])
 
   const selectedOption = React.useMemo(
     () => options.find((opt) => String(opt.value) === String(value)),
@@ -64,6 +81,7 @@ export function SearchableSelect({
             variant="outline"
             role="combobox"
             aria-expanded={open}
+            aria-busy={isLoading || undefined}
             disabled={disabled}
             className={cn(
               // Fluid clamp() sizing (see button.jsx's own comment) instead of a fixed h-9/text-sm.
@@ -76,19 +94,31 @@ export function SearchableSelect({
             <span className="truncate min-w-0">{selectedOption ? selectedOption.label : placeholder}</span>
             {/* The clear "X" (rendered below, absolutely positioned) takes over this slot once a
                 value is selected — showing both at once crowded them into an unreadable overlap. */}
-            {!showClear && <ChevronDown className="ml-2 h-[1em] w-[1em] shrink-0 opacity-50" />}
+            {isLoading
+              ? <Spinner className="ml-2 h-[1em] w-[1em] shrink-0 text-muted-foreground" />
+              : !showClear && <ChevronDown className="ml-2 h-[1em] w-[1em] shrink-0 opacity-50" />}
           </Button>
         </PopoverTrigger>
         <PopoverContent className="w-[var(--radix-popover-trigger-width)] p-0" align="start">
-          <Command>
-            {shouldShowSearch && <CommandInput placeholder={searchPlaceholder} />}
-            <CommandEmpty>{emptyMessage}</CommandEmpty>
-            <CommandList>
+          <Command shouldFilter={false}>
+            {shouldShowSearch && (
+              <CommandInput placeholder={searchPlaceholder} value={search} onValueChange={setSearch} />
+            )}
+            {isLoading && visible.length === 0 ? (
+              <div role="status" className={cn("flex items-center justify-center gap-2 py-6 text-sm text-muted-foreground", DELAYED_REVEAL)}>
+                <Spinner />
+                {loadingMessage}
+              </div>
+            ) : (
+              <CommandEmpty>{emptyMessage}</CommandEmpty>
+            )}
+            <CommandList onScroll={onScroll}>
               <CommandGroup>
-                {options.map((option) => (
+                {visible.map((option) => (
                   <CommandItem
                     key={option.value}
                     value={option.searchValue ?? String(option.label)}
+                    disabled={option.disabled}
                     onSelect={() => {
                       onValueChange(String(option.value))
                       setOpen(false)
@@ -104,6 +134,12 @@ export function SearchableSelect({
                   </CommandItem>
                 ))}
               </CommandGroup>
+              {hasMore && (
+                <div className="flex items-center justify-center gap-2 py-2 text-xs text-muted-foreground">
+                  <Spinner className="h-3.5 w-3.5" />
+                  Loading more…
+                </div>
+              )}
             </CommandList>
           </Command>
         </PopoverContent>

@@ -16,6 +16,8 @@ import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
 import EmptyState from '@/components/common/EmptyState';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { MultiSelect } from '@/components/ui/multi-select';
@@ -35,13 +37,18 @@ const columnHelper = createColumnHelper();
 const now = new Date();
 const prevMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
 
-const exportToExcel = (rows) => {
-  const hasOriginal = rows.some((r) => r.original_total_hours != null);
+// Picks the active hours basis for one row. Callers only pass HOURS_ORIGINAL when the response
+// actually carries `original_total_hours`, so a response without it behaves exactly like Adjusted.
+const hoursFor = (r, hoursSource) => (
+  hoursSource === HOURS_ORIGINAL ? r.original_total_hours : r.total_hours
+);
+
+const exportToExcel = (rows, hoursSource) => {
+  const isOriginal = hoursSource === HOURS_ORIGINAL;
   const header = [
     'Client',
     'Total Cost',
-    'Total Hours',
-    ...(hasOriginal ? ['Original Total Hours'] : []),
+    `Total Hours${isOriginal ? ' (Original)' : ''}`,
     'Avg Cost/Hour',
     'Total Projects',
     '% of Total Cost',
@@ -49,8 +56,7 @@ const exportToExcel = (rows) => {
   const dataRows = rows.map((r) => [
     r.client_name ?? '',
     r.total_cost != null ? Number(r.total_cost) : '',
-    r.total_hours != null ? Number(r.total_hours) : '',
-    ...(hasOriginal ? [r.original_total_hours != null ? Number(r.original_total_hours) : ''] : []),
+    hoursFor(r, hoursSource) != null ? Number(hoursFor(r, hoursSource)) : '',
     r.average_cost_per_hour != null ? Number(r.average_cost_per_hour) : '',
     r.total_projects != null ? Number(r.total_projects) : '',
     r.percentage_of_total_cost != null ? Number(r.percentage_of_total_cost) : '',
@@ -83,6 +89,7 @@ const SortableHeader = ({ label, column, sortBy, sortOrder, onSort, align }) => 
 };
 
 const ClientWiseAnalytics = () => {
+  const confirmExport = useExportConfirm();
   const [periodMode, setPeriodMode] = useState('month');
   const [monthYear, setMonthYear] = useState({
     month: prevMonth.getMonth() + 1,
@@ -103,6 +110,7 @@ const ClientWiseAnalytics = () => {
   const [sortBy, setSortBy] = useState(null);
   const [sortOrder, setSortOrder] = useState('asc');
   const [exporting, setExporting] = useState(false);
+  const [hoursSource, setHoursSource] = useState(HOURS_ADJUSTED);
 
   const scope = useMemo(() => ({ entityIds, businessUnitIds: buIds }), [entityIds, buIds]);
   const { data: activeEmployees = [] } = useActiveEmployees(undefined, scope);
@@ -131,6 +139,8 @@ const ClientWiseAnalytics = () => {
     : !!(dateRange?.startDate && dateRange?.endDate);
 
   const params = {
+    // Original basis: the server then sorts, ranks and totals on original hours too.
+    ...(hoursSource === HOURS_ORIGINAL && { hoursSource: 'O' }),
     ...(periodMode === 'month'
       ? (monthYear?.month && monthYear?.year && { month: monthYear.month, year: monthYear.year })
       : (dateRange?.startDate && dateRange?.endDate && { startDate: dateRange.startDate, endDate: dateRange.endDate })),
@@ -151,6 +161,9 @@ const ClientWiseAnalytics = () => {
   const records = periodReady && Array.isArray(data?.data) ? data.data : [];
   const meta = data?.meta ?? {};
 
+  const hasOriginal = useMemo(() => records.some((r) => r.original_total_hours != null), [records]);
+  const isOriginal = hasOriginal && hoursSource === HOURS_ORIGINAL;
+
   const activeFilterCount = [
     entityIds.length > 0,
     buIds.length > 0,
@@ -158,6 +171,7 @@ const ClientWiseAnalytics = () => {
     clientIds.length > 0,
     serviceTypeIds.length > 0,
     poIds.length > 0,
+    hoursSource !== HOURS_ADJUSTED,
   ].filter(Boolean).length;
 
   const clearFilters = () => {
@@ -167,6 +181,12 @@ const ClientWiseAnalytics = () => {
     setClientIds([]);
     setServiceTypeIds([]);
     setPoIds([]);
+    setHoursSource(HOURS_ADJUSTED);
+    setPage(1);
+  };
+
+  const handleHoursSourceChange = (v) => {
+    setHoursSource(v);
     setPage(1);
   };
 
@@ -186,15 +206,15 @@ const ClientWiseAnalytics = () => {
       const total = meta.total > 0 ? meta.total : 1000;
       const res = await reportsApi.getClientWiseAnalytics({ ...params, page: 1, limit: total });
       const allRecords = Array.isArray(res?.data) ? res.data : [];
-      exportToExcel(allRecords);
+      const exportOriginal = hoursSource === HOURS_ORIGINAL && allRecords.some((r) => r.original_total_hours != null);
+      exportToExcel(allRecords, exportOriginal ? HOURS_ORIGINAL : HOURS_ADJUSTED);
     } finally {
       setExporting(false);
     }
   };
 
-  const hasOriginal = useMemo(() => {
-    return records.some((r) => r.original_total_hours != null);
-  }, [records]);
+  // Same `total_hours` sort key on both bases — with hoursSource=O the server sorts by original hours.
+  const hoursSortKey = 'total_hours';
 
   const columns = useMemo(() => [
     columnHelper.accessor('client_name', {
@@ -211,24 +231,15 @@ const ClientWiseAnalytics = () => {
       enableSorting: false,
       cell: (info) => <span className="tabular-nums">{formatCurrency(info.getValue())}</span>,
     }),
-    columnHelper.accessor('total_hours', {
+    columnHelper.accessor((r) => hoursFor(r, isOriginal ? HOURS_ORIGINAL : HOURS_ADJUSTED), {
+      id: 'total_hours',
       header: () => (
-        <SortableHeader label="Total Hours" column="total_hours" sortBy={sortBy} sortOrder={sortOrder} onSort={handleSort} />
+        <SortableHeader label="Total Hours" column={hoursSortKey} sortBy={sortBy} sortOrder={sortOrder} onSort={handleSort} />
       ),
       size: 140,
       enableSorting: false,
       cell: (info) => <span className="tabular-nums">{formatHours(info.getValue())}</span>,
     }),
-    ...(hasOriginal ? [
-      columnHelper.accessor('original_total_hours', {
-        header: () => (
-          <SortableHeader label="Original Total Hours" column="original_total_hours" sortBy={sortBy} sortOrder={sortOrder} onSort={handleSort} />
-        ),
-        size: 150,
-        enableSorting: false,
-        cell: (info) => <span className="tabular-nums text-muted-foreground">{info.getValue() != null ? formatHours(info.getValue()) : '—'}</span>,
-      }),
-    ] : []),
     columnHelper.accessor('average_cost_per_hour', {
       header: () => (
         <SortableHeader label="Avg Cost/Hour" column="average_cost_per_hour" sortBy={sortBy} sortOrder={sortOrder} onSort={handleSort} />
@@ -261,7 +272,7 @@ const ClientWiseAnalytics = () => {
         );
       },
     }),
-  ], [sortBy, sortOrder, hasOriginal]);
+  ], [sortBy, sortOrder, isOriginal, hoursSortKey]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -275,7 +286,7 @@ const ClientWiseAnalytics = () => {
               activeCount={activeFilterCount}
             />
             {records.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport} disabled={exporting}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)} disabled={exporting}>
                 <Download className="h-4 w-4" />{exporting ? 'Exporting…' : 'Export Excel'}
               </Button>
             )}
@@ -355,15 +366,15 @@ const ClientWiseAnalytics = () => {
           )}
         </div>
 
+        {(hasOriginal || hoursSource !== HOURS_ADJUSTED) && (
+          <HoursBasisToggle value={hoursSource} onChange={handleHoursSourceChange} labelClassName={FILTER_LABEL} />
+        )}
+
         <div className="flex flex-col gap-1.5">
           <Label className={FILTER_LABEL}>Employee</Label>
           <MultiSelect
             options={[
-              ...activeEmployees.map((e) => ({ label: e.full_name, value: String(e.id) , 
-            ...(e.original_total_hours != null ? {'Original Total Hours': e.original_total_hours} : {}),
-            ...(e.original_billable_hours != null ? {'Original Billable Hours': e.original_billable_hours} : {}),
-            ...(e.original_hours != null ? {'Original Hours': e.original_hours} : {})
-          })),
+              ...activeEmployees.map((e) => ({ label: e.full_name, value: String(e.id) })),
             ]}
             value={employeeIds}
             onValueChange={(v) => { setEmployeeIds(v); setPage(1); }}
@@ -377,11 +388,7 @@ const ClientWiseAnalytics = () => {
           <Label className={FILTER_LABEL}>Client</Label>
           <MultiSelect
             options={[
-              ...activeClients.map((c) => ({ label: c.client_name, value: String(c.id) , 
-            ...(c.original_total_hours != null ? {'Original Total Hours': c.original_total_hours} : {}),
-            ...(c.original_billable_hours != null ? {'Original Billable Hours': c.original_billable_hours} : {}),
-            ...(c.original_hours != null ? {'Original Hours': c.original_hours} : {})
-          })),
+              ...activeClients.map((c) => ({ label: c.client_name, value: String(c.id) })),
             ]}
             value={clientIds}
             onValueChange={(v) => { setClientIds(v); setPage(1); }}
@@ -395,11 +402,7 @@ const ClientWiseAnalytics = () => {
           <Label className={FILTER_LABEL}>Service Type</Label>
           <MultiSelect
             options={[
-              ...activeServiceTypes.map((st) => ({ label: st.service_type_name, value: String(st.id) , 
-            ...(st.original_total_hours != null ? {'Original Total Hours': st.original_total_hours} : {}),
-            ...(st.original_billable_hours != null ? {'Original Billable Hours': st.original_billable_hours} : {}),
-            ...(st.original_hours != null ? {'Original Hours': st.original_hours} : {})
-          })),
+              ...activeServiceTypes.map((st) => ({ label: st.service_type_name, value: String(st.id) })),
             ]}
             value={serviceTypeIds}
             onValueChange={handleServiceTypeChange}
@@ -416,10 +419,7 @@ const ClientWiseAnalytics = () => {
               ...filteredPOs.map((po) => ({
                 label: po.service_po_name || po.service_po_code || String(po.id),
                 value: String(po.id),
-                  ...(po.original_total_hours != null ? {'Original Total Hours': po.original_total_hours} : {}),
-            ...(po.original_billable_hours != null ? {'Original Billable Hours': po.original_billable_hours} : {}),
-            ...(po.original_hours != null ? {'Original Hours': po.original_hours} : {})
-          })),
+              })),
             ]}
             value={poIds}
             onValueChange={(v) => { setPoIds(v); setPage(1); }}

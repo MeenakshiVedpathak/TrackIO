@@ -21,6 +21,7 @@ import { Badge } from '@/components/ui/badge';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import ConfirmDialog from '@/components/common/ConfirmDialog';
 import ProjectSelect from '@/components/employee/ProjectSelect';
+import { APPROVED_LOCK_TOOLTIP, approvedPoIdsOf, isApprovedLog } from '@/utils/approvedWorkLog';
 import OffDayRequestPanel from '@/components/employee/OffDayRequestPanel';
 import TimeSegmentsInput, { BLANK_SEGMENT, AddTimeBlockButton } from '@/components/employee/TimeSegmentsInput';
 import { employeeWorkLogApi } from '@/api/employeeWorkLog.api';
@@ -171,7 +172,6 @@ const EmployeeTimeEntry = () => {
   // reason: no point picking Module/Task/blocks for a date this employee still needs approval to
   // log at all.
   const hasProject = !!selectedServicePOId;
-  const blocksDisabled = isSaving || !hasProject || isGated;
 
   // The last block must be complete before another can be added: same rule submit() enforces
   // (both times), just applied up front so half-filled rows can't pile up. Description is
@@ -196,6 +196,13 @@ const EmployeeTimeEntry = () => {
     ),
     [savedEntriesData, selectedDate]
   );
+
+  // Service POs that already have an approved log on this date. Per PO per date: those POs can't be
+  // picked or saved against (an approved log is read-only), but other POs on the same date still can.
+  const approvedPoIds = useMemo(() => approvedPoIdsOf(savedRowsForDate), [savedRowsForDate]);
+  const isSelectedPoApproved = !!selectedServicePOId && approvedPoIds.has(String(selectedServicePOId));
+  // Declared after isSelectedPoApproved on purpose: it is read while rendering, so it must come second.
+  const blocksDisabled = isSaving || !hasProject || isGated || isSelectedPoApproved;
 
   const nodeNameById = useMemo(() => {
     const map = new Map();
@@ -255,7 +262,7 @@ const EmployeeTimeEntry = () => {
         // to split a (project, node) pair across rows), so they're collected rather than assumed
         // to be a single id. Block ids can't be used — they identify segments, which have no
         // endpoint of their own (removing one block is an edit + save, not a delete).
-        groups.set(key, { key, label, displayName, servicePoId, moduleNodeId, taskNodeId, hours: 0, blocks: [], rowIds: [], isSynced: false });
+        groups.set(key, { key, label, displayName, servicePoId, moduleNodeId, taskNodeId, hours: 0, blocks: [], rowIds: [], isSynced: false, isApproved: false, revertReason: '' });
       }
       const group = groups.get(key);
       group.hours += Number(row.hours ?? 0);
@@ -264,6 +271,11 @@ const EmployeeTimeEntry = () => {
       // to lock the whole group — editing/deleting it is a single PUT/DELETE (or a whole-day
       // replace) that the backend will 409 regardless of which row within the pair caused it.
       if (row.status === 'synced') group.isSynced = true;
+      // Approved is read-only too, but reversible: the approver can revert it back to Pending.
+      if (isApprovedLog(row)) group.isApproved = true;
+      // A reverted log is Pending again (editable); the approver's reason is kept on the row, like
+      // a rejection remark, so the employee knows why it came back.
+      if (row.status === 'pending' && row.revert_reason) group.revertReason = row.revert_reason;
 
       const segments = row.timeEntries ?? row.time_entries ?? [];
       if (segments.length) {
@@ -354,10 +366,27 @@ const EmployeeTimeEntry = () => {
       // Always re-read the day fresh right before writing — this is the whole-day-replace hazard
       // the backend spec calls out: whichever form saves last must know about the other form's
       // rows, and a stale client-side cache could be missing something saved moments ago.
-      const dailyData = await employeeWorkLogApi.getDaily(values.timesheet_date);
+      const [dailyData, freshEntries] = await Promise.all([
+        employeeWorkLogApi.getDaily(values.timesheet_date),
+        employeeWorkLogApi.getEntries({ startDate: values.timesheet_date, endDate: values.timesheet_date, limit: 100 }),
+      ]);
       const hierarchyNodeId = values.task_node_id || values.module_node_id || null;
-      const otherEntries = buildOtherDayEntries(dailyData, values.timesheet_date, values.service_po_id, hierarchyNodeId);
-      const otherHours = otherEntries.reduce((sum, e) => sum + Number(e.hours || 0), 0);
+      const freshRows = (freshEntries?.data ?? []).filter(
+        (row) => String(row.timesheet_date ?? row.work_date ?? '').slice(0, 10) === values.timesheet_date
+      );
+      const freshApprovedPoIds = approvedPoIdsOf(freshRows);
+      if (freshApprovedPoIds.has(String(values.service_po_id))) {
+        setFormError('This project already has an approved log for this date. Ask your approver to revert it to edit.');
+        qc.invalidateQueries({ queryKey: ['employee-worklog'] });
+        return;
+      }
+      // Approved lines are never resent (see buildOtherDayEntries), but their hours still count
+      // towards the daily cap.
+      const otherEntries = buildOtherDayEntries(dailyData, values.timesheet_date, values.service_po_id, hierarchyNodeId, freshApprovedPoIds);
+      const approvedHours = freshRows
+        .filter((row) => freshApprovedPoIds.has(String(row.service_po_id)))
+        .reduce((sum, row) => sum + Number(row.hours ?? 0), 0);
+      const otherHours = otherEntries.reduce((sum, e) => sum + Number(e.hours || 0), 0) + approvedHours;
 
       if (otherHours + totalHours > DAILY_HOURS_CAP) {
         setFormError(`Total hours for ${values.timesheet_date} cannot exceed ${DAILY_HOURS_CAP}. This would total ${otherHours + totalHours} hours.`);
@@ -542,6 +571,7 @@ const EmployeeTimeEntry = () => {
                                 field.onChange(v);
                               }}
                               disabled={isSaving}
+                              lockedIds={approvedPoIds}
                             />
                           </FormControl>
                           <FormMessage />
@@ -549,6 +579,15 @@ const EmployeeTimeEntry = () => {
                       )}
                     />
                   </div>
+
+                  {isSelectedPoApproved && (
+                    <Alert className="shrink-0 border-emerald-200 bg-emerald-50 text-emerald-900">
+                      <Lock className="h-4 w-4 text-emerald-600" />
+                      <AlertDescription className="text-xs text-emerald-800">
+                        This project already has an approved log for this date. {APPROVED_LOCK_TOOLTIP} You can still log other projects on this date.
+                      </AlertDescription>
+                    </Alert>
+                  )}
 
                   {isGated ? (
                     <>
@@ -734,8 +773,11 @@ const EmployeeTimeEntry = () => {
                           "Synced" badge instead of inviting an edit/delete that's now guaranteed
                           to fail. */}
                       <div className="-mx-1 flex items-start gap-1">
-                        {group.isSynced ? (
-                          <div className="flex min-w-0 flex-1 items-baseline justify-between gap-2 rounded-md px-1 py-1">
+                        {group.isSynced || group.isApproved ? (
+                          <div
+                            className="flex min-w-0 flex-1 items-baseline justify-between gap-2 rounded-md px-1 py-1"
+                            title={group.isApproved && !group.isSynced ? APPROVED_LOCK_TOOLTIP : undefined}
+                          >
                             <span className="flex min-w-0 items-center gap-1.5 truncate text-sm font-semibold text-muted-foreground">
                               <Lock className="h-3 w-3 shrink-0" />
                               {group.label.length
@@ -775,6 +817,11 @@ const EmployeeTimeEntry = () => {
                         )}
                         {group.isSynced ? (
                           <Badge variant="success" className="mt-0.5 shrink-0 text-[10px]">Synced</Badge>
+                        ) : group.isApproved ? (
+                          <Badge variant="success" className="mt-0.5 shrink-0 gap-0.5 text-[10px]" title={APPROVED_LOCK_TOOLTIP}>
+                            <Lock className="h-2.5 w-2.5" />
+                            Approved
+                          </Badge>
                         ) : (
                           <button
                             type="button"
@@ -788,6 +835,12 @@ const EmployeeTimeEntry = () => {
                           </button>
                         )}
                       </div>
+
+                      {group.revertReason && (
+                        <p className="rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-xs text-amber-800">
+                          Reverted by approver: {group.revertReason}
+                        </p>
+                      )}
 
                       {group.blocks.map((block) => (
                         <div key={block.id} className="space-y-0.5 text-xs">

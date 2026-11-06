@@ -8,12 +8,14 @@ import { useDebounce } from '@/hooks/useDebounce';
 import { formatPercentage } from '@/utils/formatters';
 import DataTable from '@/components/common/DataTable';
 import PageHeader from '@/components/common/PageHeader';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import EmptyState from '@/components/common/EmptyState';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
 import SearchInput from '@/components/common/SearchInput';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { MonthYearPicker } from '@/components/ui/month-year-picker';
@@ -35,6 +37,10 @@ const PERIOD_MODES = [
   { value: 'month', label: 'Month' },
   { value: 'range', label: 'Date Range' },
 ];
+
+// The endpoint returns both the adjusted (`bench_pct`) and original (`original_bench_pct`) figure
+// for every month and for the average; the Hours basis toggle picks which one the table/export
+// shows, so the grid carries one column per month instead of an adjusted + "Orig" pair.
 
 // GET /reports/resource-wise-bench declares no `search` param — same "widen the fetch, then
 // filter/paginate client-side" pattern as TeamCapacityTable's designation filter: while a search
@@ -83,6 +89,7 @@ const SortableHeader = ({ label, column, sortBy, sortOrder, onSort, align }) => 
 // for the same period lives on its own page (MonthWiseBenchReport.jsx, GET
 // /reports/month-wise-bench) rather than here, since each is its own Management Report.
 const ResourceWiseBenchReport = () => {
+  const confirmExport = useExportConfirm();
   const [periodMode, setPeriodMode] = useState('range');
   const [monthYear, setMonthYear] = useState({ month: now.getMonth() + 1, year: now.getFullYear() });
   const [fromMonthYear, setFromMonthYear] = useState({ month: defaultFromDate.getMonth() + 1, year: defaultFromDate.getFullYear() });
@@ -90,6 +97,8 @@ const ResourceWiseBenchReport = () => {
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [entityIds, setEntityIds] = useState([]);
   const [buIds, setBuIds] = useState([]);
+  const [benchBasis, setBenchBasis] = useState('adjusted');
+  const isOriginal = benchBasis === 'original';
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(1);
   const [limit, setLimit] = useState(10);
@@ -102,7 +111,7 @@ const ResourceWiseBenchReport = () => {
   const periodReady = periodMode === 'month'
     ? !!(monthYear?.month && monthYear?.year)
     : !!(fromMonthYear?.month && fromMonthYear?.year && toMonthYear?.month && toMonthYear?.year);
-  const activeFilterCount = (entityIds.length > 0 ? 1 : 0) + (buIds.length > 0 ? 1 : 0);
+  const activeFilterCount = (entityIds.length > 0 ? 1 : 0) + (buIds.length > 0 ? 1 : 0) + (isOriginal ? 1 : 0);
 
   const handlePeriodModeChange = (mode) => {
     setPeriodMode(mode);
@@ -110,6 +119,8 @@ const ResourceWiseBenchReport = () => {
   };
 
   const params = {
+    // Original basis: the server then sorts, ranks and totals on original hours too.
+    ...(isOriginal && { hoursSource: 'O' }),
     ...(periodMode === 'month'
       ? { month: monthYear.month, year: monthYear.year }
       : { startMonth: fromMonthYear.month, startYear: fromMonthYear.year, endMonth: toMonthYear.month, endYear: toMonthYear.year }),
@@ -167,18 +178,21 @@ const ResourceWiseBenchReport = () => {
   // in memory from the wide fetch), or just the current server page otherwise, same tradeoff
   // ResourceUtilizationTrend documents for its own export.
   const handleExport = () => {
-    const header = ['Employee Name', 'PM', ...monthColumnDefs.flatMap((m) => [m.label, `Orig ${m.label}`]), 'Avg Bench %', 'Original Avg Bench %'];
+    const basisSuffix = isOriginal ? ' (Original)' : '';
+    const header = ['Employee Name', 'PM', ...monthColumnDefs.map((m) => `${m.label}${basisSuffix}`), `Avg Bench %${basisSuffix}`];
     const exportRows = (hasClientSearch ? filteredRows : rawRows).map((r) => {
       const byMonth = new Map((r.months ?? []).map((m) => [`${m.year}-${String(m.month).padStart(2, '0')}`, m]));
       return [
         r.full_name ?? '',
         r.project_manager_name ?? '',
-        ...monthColumnDefs.flatMap(({ key }) => {
+        ...monthColumnDefs.map(({ key }) => {
           const m = byMonth.get(key);
-          return [m?.bench_pct != null ? Number(m.bench_pct) : '', m?.original_bench_pct != null ? Number(m.original_bench_pct) : ''];
+          const v = isOriginal ? (m?.original_bench_pct ?? m?.bench_pct) : m?.bench_pct;
+          return v != null ? Number(v) : '';
         }),
-        r.avg_bench_pct != null ? Number(r.avg_bench_pct) : '',
-        r.original_avg_bench_pct != null ? Number(r.original_avg_bench_pct) : '',
+        (isOriginal ? (r.original_avg_bench_pct ?? r.avg_bench_pct) : r.avg_bench_pct) != null
+          ? Number(isOriginal ? (r.original_avg_bench_pct ?? r.avg_bench_pct) : r.avg_bench_pct)
+          : '',
       ];
     });
     const ws = XLSX.utils.aoa_to_sheet([header, ...exportRows]);
@@ -213,8 +227,7 @@ const ResourceWiseBenchReport = () => {
       enableSorting: false,
       cell: (info) => <div className="truncate max-w-[140px]" title={info.getValue()}>{info.getValue() || '—'}</div>,
     }),
-    ...monthColumnDefs.flatMap(({ key, label }) => [
-      columnHelper.accessor((row) => row[key], {
+    ...monthColumnDefs.map(({ key, label }) => columnHelper.accessor((row) => (isOriginal ? (row[`original_${key}`] ?? row[key]) : row[key]), {
       id: key,
       header: label,
       size: 100,
@@ -225,23 +238,12 @@ const ResourceWiseBenchReport = () => {
         if (value == null || value === '') return <span className="text-muted-foreground">—</span>;
         return <span className={cn('tabular-nums', benchColorClass(value))}>{formatPercentage(value, 1)}</span>;
       },
-    }),
-      columnHelper.accessor((row) => row[`original_${key}`], {
-        id: `original_${key}`,
-        header: `Orig ${label}`,
-        size: 110,
-        meta: { align: 'right' },
-        enableSorting: false,
-        cell: (info) => {
-          const value = info.getValue();
-          if (value == null || value === '') return null;
-          return <span className="tabular-nums text-muted-foreground">{formatPercentage(value, 1)}</span>;
-        },
-      })
-    ]),
-    columnHelper.accessor('avg_bench_pct', {
+    })),
+    columnHelper.accessor((row) => (isOriginal ? (row.original_avg_bench_pct ?? row.avg_bench_pct) : row.avg_bench_pct), {
+      id: 'avg_bench_pct',
+      // Same sortBy key on both bases — with hoursSource=O the server sorts by the original average.
       header: () => <SortableHeader label="Avg Bench %" column={SORTABLE.AVG_BENCH} sortBy={sortBy} sortOrder={sortOrder} onSort={handleSort} align="right" />,
-      size: 140,
+      size: 150,
       meta: { align: 'right' },
       enableSorting: false,
       cell: (info) => {
@@ -250,19 +252,8 @@ const ResourceWiseBenchReport = () => {
         return <span className={cn('tabular-nums font-semibold', benchColorClass(value))}>{formatPercentage(value, 1)}</span>;
       },
     }),
-    columnHelper.accessor('original_avg_bench_pct', {
-      header: 'Original Avg Bench %',
-      size: 160,
-      meta: { align: 'right' },
-      enableSorting: false,
-      cell: (info) => {
-        const value = info.getValue();
-        if (value == null || value === '') return null;
-        return <span className="tabular-nums text-muted-foreground">{formatPercentage(value, 1)}</span>;
-      },
-    }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  ], [monthColumnDefs, sortBy, sortOrder]);
+  ], [monthColumnDefs, sortBy, sortOrder, isOriginal]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -282,7 +273,7 @@ const ResourceWiseBenchReport = () => {
               activeCount={activeFilterCount}
             />
             {(hasClientSearch ? filteredRows.length : rawRows.length) > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)}>
                 <Download className="h-4 w-4" />Export Excel
               </Button>
             )}
@@ -293,7 +284,7 @@ const ResourceWiseBenchReport = () => {
       <FilterPanel
         isOpen={filtersOpen}
         maxHeightClass="max-h-[300px]"
-        onClear={() => { setEntityIds([]); setBuIds([]); setPage(1); }}
+        onClear={() => { setEntityIds([]); setBuIds([]); setBenchBasis('adjusted'); setPage(1); }}
         showClear={activeFilterCount > 0}
       >
         <EntityFilter multiple value={entityIds} onChange={(v) => { setEntityIds(v); setBuIds([]); setPage(1); }} />
@@ -335,6 +326,12 @@ const ResourceWiseBenchReport = () => {
             />
           )}
         </div>
+
+        <HoursBasisToggle
+          value={isOriginal ? HOURS_ORIGINAL : HOURS_ADJUSTED}
+          onChange={(v) => setBenchBasis(v === HOURS_ORIGINAL ? 'original' : 'adjusted')}
+          labelClassName="text-xs"
+        />
       </FilterPanel>
 
       <DataTable

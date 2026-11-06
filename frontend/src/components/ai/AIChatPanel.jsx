@@ -116,6 +116,8 @@ const AIChatPanel = ({ copilot, onClose, className }) => {
                     key={m.id}
                     message={m}
                     isLast={m.id === lastAssistantId}
+                    onSuggest={sendMessage}
+                    suggestDisabled={isThinking}
                     onRegenerate={m.id === lastAssistantId && !isThinking ? regenerateLast : undefined}
                   />
                 ))

@@ -194,6 +194,46 @@ export const useApproveMyTeamTimesheetEntry = () => {
   });
 };
 
+// Approved-log Revert / Delete — flips the entry (and its bucket's approved/pending counts), so the
+// same broad approval-summary prefix is refetched. The Employee-side caches ('employee-worklog')
+// are invalidated too since a reverted/deleted log changes what the Employee sees.
+const invalidateAfterApprovedLogChange = (qc) => {
+  qc.invalidateQueries({ queryKey: ['my-team', 'approval-summary'] });
+  qc.invalidateQueries({ queryKey: ['employee-worklog'] });
+};
+
+export const useRevertMyTeamTimesheetEntry = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, reason }) => myTeamApi.revertApprovedTimesheetEntry(id, reason),
+    onSuccess: () => invalidateAfterApprovedLogChange(qc),
+  });
+};
+
+export const useDeleteMyTeamTimesheetEntry = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, reason }) => myTeamApi.deleteApprovedTimesheetEntry(id, reason),
+    onSuccess: () => invalidateAfterApprovedLogChange(qc),
+  });
+};
+
+export const useRevertApprovedByDate = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: myTeamApi.revertApprovedByDate,
+    onSuccess: () => invalidateAfterApprovedLogChange(qc),
+  });
+};
+
+export const useDeleteApprovedByDate = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: myTeamApi.deleteApprovedByDate,
+    onSuccess: () => invalidateAfterApprovedLogChange(qc),
+  });
+};
+
 // "Log Work for My Team" — a Team Lead filling in a mapped Employee's monthly work log on their
 // behalf (see pages/myTeam/TeamLeadFillWorkLog.jsx). `enabled` follows the caller (only fetch once
 // both an Employee and a Month/Year are picked).

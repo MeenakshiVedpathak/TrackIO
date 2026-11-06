@@ -28,9 +28,19 @@ const SummaryTable = ({
   // Collapsed by default — a Service PO's hierarchy breakdown only shows once its row (or an
   // ancestor Parent node) is expanded, so the table opens as a flat list and drills down on click.
   const [expandedKeys, setExpandedKeys] = useState(() => new Set());
+  // Expanding a row opens its WHOLE subtree (every nested sub-task), not just one level — so a
+  // deeper node never sits folded until it's clicked open separately. Collapsing only folds the
+  // row itself; its descendants are hidden with it either way.
   const toggleExpanded = (rowKey) => setExpandedKeys((prev) => {
     const next = new Set(prev);
-    next.has(rowKey) ? next.delete(rowKey) : next.add(rowKey);
+    if (next.has(rowKey)) {
+      next.delete(rowKey);
+    } else {
+      next.add(rowKey);
+      (rows ?? []).forEach((r) => {
+        if (r.ancestorKeys?.includes(rowKey)) next.add(r.rowKey);
+      });
+    }
     return next;
   });
 
@@ -240,7 +250,11 @@ const SummaryTable = ({
               editable={!!row.editable && !row.isRolledUp}
               isRolledUp={row.isRolledUp}
               subtreeCount={row.subtreeCount}
-              editableDays={editableDays}
+              // A day whose Service PO already has an approved log is read-only for every row of that
+              // PO (the lock is per PO per date) — the backend would 409 an edit to it anyway.
+              editableDays={row.lockedByDay && Object.values(row.lockedByDay).some(Boolean)
+                ? new Set([...editableDays].filter((d) => !row.lockedByDay[d]))
+                : editableDays}
               offDayBlockedDays={offDayBlockedDays}
               cellEdits={edits?.[row.rowKey]}
               onCellChange={(day, value) => onCellChange(row.rowKey, day, value)}

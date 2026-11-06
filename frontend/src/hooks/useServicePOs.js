@@ -10,6 +10,14 @@ export const useServicePOs = (params, options = {}) =>
     ...options,
   });
 
+export const useServicePOCreators = (params) =>
+  useQuery({
+    queryKey: ['service-pos', 'creators', params],
+    queryFn: () => servicePOsApi.getCreators(params),
+    staleTime: 1000 * 60 * 5,
+    retry: false,
+  });
+
 // `buId` narrows the list to one Business Unit — passed only by screens that gate the Service PO
 // picker behind a BU choice. Left undefined by every other caller, who then share a single
 // cross-BU cache entry exactly as before.

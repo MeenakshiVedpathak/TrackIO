@@ -13,6 +13,7 @@ import { useNotification } from '@/hooks/useNotification';
 import { downloadBlob } from '@/utils/download';
 import { formatDate, getStatusColor } from '@/utils/formatters';
 import PageHeader from '@/components/common/PageHeader';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import FilterPanel from '@/components/common/FilterPanel';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
@@ -139,6 +140,7 @@ const SummaryPaginationFooter = ({ page, limit, total, onPageChange, onLimitChan
 };
 
 const ProjectWiseTimesheetReport = () => {
+  const confirmExport = useExportConfirm();
   const { error: showError } = useNotification();
 
   const [filtersOpen, setFiltersOpen] = useState(false);
@@ -436,7 +438,7 @@ const ProjectWiseTimesheetReport = () => {
               onToggle={() => setFiltersOpen((p) => !p)}
               activeCount={activeFilterCount}
             />
-            <Button variant="outline" size="sm" className="h-[clamp(1.875rem,2vw,2.25rem)]" onClick={() => handleDownload('excel')} disabled={!!exportingFormat}>
+            <Button variant="outline" size="sm" className="h-[clamp(1.875rem,2vw,2.25rem)]" onClick={() => confirmExport(() => handleDownload('excel'))} disabled={!!exportingFormat}>
               <Download className="mr-1.5 h-4 w-4" />{exportingFormat === 'excel' ? 'Exporting…' : 'Export Excel'}
             </Button>
           </div>

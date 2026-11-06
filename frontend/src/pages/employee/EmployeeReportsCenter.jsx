@@ -9,6 +9,7 @@ import { resolveFormRoute, FORM_NAMES } from '@/constants/rbacForms';
 import PageHeader from '@/components/common/PageHeader';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
+import { LoadingBlock, Spinner } from '@/components/ui/spinner';
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetFooter } from '@/components/ui/sheet';
 import { cn } from '@/utils/cn';
 
@@ -31,8 +32,8 @@ const EMPLOYEE_REPORT_FORM_NAMES = new Set([
 const EmployeeReportsCenter = () => {
   const navigate = useNavigate();
   const { accessibleForms } = useAuth();
-  const { data: formsList } = useForms({ status: 'active' });
-  const { data: categories = [] } = useFormCategories({});
+  const { data: formsList, isPending: formsLoading } = useForms({ status: 'active' });
+  const { data: categories = [], isPending: categoriesLoading } = useFormCategories({});
   const [search, setSearch] = useState('');
   const [selectedCategoryId, setSelectedCategoryId] = useState(null); // null = "All Reports"
   const isMobile = useIsMobile();
@@ -160,12 +161,16 @@ const EmployeeReportsCenter = () => {
           <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
         </button>
 
-        <p className="shrink-0 text-sm font-semibold text-foreground">
-          {visibleRows.length} Report{visibleRows.length !== 1 ? 's' : ''}
-        </p>
+        {!formsLoading && (
+          <p className="shrink-0 text-sm font-semibold text-foreground">
+            {visibleRows.length} Report{visibleRows.length !== 1 ? 's' : ''}
+          </p>
+        )}
 
         <div className="flex-1 space-y-2 overflow-y-auto pb-2">
-          {visibleRows.length === 0 ? (
+          {formsLoading ? (
+            <LoadingBlock label="Loading reports…" className="py-14" />
+          ) : visibleRows.length === 0 ? (
             <div className="flex flex-col items-center gap-2 rounded-lg border border-dashed py-14 text-center text-sm text-muted-foreground">
               <Search className="h-6 w-6 text-muted-foreground/50" />
               <p className="font-medium text-foreground">No reports found</p>
@@ -278,8 +283,17 @@ const EmployeeReportsCenter = () => {
             >
               <Folder className="h-4 w-4 shrink-0" />
               <span className="truncate">All Reports</span>
-              <span className="ml-auto text-xs text-muted-foreground">{reportRows.length}</span>
+              {formsLoading
+                ? <Spinner className="ml-auto h-3.5 w-3.5 text-muted-foreground" />
+                : <span className="ml-auto text-xs text-muted-foreground">{reportRows.length}</span>}
             </button>
+
+            {(formsLoading || categoriesLoading) && (
+              <div className="flex items-center gap-2 px-3 pt-3 text-xs text-muted-foreground">
+                <Spinner className="h-3.5 w-3.5" />
+                Loading categories…
+              </div>
+            )}
 
             {categoryFolders.length > 0 && (
               <p className="px-3 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
@@ -311,9 +325,11 @@ const EmployeeReportsCenter = () => {
         <div className="flex-1 flex flex-col rounded-lg border bg-white overflow-hidden">
           <div className="flex items-center gap-2 px-5 py-4 border-b">
             <h2 className="text-lg font-semibold">{activeLabel}</h2>
-            <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-primary/10 px-1.5 text-xs font-medium text-primary">
-              {visibleRows.length}
-            </span>
+            {!formsLoading && (
+              <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-primary/10 px-1.5 text-xs font-medium text-primary">
+                {visibleRows.length}
+              </span>
+            )}
           </div>
 
           <div className="px-5 py-2 border-b bg-muted/30 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
@@ -321,7 +337,9 @@ const EmployeeReportsCenter = () => {
           </div>
 
           <div className="flex-1 overflow-y-auto">
-            {visibleRows.length === 0 ? (
+            {formsLoading ? (
+              <LoadingBlock label="Loading reports…" className="py-16" />
+            ) : visibleRows.length === 0 ? (
               <div className="p-10 text-center text-sm text-muted-foreground">No reports found.</div>
             ) : (
               visibleRows.map((r) => (

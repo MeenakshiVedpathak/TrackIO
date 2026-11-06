@@ -148,6 +148,9 @@ const ProjectWiseTimesheetReport = lazy(() => import('@/pages/reports/ProjectWis
 const CrossBuEmployeePoHoursReport = lazy(() => import('@/pages/reports/CrossBuEmployeePoHoursReport'));
 const EmployeeRoleBuMappingReport = lazy(() => import('@/pages/reports/EmployeeRoleBuMappingReport'));
 const TeamLeadEmployeeProjectHours = lazy(() => import('@/pages/reports/TeamLeadEmployeeProjectHours'));
+const TeamLeadEmployeePoHours = lazy(() => import('@/pages/reports/TeamLeadEmployeePoHours'));
+const BuAdminEmployeePoHours = lazy(() => import('@/pages/reports/BuAdminEmployeePoHours'));
+const ProjectManagerEmployeePoHours = lazy(() => import('@/pages/reports/ProjectManagerEmployeePoHours'));
 
 // ── AI Copilot (new pages, launched from the floating AI Copilot widget) ──
 const RootCauseView = lazy(() => import('@/pages/ai/RootCauseView'));
@@ -186,6 +189,7 @@ const ResourceBudgetPage = lazy(() => import('@/pages/resourceBudgets/ResourceBu
 // ── Settings ──
 const Notifications = lazy(() => import('@/pages/Notifications'));
 const MonthlyCapSettings = lazy(() => import('@/pages/settings/MonthlyCapSettings'));
+const SiteLogoSettings = lazy(() => import('@/pages/settings/SiteLogoSettings'));
 
 // ── Errors ──
 const NotFound = lazy(() => import('@/pages/NotFound'));
@@ -476,6 +480,9 @@ const AppRoutes = () => {
           <Route path={ROUTES.REPORT_CROSS_BU_EMPLOYEE_PO_HOURS} element={<ProtectedRoute formName={FORM_NAMES.REPORT_CROSS_BU_EMPLOYEE_PO_HOURS} allowIfNoFormsMapped><CrossBuEmployeePoHoursReport /></ProtectedRoute>} />
           <Route path={ROUTES.REPORT_EMPLOYEE_ROLE_BU_MAPPING} element={<ProtectedRoute formName={FORM_NAMES.REPORT_EMPLOYEE_ROLE_BU_MAPPING} allowIfNoFormsMapped><EmployeeRoleBuMappingReport /></ProtectedRoute>} />
           <Route path={ROUTES.REPORT_TEAM_LEAD_EMPLOYEE_PROJECT_HOURS} element={<ProtectedRoute formName={FORM_NAMES.REPORT_TEAM_LEAD_EMPLOYEE_PROJECT_HOURS} allowIfNoFormsMapped><TeamLeadEmployeeProjectHours /></ProtectedRoute>} />
+          <Route path={ROUTES.REPORT_TEAM_LEAD_EMPLOYEE_PO_HOURS} element={<ProtectedRoute formName={FORM_NAMES.REPORT_TEAM_LEAD_EMPLOYEE_PO_HOURS} allowIfNoFormsMapped><TeamLeadEmployeePoHours /></ProtectedRoute>} />
+          <Route path={ROUTES.REPORT_BU_ADMIN_EMPLOYEE_PO_HOURS} element={<ProtectedRoute formName={FORM_NAMES.REPORT_BU_ADMIN_EMPLOYEE_PO_HOURS} allowIfNoFormsMapped><BuAdminEmployeePoHours /></ProtectedRoute>} />
+          <Route path={ROUTES.REPORT_PROJECT_MANAGER_EMPLOYEE_PO_HOURS} element={<ProtectedRoute formName={FORM_NAMES.REPORT_PROJECT_MANAGER_EMPLOYEE_PO_HOURS} allowIfNoFormsMapped><ProjectManagerEmployeePoHours /></ProtectedRoute>} />
           {/* No formName gate — reachable by any authenticated login regardless of Role-Form
               Mapping, since Team Lead Timesheet Approval's "Check Pending & Remind" button links
               here directly and a Team Lead role may not have this form explicitly granted. */}
@@ -552,6 +559,8 @@ const AppRoutes = () => {
         {/* Monthly Cap Hours — system-wide setting, Admin / Platform Admin only (backend PUT also
             403s anyone else). No Form Master row, so gated by allowedRoles, not formName. */}
         <Route path={ROUTES.SETTINGS_MONTHLY_CAP} element={<ProtectedRoute allowedRoles={[ROLE_NAMES.ADMIN, ROLE_NAMES.PLATFORM_ADMIN]}><MonthlyCapSettings /></ProtectedRoute>} />
+        {/* Site Logo — Platform Admin only (Admin is deliberately excluded; backend 403s too). */}
+        <Route path={ROUTES.SETTINGS_SITE_LOGO} element={<ProtectedRoute allowedRoles={[ROLE_NAMES.PLATFORM_ADMIN]}><SiteLogoSettings /></ProtectedRoute>} />
 
         {/* Employee self-service, rendered here (same shell, same formName gating as every
             other screen above) for any account that ISN'T employee-only — a Team Lead who also

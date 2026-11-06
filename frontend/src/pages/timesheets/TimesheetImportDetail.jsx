@@ -25,7 +25,9 @@ import { formatDate } from '@/utils/formatters';
 import { cn } from '@/utils/cn';
 import DataTable from '@/components/common/DataTable';
 import PageHeader from '@/components/common/PageHeader';
+import SearchInput from '@/components/common/SearchInput';
 import ConfirmDialog from '@/components/common/ConfirmDialog';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { SearchableSelect } from '@/components/ui/searchable-select';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -110,6 +112,7 @@ const PublishPill = ({ value }) => (
 );
 
 const TimesheetImportDetail = () => {
+  const confirmExport = useExportConfirm();
   const navigate = useNavigate();
   const location = useLocation();
   const { id } = useParams();
@@ -300,6 +303,7 @@ const TimesheetImportDetail = () => {
   const [serviceCategoryFilter, setServiceCategoryFilter] = useState('all');
   const [serviceTypeFilter, setServiceTypeFilter] = useState('all');
   const [filtersOpen, setFiltersOpen] = useState(false);
+  const [search, setSearch] = useState('');
 
   // Rows aren't paginated server-side (the whole import is fetched in one
   // shot), but rendering every row at once — each wrapped in its own
@@ -394,8 +398,21 @@ const TimesheetImportDetail = () => {
     setDetailPage(1);
   };
 
+  // GET /timesheets/import/:id/rows returns the whole import in one response, so search runs
+  // client-side over the same rows the dropdown filters narrow — no extra request per keystroke.
+  const searchTerm = search.trim().toLowerCase();
+
   const filteredRows = useMemo(() => {
     return rows.filter(row => {
+      if (searchTerm && ![
+        row.employee?.full_name,
+        row.employee?.employee_code,
+        row.servicePO?.service_po_name,
+        row.servicePO?.service_po_code,
+        row.servicePO?.client?.client_name,
+        row.servicePO?.serviceType?.name,
+        row.servicePO?.serviceType?.serviceCategory?.name,
+      ].some((v) => String(v ?? '').toLowerCase().includes(searchTerm))) return false;
       if (employeeFilter !== 'all' && row.employee?.full_name !== employeeFilter) return false;
       if (poFilter !== 'all' && row.servicePO?.service_po_name !== poFilter) return false;
       if (clientFilter !== 'all' && row.servicePO?.client?.client_name !== clientFilter) return false;
@@ -403,7 +420,7 @@ const TimesheetImportDetail = () => {
       if (serviceTypeFilter !== 'all' && String(row.servicePO?.serviceType?.id) !== serviceTypeFilter) return false;
       return true;
     });
-  }, [rows, employeeFilter, poFilter, clientFilter, serviceCategoryFilter, serviceTypeFilter]);
+  }, [rows, searchTerm, employeeFilter, poFilter, clientFilter, serviceCategoryFilter, serviceTypeFilter]);
 
   const filteredHours = useMemo(
     () => filteredRows.reduce((sum, r) => sum + (Number(r.hours_logged) || 0), 0),
@@ -415,7 +432,7 @@ const TimesheetImportDetail = () => {
     [filteredRows]
   );
 
-  const isFiltered = employeeFilter !== 'all' || poFilter !== 'all' || clientFilter !== 'all'
+  const isFiltered = !!searchTerm || employeeFilter !== 'all' || poFilter !== 'all' || clientFilter !== 'all'
     || serviceCategoryFilter !== 'all' || serviceTypeFilter !== 'all';
 
   const activeFilterCount = [
@@ -538,7 +555,13 @@ const TimesheetImportDetail = () => {
         title="Import Details"
         description={importRecord?.file_name ?? `Import #${id}`}
         actions={
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <SearchInput
+              value={search}
+              onChange={(e) => { setSearch(e.target.value); setDetailPage(1); }}
+              placeholder="Search employee, PO, client…"
+              className="w-full sm:w-full md:w-72"
+            />
             <Button
               size="sm"
               className="gap-2 bg-blue-600 hover:bg-blue-700 text-white"
@@ -562,13 +585,13 @@ const TimesheetImportDetail = () => {
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
-                  <DropdownMenuItem onClick={() => handleDownloadSheet('hours')} className="cursor-pointer">
+                  <DropdownMenuItem onClick={() => confirmExport(() => handleDownloadSheet('hours'))} className="cursor-pointer">
                     Hours
                   </DropdownMenuItem>
-                  <DropdownMenuItem onClick={() => handleDownloadSheet('modified')} className="cursor-pointer">
+                  <DropdownMenuItem onClick={() => confirmExport(() => handleDownloadSheet('modified'))} className="cursor-pointer">
                     Modified Hours
                   </DropdownMenuItem>
-                  <DropdownMenuItem onClick={() => handleDownloadSheet('both')} className="cursor-pointer">
+                  <DropdownMenuItem onClick={() => confirmExport(() => handleDownloadSheet('both'))} className="cursor-pointer">
                     Both
                   </DropdownMenuItem>
                 </DropdownMenuContent>
@@ -632,13 +655,13 @@ const TimesheetImportDetail = () => {
               </div>
             </div>
             <div>
-              <p className="text-xs text-muted-foreground">Imported By</p>
+              <p className="text-xs text-muted-foreground">Synced By</p>
               <p className="text-sm font-medium">
                 {importRecord.importer?.employee?.full_name ?? importRecord.importer?.email ?? '—'}
               </p>
             </div>
             <div>
-              <p className="text-xs text-muted-foreground">Imported At</p>
+              <p className="text-xs text-muted-foreground">Synced At</p>
               <p className="text-sm tabular-nums">{formatDate(importRecord.created_at)}</p>
             </div>
             {canViewOriginal && (

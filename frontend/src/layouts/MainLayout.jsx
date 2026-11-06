@@ -1,9 +1,13 @@
+import { Suspense } from 'react';
 import { Navigate, Outlet, useLocation } from 'react-router-dom';
+import { LoadingBlock } from '@/components/ui/spinner';
 import Sidebar from '@/components/layout/Sidebar';
 import Topbar from '@/components/layout/Topbar';
 import AICopilotWidget from '@/components/ai/AICopilotWidget';
 import { useSyncAccessibleForms, useSyncBusinessUnits } from '@/hooks/useAccessibleForms';
 import { useAuth } from '@/hooks/useAuth';
+import { useHasForm } from '@/hooks/usePermissions';
+import { FORM_NAMES } from '@/constants/rbacForms';
 import { ROUTES } from '@/constants/routes';
 
 // RBAC redesign (§6.1): the full set of routes a Platform Admin may reach. Platform Admin only
@@ -14,6 +18,7 @@ const PLATFORM_ADMIN_ROUTES = [
   ROUTES.ADMINS, ROUTES.ADMIN_NEW, ROUTES.ROLES, ROUTES.FORMS, ROUTES.ORGANIZATION_OVERVIEW,
   ROUTES.SERVICE_TYPES, ROUTES.SERVICE_TYPE_NEW,
   ROUTES.SETTINGS_MONTHLY_CAP,
+  ROUTES.SETTINGS_SITE_LOGO,
 ];
 
 const MainLayout = () => {
@@ -28,6 +33,7 @@ const MainLayout = () => {
   useSyncBusinessUnits();
 
   const { isPlatformAdmin, isEmployeeOnly, homeRoute } = useAuth();
+  const canUseCopilot = useHasForm(FORM_NAMES.AI_COPILOT);
   const { pathname } = useLocation();
 
   // Dynamic login: an account whose ONLY role is Employee has no business on any RBAC-driven
@@ -69,7 +75,12 @@ const MainLayout = () => {
             footer never scroll out of view together with a tall/overflowing page. */}
         <main className="flex-1 min-h-0 overflow-y-auto flex flex-col">
           <div className="mx-auto max-w-screen-2xl px-3 sm:px-4 md:px-6 pt-4 pb-4 flex-1 w-full flex flex-col min-h-0">
-            <Outlet />
+            {/* Lazy route chunks suspend HERE, inside the content area, so the sidebar/topbar stay
+                put while a page loads — instead of the router's top-level full-screen fallback
+                replacing the whole shell on every first visit to a page. */}
+            <Suspense fallback={<LoadingBlock className="flex-1" />}>
+              <Outlet />
+            </Suspense>
           </div>
         </main>
         <footer className="shrink-0 w-full border-t bg-slate-50/80 py-2 px-3 sm:px-4 md:px-6">
@@ -84,8 +95,8 @@ const MainLayout = () => {
           </div>
         </footer>
       </div>
-      {/* Chatbot hidden for now */}
-      {false && !isPlatformAdmin && <AICopilotWidget />}
+      {/* Chatbot is role-wise: shown only when the "AI Copilot" form is mapped to the user's role. */}
+      {!isPlatformAdmin && canUseCopilot && <AICopilotWidget />}
     </div>
   );
 };

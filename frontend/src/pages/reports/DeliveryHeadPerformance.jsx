@@ -11,6 +11,8 @@ import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFil
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
 import SearchInput from '@/components/common/SearchInput';
 import DataTable from '@/components/common/DataTable';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
@@ -23,17 +25,23 @@ const columnHelper = createColumnHelper();
 // single month) and paginated client-side from there.
 const MAX_RECORDS_FETCH = 5000;
 
-const exportToExcel = (rows) => {
+// Hours delivered on the active basis. Callers only pass HOURS_ORIGINAL when the response actually
+// carries `original_total_hours_delivered`, so a response without it behaves exactly like Adjusted.
+const hoursDeliveredFor = (r, hoursSource) => (
+  hoursSource === HOURS_ORIGINAL ? r.original_total_hours_delivered : r.total_hours_delivered
+);
+
+const exportToExcel = (rows, hoursSource) => {
   const header = [
-    'Employee Code', 'Full Name', 'PO Count', 'Total Hours Delivered', 'Original Total Hours Delivered',
+    'Employee Code', 'Full Name', 'PO Count',
+    `Total Hours Delivered${hoursSource === HOURS_ORIGINAL ? ' (Original)' : ''}`,
     'Total Invoiced', 'Total Delivery Cost', 'Total Margin', 'At-Risk POs',
   ];
   const dataRows = rows.map((r) => [
     r.employee_code ?? '',
     r.full_name ?? '',
     r.po_count != null ? Number(r.po_count) : '',
-    r.total_hours_delivered != null ? Number(r.total_hours_delivered) : '',
-    r.original_total_hours_delivered != null ? Number(r.original_total_hours_delivered) : '',
+    hoursDeliveredFor(r, hoursSource) != null ? Number(hoursDeliveredFor(r, hoursSource)) : '',
     r.total_invoiced != null ? Number(r.total_invoiced) : '',
     r.total_delivery_cost != null ? Number(r.total_delivery_cost) : '',
     r.total_margin != null ? Number(r.total_margin) : '',
@@ -58,7 +66,7 @@ const MarginCell = ({ value }) => {
   );
 };
 
-const columns = [
+const buildColumns = (hoursSource) => [
   columnHelper.accessor('employee_code', {
     header: 'Employee Code',
     size: 150,
@@ -78,19 +86,11 @@ const columns = [
     size: 110,
     cell: (info) => <span className="tabular-nums">{info.getValue() ?? '—'}</span>,
   }),
-  columnHelper.accessor('total_hours_delivered', {
+  columnHelper.accessor((r) => hoursDeliveredFor(r, hoursSource), {
+    id: 'total_hours_delivered',
     header: 'Total Hours Delivered',
     size: 170,
     cell: (info) => <span className="tabular-nums">{formatHours(info.getValue())}</span>,
-  }),
-  columnHelper.accessor('original_total_hours_delivered', {
-    header: 'Original Total Hours Delivered',
-    size: 190,
-    cell: (info) => {
-      const value = info.getValue();
-      if (value == null || value === '') return null;
-      return <span className="tabular-nums text-muted-foreground">{formatHours(value)}</span>;
-    },
   }),
   columnHelper.accessor('total_invoiced', {
     header: 'Total Invoiced',
@@ -131,6 +131,7 @@ const SummaryItem = ({ label, value, negative = false }) => (
 );
 
 const DeliveryHeadPerformance = () => {
+  const confirmExport = useExportConfirm();
   const [monthYear, setMonthYear] = useState({
     month: prevMonth.getMonth() + 1,
     year: prevMonth.getFullYear(),
@@ -139,12 +140,15 @@ const DeliveryHeadPerformance = () => {
   const [entityIds, setEntityIds] = useState([]);
   const [buIds, setBuIds] = useState([]);
   const [search, setSearch] = useState('');
+  const [hoursSource, setHoursSource] = useState(HOURS_ADJUSTED);
   const [page, setPage] = useState(1);
   const [limit, setLimit] = useState(10);
 
   // page/limit above are for client-side pagination only, never sent to the API — the whole
   // matching month's data is fetched in one shot so totals and pagination both work off it.
   const params = {
+    // Original basis: the server then sorts, ranks and totals on original hours too.
+    ...(hoursSource === HOURS_ORIGINAL && { hoursSource: 'O' }),
     ...(monthYear && { month: monthYear.month, year: monthYear.year }),
     page: 1,
     limit: MAX_RECORDS_FETCH,
@@ -179,7 +183,25 @@ const DeliveryHeadPerformance = () => {
   } : null;
 
   // Already have the full record set in memory — no need for a second network round-trip.
-  const handleExport = () => exportToExcel(filteredRecords);
+  const hasOriginal = useMemo(() => records.some((r) => r.original_total_hours_delivered != null), [records]);
+  const effectiveSource = hasOriginal ? hoursSource : HOURS_ADJUSTED;
+
+  const handleExport = () => exportToExcel(filteredRecords, effectiveSource);
+
+  const columns = useMemo(() => buildColumns(effectiveSource), [effectiveSource]);
+
+  const activeFilterCount = [
+    entityIds.length > 0,
+    buIds.length > 0,
+    hoursSource !== HOURS_ADJUSTED,
+  ].filter(Boolean).length;
+
+  const clearFilters = () => {
+    setEntityIds([]);
+    setBuIds([]);
+    setHoursSource(HOURS_ADJUSTED);
+    setPage(1);
+  };
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -196,10 +218,10 @@ const DeliveryHeadPerformance = () => {
             <FilterToggleButton
               isOpen={filtersOpen}
               onToggle={() => setFiltersOpen((p) => !p)}
-              activeCount={(entityIds.length > 0 ? 1 : 0) + (buIds.length > 0 ? 1 : 0)}
+              activeCount={activeFilterCount}
             />
             {filteredRecords.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)}>
                 <Download className="h-4 w-4" />Export Excel
               </Button>
             )}
@@ -208,7 +230,7 @@ const DeliveryHeadPerformance = () => {
       />
 
       {/* Collapsible filter panel */}
-      <FilterPanel isOpen={filtersOpen} maxHeightClass="max-h-[300px]" onClear={() => { setEntityIds([]); setBuIds([]); }} showClear={entityIds.length > 0 || buIds.length > 0}>
+      <FilterPanel isOpen={filtersOpen} maxHeightClass="max-h-[300px]" onClear={clearFilters} showClear={activeFilterCount > 0}>
         <EntityFilter multiple value={entityIds} onChange={(v) => { setEntityIds(v); setBuIds([]); }} />
 
         <BusinessUnitFilter multiple value={buIds} entityId={entityIds} onChange={setBuIds} />
@@ -223,6 +245,8 @@ const DeliveryHeadPerformance = () => {
             className="w-full"
           />
         </div>
+
+        <HoursBasisToggle value={hoursSource} onChange={(v) => { setHoursSource(v); setPage(1); }} labelClassName="text-xs" />
       </FilterPanel>
 
       <DataTable

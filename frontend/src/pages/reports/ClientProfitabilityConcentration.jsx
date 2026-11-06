@@ -11,6 +11,7 @@ import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
 import SearchInput from '@/components/common/SearchInput';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { MonthYearPicker } from '@/components/ui/month-year-picker';
@@ -110,6 +111,7 @@ const SummaryItem = ({ label, value, negative = false }) => (
 );
 
 const ClientProfitabilityConcentration = () => {
+  const confirmExport = useExportConfirm();
   const [monthYear, setMonthYear] = useState({
     month: prevMonth.getMonth() + 1,
     year: prevMonth.getFullYear(),
@@ -177,7 +179,7 @@ const ClientProfitabilityConcentration = () => {
               activeCount={(entityIds.length > 0 ? 1 : 0) + (buIds.length > 0 ? 1 : 0)}
             />
             {filteredRecords.length > 0 && (
-              <Button variant="outline" size="sm" className="h-[clamp(1.875rem,2vw,2.25rem)]" onClick={handleExport}>
+              <Button variant="outline" size="sm" className="h-[clamp(1.875rem,2vw,2.25rem)]" onClick={() => confirmExport(handleExport)}>
                 <Download className="mr-1.5 h-4 w-4" />Export Excel
               </Button>
             )}

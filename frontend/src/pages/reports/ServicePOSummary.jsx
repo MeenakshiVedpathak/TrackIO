@@ -3,7 +3,6 @@ import * as XLSX from 'xlsx';
 import { createColumnHelper } from '@tanstack/react-table';
 import { Download } from 'lucide-react';
 import { useServicePOSummary, useServicePOSummaryTotals } from '@/hooks/useReports';
-import { useCanViewOriginalData } from '@/hooks/usePermissions';
 import { reportsApi } from '@/api/reports.api';
 import { useActiveClients } from '@/hooks/useClients';
 import { useActiveServicePOs } from '@/hooks/useServicePOs';
@@ -13,12 +12,14 @@ import { useDebounce } from '@/hooks/useDebounce';
 import { formatCurrency, formatDate, formatHours } from '@/utils/formatters';
 import DataTable from '@/components/common/DataTable';
 import PageHeader from '@/components/common/PageHeader';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import StatusBadge from '@/components/common/StatusBadge';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
 import SearchInput from '@/components/common/SearchInput';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { MultiSelect } from '@/components/ui/multi-select';
@@ -29,14 +30,19 @@ import useAuth from '@/hooks/useAuth';
 
 const columnHelper = createColumnHelper();
 
-const exportToExcel = (rows) => {
-  const hasOriginal = rows.some((r) => r.original_hours_delivered_before_month != null);
+// One value per metric, chosen by the Hours basis switch — in Original mode read the original_*
+// twin, falling back to the plain field (which the API may already fill with original values).
+const deliveredBeforeMonth = (r, isOriginal) => (
+  isOriginal ? (r.original_hours_delivered_before_month ?? r.hours_delivered_before_month) : r.hours_delivered_before_month
+);
+
+const exportToExcel = (rows, isOriginal = false) => {
+  // Only the active hours basis is exported — one column per metric.
   const header = [
     'PO Code', 'PO Name', 'Client Name', 'Service Type', 'Category', 'Start Date', 'End Date',
     'Status', 'Billable', 'Invoice Freq.', 'Account Manager', 'PO Value',
     // 'Expected Hours',
-    'Hours Delivered Before Month',
-    ...(hasOriginal ? ['Original Delivered Before Month'] : []),
+    isOriginal ? 'Hours Delivered Before Month (Original)' : 'Hours Delivered Before Month',
     'Billable Amount', 'Invoiced Amount', 'Billed Amount', 'Unbilled Amount'
   ];
   const dataRows = rows.map((r) => [
@@ -53,8 +59,7 @@ const exportToExcel = (rows) => {
     r.account_manager ?? '',
     r.po_value != null ? Number(r.po_value) : '',
     // r.expected_man_hours != null ? Number(r.expected_man_hours) : '',
-    r.hours_delivered_before_month != null ? Number(r.hours_delivered_before_month) : '',
-    ...(hasOriginal ? [r.original_hours_delivered_before_month != null ? Number(r.original_hours_delivered_before_month) : ''] : []),
+    deliveredBeforeMonth(r, isOriginal) != null ? Number(deliveredBeforeMonth(r, isOriginal)) : '',
     r.monthly_billable_amount != null ? Number(r.monthly_billable_amount) : '',
     r.invoiced_amount != null ? Number(r.invoiced_amount) : '',
     r.billed_amount != null ? Number(r.billed_amount) : '',
@@ -79,7 +84,7 @@ const ValueCell = ({ value, format = 'currency' }) => {
 };
 
 
-const columns = [
+const buildColumns = (isOriginal) => [
   columnHelper.accessor('service_po_code', {
     header: 'PO Code',
     size: 160,
@@ -136,14 +141,10 @@ const columns = [
   //   size: 140,
   //   cell: (info) => <ValueCell value={info.getValue()} format="hours" />,
   // }),
-  columnHelper.accessor('hours_delivered_before_month', {
+  columnHelper.accessor((row) => deliveredBeforeMonth(row, isOriginal), {
+    id: 'hours_delivered_before_month',
     header: 'Delivered Before Month',
     size: 180,
-    cell: (info) => <ValueCell value={info.getValue()} format="hours" />,
-  }),
-  columnHelper.accessor('original_hours_delivered_before_month', {
-    header: 'Original Delivered Before Month',
-    size: 220,
     cell: (info) => <ValueCell value={info.getValue()} format="hours" />,
   }),
   columnHelper.accessor('monthly_billable_amount', {
@@ -178,6 +179,7 @@ const SummaryItem = ({ label, value, highlight = false, negative = false }) => (
 );
 
 const ServicePOSummary = () => {
+  const confirmExport = useExportConfirm();
   const [monthYear, setMonthYear] = useState({
     month: prevMonth.getMonth() + 1,
     year: prevMonth.getFullYear(),
@@ -188,13 +190,8 @@ const ServicePOSummary = () => {
 
   const [categoryId, setCategoryId] = useState([]);
   const [status, setStatus] = useState([]);
-  const canViewOriginal = useCanViewOriginalData();
   const [hoursSource, setHoursSource] = useState('M');
 
-  // Role no longer grants Original-data visibility (e.g. role reassigned mid-session) — force back to Modified.
-  useEffect(() => {
-    if (!canViewOriginal) setHoursSource('M');
-  }, [canViewOriginal]);
   const [dateRange, setDateRange] = useState(null);
   const [search, setSearch] = useState('');
   const [filtersOpen, setFiltersOpen] = useState(false);
@@ -204,7 +201,8 @@ const ServicePOSummary = () => {
   const [limit, setLimit] = useState(10);
   const [exporting, setExporting] = useState(false);
 
-  const debouncedSearch = useDebounce(search, 400);  const scope = useMemo(() => ({ entityIds, businessUnitIds: buIds }), [entityIds, buIds]);
+  const debouncedSearch = useDebounce(search, 400);
+  const scope = useMemo(() => ({ entityIds, businessUnitIds: buIds }), [entityIds, buIds]);
 
   const { data: activeClients = [] } = useActiveClients(scope);
   const { data: activePOs = [] } = useActiveServicePOs(true, undefined, scope);
@@ -273,14 +271,8 @@ const ServicePOSummary = () => {
   const summary = totalsSummary ?? data?.data?.summary ?? null;
   const meta    = data?.meta ?? {};
 
-  const hasOriginalBefore = records.some((r) => r.original_hours_delivered_before_month != null);
-  const visibleColumns = useMemo(() => {
-    if (hasOriginalBefore) return columns;
-    return columns.filter((col) => {
-      const key = col.accessorKey || col.id;
-      return key !== 'original_hours_delivered_before_month';
-    });
-  }, [hasOriginalBefore]);
+  const isOriginal = hoursSource === HOURS_ORIGINAL;
+  const visibleColumns = useMemo(() => buildColumns(isOriginal), [isOriginal]);
 
   const activeFilterCount = [
     entityIds.length > 0,
@@ -291,6 +283,7 @@ const ServicePOSummary = () => {
     serviceTypeId.length > 0,
     poId.length > 0,
     status.length > 0,
+    hoursSource !== HOURS_ADJUSTED,
   ].filter(Boolean).length;
 
   const clearFilters = () => {
@@ -302,6 +295,7 @@ const ServicePOSummary = () => {
     setServiceTypeId([]);
     setPoId([]);
     setStatus([]);
+    setHoursSource(HOURS_ADJUSTED);
     setPage(1);
   };
 
@@ -312,7 +306,7 @@ const ServicePOSummary = () => {
       const total = meta.total > 0 ? meta.total : 1000;
       const res = await reportsApi.getServicePOSummary({ ...params, page: 1, limit: total });
       const allRecords = Array.isArray(res?.data?.records) ? res.data.records : Array.isArray(res?.data) ? res.data : [];
-      exportToExcel(allRecords);
+      exportToExcel(allRecords, isOriginal);
     } finally {
       setExporting(false);
     }
@@ -330,32 +324,13 @@ const ServicePOSummary = () => {
               placeholder="Search PO Name, Client…"
               className="w-full sm:w-full md:w-56"
             />
-            {canViewOriginal && (
-              <div className="flex items-center gap-0.5 p-0.5 rounded-xl bg-muted border shrink-0">
-                {[
-                  { value: 'O', label: 'Original' },
-                  { value: 'M', label: 'Published' },
-                ].map(({ value, label }) => (
-                  <button
-                    key={value}
-                    type="button"
-                    onClick={() => { setHoursSource(value); setPage(1); }}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-                      hoursSource === value ? 'bg-card shadow-sm text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground hover:text-foreground'
-                    }`}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-            )}
             <FilterToggleButton
               isOpen={filtersOpen}
               onToggle={() => setFiltersOpen((p) => !p)}
               activeCount={activeFilterCount}
             />
             {records.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport} disabled={exporting}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)} disabled={exporting}>
                 <Download className="h-4 w-4" />{exporting ? 'Exporting…' : 'Export Excel'}
               </Button>
             )}
@@ -378,6 +353,12 @@ const ServicePOSummary = () => {
               className="w-full"
             />
           </div>
+
+          <HoursBasisToggle
+            value={hoursSource}
+            onChange={(v) => { setHoursSource(v); setPage(1); }}
+            labelClassName="text-xs"
+          />
 
           <div className="flex flex-col gap-1.5">
             <Label className="text-xs">PO Start &amp; End Date</Label>
@@ -484,8 +465,12 @@ const ServicePOSummary = () => {
           <div className="flex flex-wrap gap-x-6 gap-y-2">
             <SummaryItem label="PO Value" value={formatCurrency(summary.total_po_value)} />
             {/* <SummaryItem label="Exp. Hours" value={formatHours(summary.total_expected_man_hours)} /> */}
-            <SummaryItem label="Delivered Before Month" value={formatHours(summary.total_hours_delivered_before_month)} />
-            {hasOriginalBefore && <SummaryItem label="Original Delivered Before Month" value={formatHours(summary.total_original_hours_delivered_before_month)} />}
+            <SummaryItem
+              label="Delivered Before Month"
+              value={formatHours(isOriginal
+                ? (summary.total_original_hours_delivered_before_month ?? summary.total_hours_delivered_before_month)
+                : summary.total_hours_delivered_before_month)}
+            />
             <SummaryItem label="Billable Amount" value={formatCurrency(summary.total_monthly_billable_amount)} highlight />
             <SummaryItem label="Invoiced Amount" value={formatCurrency(summary.total_invoiced_amount)} highlight />
             <SummaryItem label="Billed Amount" value={formatCurrency(summary.total_billed_amount)} highlight />

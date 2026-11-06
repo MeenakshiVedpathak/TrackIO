@@ -22,6 +22,7 @@ import FilterPanel from '@/components/common/FilterPanel';
 import SearchInput from '@/components/common/SearchInput';
 import SegmentedToggle from '@/components/common/SegmentedToggle';
 import EmptyState from '@/components/common/EmptyState';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -76,6 +77,7 @@ const StatusToggle = ({ client, canManage }) => {
 };
 
 const ClientList = () => {
+  const confirmExport = useExportConfirm();
   const navigate = useNavigate();
   const { success, error: showError, warning } = useNotification();
 
@@ -545,7 +547,7 @@ const ClientList = () => {
                 activeCount={activeFilterCount}
               />
               {clients.length > 0 && (
-                <Button variant="outline" size="toolbar" onClick={handleExportExcel}>
+                <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExportExcel)}>
                   <Download className="h-4 w-4" /> Export Excel
                 </Button>
               )}
@@ -623,7 +625,7 @@ const ClientList = () => {
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
                 {clients.length > 0 && (
-                  <DropdownMenuItem onClick={handleExportExcel} className="cursor-pointer">
+                  <DropdownMenuItem onClick={() => confirmExport(handleExportExcel)} className="cursor-pointer">
                     <Download className="h-4 w-4" /> Export Excel
                   </DropdownMenuItem>
                 )}

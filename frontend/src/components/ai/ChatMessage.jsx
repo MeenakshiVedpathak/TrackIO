@@ -48,7 +48,7 @@ const useTypewriter = (fullText, enabled) => {
   return revealed;
 };
 
-const ChatMessage = ({ message, isLast, onRegenerate }) => {
+const ChatMessage = ({ message, isLast, onRegenerate, onSuggest, suggestDisabled }) => {
   const { success } = useNotification();
   const [copied, setCopied] = useState(false);
   const isUser = message.role === 'user';
@@ -96,6 +96,21 @@ const ChatMessage = ({ message, isLast, onRegenerate }) => {
             <MarkdownLite text={revealed} />
           )}
         </div>
+        {!isThinking && message.suggestedQuestions?.length > 0 && (
+          <div className="mt-2 flex flex-wrap gap-1.5" role="group" aria-label="Suggested questions">
+            {message.suggestedQuestions.map((q) => (
+              <button
+                key={q}
+                type="button"
+                onClick={() => onSuggest?.(q)}
+                disabled={suggestDisabled || !onSuggest}
+                className="rounded-full border border-violet-200 bg-violet-50 px-2.5 py-1 text-left text-xs font-medium text-violet-700 transition-colors hover:bg-violet-100 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {q}
+              </button>
+            ))}
+          </div>
+        )}
         {!isThinking && (
           <div className="flex items-center gap-3 mt-1 pl-1">
             <span className="text-[10px] text-muted-foreground">{formatTime(message.createdAt)}</span>

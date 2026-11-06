@@ -277,4 +277,51 @@ export const reportsApi = {
     const filename = match?.[1] ?? 'Team_Lead_Employee_Project_Hours.xlsx';
     return { blob: res.data, filename };
   },
+  // Team Lead Employee PO Hours — employee × Service PO hours matrix for the same mapped-employee
+  // scope as the report above (Team Lead resolved from the login, never a param). Callers pass
+  // `buId: 'all'` so no X-Company-Id goes out: the PO side is intentionally cross-BU. No
+  // page/limit — the endpoint returns the whole matrix.
+  getTeamLeadEmployeePoHours: (params) => getReport('/reports/team-lead-employee-po-hours', params),
+  // Dropdown options for that report (employees/clients/projects/servicePos/BUs/Sub-BUs). Must be
+  // used instead of the generic master lists, which are BU-scoped and would hide Cross-BU POs.
+  getTeamLeadEmployeePoHoursFilterOptions: (params) => getReport('/reports/team-lead-employee-po-hours/filter-options', params),
+  exportTeamLeadEmployeePoHours: async (params) => {
+    const { buId, ...query } = params;
+    const res = await apiClient.get('/reports/team-lead-employee-po-hours/export', {
+      params: { ...query, format: 'excel' },
+      responseType: 'blob',
+      ...explicitBuScope(buId),
+    });
+    const match = /filename="?([^"]+)"?/i.exec(res.headers['content-disposition'] ?? '');
+    const filename = match?.[1] ?? 'Team_Lead_Employee_PO_Hours.xlsx';
+    return { blob: res.data, filename };
+  },
+  // BU Employee PO Hours — employee × Service PO hours matrix; Admin/Entity Admin/BU Admin, scoped by role reach.
+  getBuAdminEmployeePoHours: (params) => getReport('/reports/bu-admin-employee-po-hours', params),
+  getBuAdminEmployeePoHoursFilterOptions: (params) => getReport('/reports/bu-admin-employee-po-hours/filter-options', params),
+  exportBuAdminEmployeePoHours: async (params) => {
+    const { buId, ...query } = params;
+    const res = await apiClient.get('/reports/bu-admin-employee-po-hours/export', {
+      params: { ...query, format: 'excel' },
+      responseType: 'blob',
+      ...explicitBuScope(buId),
+    });
+    const match = /filename="?([^"]+)"?/i.exec(res.headers['content-disposition'] ?? '');
+    const filename = match?.[1] ?? 'BU_Employee_PO_Hours.xlsx';
+    return { blob: res.data, filename };
+  },
+  // Project Manager Employee PO Hours — employee × Service PO hours matrix for caller's own flagged POs.
+  getProjectManagerEmployeePoHours: (params) => getReport('/reports/project-manager-employee-po-hours', params),
+  getProjectManagerEmployeePoHoursFilterOptions: (params) => getReport('/reports/project-manager-employee-po-hours/filter-options', params),
+  exportProjectManagerEmployeePoHours: async (params) => {
+    const { buId, ...query } = params;
+    const res = await apiClient.get('/reports/project-manager-employee-po-hours/export', {
+      params: { ...query, format: 'excel' },
+      responseType: 'blob',
+      ...explicitBuScope(buId),
+    });
+    const match = /filename="?([^"]+)"?/i.exec(res.headers['content-disposition'] ?? '');
+    const filename = match?.[1] ?? 'Project_Manager_Employee_PO_Hours.xlsx';
+    return { blob: res.data, filename };
+  },
 };

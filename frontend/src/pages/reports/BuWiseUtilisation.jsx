@@ -21,6 +21,8 @@ import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter from '@/components/common/EntityFilter';
 import SearchInput from '@/components/common/SearchInput';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Label } from '@/components/ui/label';
 import { MultiSelect } from '@/components/ui/multi-select';
 import { MonthYearPicker } from '@/components/ui/month-year-picker';
@@ -206,6 +208,7 @@ const SummaryItem = ({ label, value }) => (
 );
 
 const BuWiseUtilisation = () => {
+  const confirmExport = useExportConfirm();
   const [periodMode, setPeriodMode] = useState('month');
   const [monthYear, setMonthYear] = useState({ month: now.getMonth() + 1, year: now.getFullYear() });
   const [dateRange, setDateRange] = useState(null);
@@ -223,8 +226,9 @@ const BuWiseUtilisation = () => {
   const { error: showError } = useNotification();
   const debouncedSearch = useDebounce(search, 400);
 
-  // '' = Adjusted (after sync, default); 'O' = Original (as logged, before monthly cap).
-  const [hoursSource, setHoursSource] = useState('');
+  // 'M' = Adjusted (after sync, default); 'O' = Original (as logged, before monthly cap).
+  // Only 'O' is sent to the API — Adjusted is the server default, so the request is unchanged.
+  const [hoursSource, setHoursSource] = useState(HOURS_ADJUSTED);
 
   // Expand/collapse per BU row. Collapsed by default — the hierarchy is opt-in.
   const [expandedBuIds, setExpandedBuIds] = useState(() => new Set());
@@ -253,7 +257,7 @@ const BuWiseUtilisation = () => {
     ...(periodMode === 'month'
       ? monthYear?.month && monthYear?.year && { month: monthYear.month, year: monthYear.year }
       : dateRange?.startDate && dateRange?.endDate && { startDate: dateRange.startDate, endDate: dateRange.endDate }),
-    ...(hoursSource === 'O' && { hoursSource: 'O' }),
+    ...(hoursSource === HOURS_ORIGINAL && { hoursSource: HOURS_ORIGINAL }),
     groupBy: 'hierarchy',
     ...(debouncedSearch && { search: debouncedSearch }),
     sortBy,
@@ -327,7 +331,7 @@ const BuWiseUtilisation = () => {
     clientIds.length > 0,
     projectIds.length > 0,
     serviceTypeIds.length > 0,
-    hoursSource !== '',
+    hoursSource !== HOURS_ADJUSTED,
   ].filter(Boolean).length;
 
   const clearFilters = () => {
@@ -337,7 +341,7 @@ const BuWiseUtilisation = () => {
     setClientIds([]);
     setProjectIds([]);
     setServiceTypeIds([]);
-    setHoursSource('');
+    setHoursSource(HOURS_ADJUSTED);
     setPage(1);
   };
 
@@ -387,7 +391,7 @@ const BuWiseUtilisation = () => {
               className="w-full sm:w-56"
             />
             {periodReady && records.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport} disabled={isExporting}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)} disabled={isExporting}>
                 <Download className="h-4 w-4" />{isExporting ? 'Exporting…' : 'Export Excel'}
               </Button>
             )}
@@ -440,30 +444,11 @@ const BuWiseUtilisation = () => {
           )}
         </div>
 
-        <div className="flex flex-col gap-1.5">
-          <Label className="text-xs font-medium">Hours basis</Label>
-          <div className="flex items-center gap-0.5 p-0.5 rounded-lg bg-muted border w-fit">
-            {[
-              { value: '', label: 'Adjusted' },
-              { value: 'O', label: 'Original' },
-            ].map(({ value, label }) => (
-              <button
-                key={value || 'adjusted'}
-                type="button"
-                onClick={() => { setHoursSource(value); setPage(1); }}
-                className={cn(
-                  'px-3 py-1.5 rounded-md text-xs font-semibold transition-all duration-150 whitespace-nowrap',
-                  hoursSource === value ? 'bg-card shadow-sm text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground hover:text-foreground'
-                )}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-          <span className="text-[10px] text-muted-foreground">
-            {hoursSource === 'O' ? 'Original (as logged, before the monthly cap)' : 'Adjusted (after sync)'}
-          </span>
-        </div>
+        <HoursBasisToggle
+          value={hoursSource}
+          onChange={(v) => { setHoursSource(v); setPage(1); }}
+          labelClassName="text-xs"
+        />
 
         <div className="flex flex-col gap-1.5">
           <Label className="text-xs">Employee</Label>

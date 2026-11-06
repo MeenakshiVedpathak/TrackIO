@@ -12,8 +12,9 @@ import { resolveFormRoute, FORM_NAMES } from '@/constants/rbacForms';
 import { useCanManageBusinessUnits, useCanManageEmployeeRecords, useCanManageClientProjectPO, useCanWrite } from '@/hooks/usePermissions';
 import { ROUTES } from '@/constants/routes';
 import { ROLE_NAMES } from '@/constants/roleHierarchy';
-import { ChevronLeft, ChevronRight, ChevronDown, UserPlus, Shield, ClipboardList, Network, Folder, Plus, Layers, Gauge, History } from 'lucide-react';
+import { ChevronLeft, ChevronRight, ChevronDown, UserPlus, Shield, ClipboardList, Network, Folder, Plus, Layers, Gauge, Image } from 'lucide-react';
 import ConfirmDialog from '@/components/common/ConfirmDialog';
+import SiteLogo from '@/components/common/SiteLogo';
 import ScrollOnHoverText from '@/components/common/ScrollOnHoverText';
 
 // A Platform Admin (top of the RBAC hierarchy, §0) sees ONLY these nav items — everything else
@@ -27,9 +28,9 @@ const SUPER_ADMIN_NAV_GROUPS = [
       { label: 'Role Master', icon: Shield, to: ROUTES.ROLES, exact: false, addTo: ROUTES.ROLE_NEW, addLabel: 'Add Role' },
       { label: 'Forms Master', icon: ClipboardList, to: ROUTES.FORMS, exact: false, addTo: `${ROUTES.FORM_NEW}?type=form`, addLabel: 'Add Form' },
       { label: 'Organization Overview', icon: Network, to: ROUTES.ORGANIZATION_OVERVIEW, exact: true },
-      { label: 'Audit Logs', icon: History, to: ROUTES.AUDIT_LOGS, exact: true },
       { label: 'Service Types', icon: Layers, to: ROUTES.SERVICE_TYPES, exact: false, addTo: ROUTES.SERVICE_TYPE_NEW, addLabel: 'Add Service Type' },
       { label: 'Monthly Cap Hours', icon: Gauge, to: ROUTES.SETTINGS_MONTHLY_CAP, exact: true },
+      { label: 'Site Logo', icon: Image, to: ROUTES.SETTINGS_SITE_LOGO, exact: true },
     ],
   },
 ];
@@ -529,9 +530,7 @@ const Sidebar = () => {
           whileHover={{ scale: 1.05 }}
           whileTap={{ scale: 0.94 }}
         >
-          <img
-            src="/logo-dark.png"
-            alt="Trackio"
+          <SiteLogo
             className={collapsed ? 'h-full w-full object-cover object-left' : 'h-full w-auto object-contain'}
           />
         </motion.div>

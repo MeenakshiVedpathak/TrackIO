@@ -9,6 +9,7 @@ import { useNotification } from '@/hooks/useNotification';
 import { extractApiError } from '@/services/apiClient';
 import { useIsMobile } from '@/hooks/useMediaQuery';
 import { formatDate, formatMonthYear, getInitials } from '@/utils/formatters';
+import { PreviewEmployee } from '@/utils/timesheetPreview';
 import { QUERY_KEYS } from '@/constants/queryKeys';
 import ImportPreviewPanel from './ImportPreviewPanel';
 import {
@@ -64,7 +65,7 @@ const ErrorRowsTable = ({ errors }) => {
         {errors.map((e, i) => (
           <tr key={i} className="hover:bg-muted/30">
             <td className="px-3 py-2 tabular-nums font-mono">{e.rowNumber ?? i + 1}</td>
-            <td className="px-3 py-2 max-w-[120px] truncate" title={e.row?.resourceName}>{e.row?.resourceName ?? '—'}</td>
+            <td className="px-3 py-2 max-w-[160px]"><PreviewEmployee row={e.row} /></td>
             <td className="px-3 py-2 max-w-[140px] truncate" title={e.row?.servicePOName}>{e.row?.servicePOName ?? '—'}</td>
             <td className="px-3 py-2 whitespace-nowrap">{e.row?.date ? formatDate(e.row.date) : '—'}</td>
             <td className="px-3 py-2 text-destructive">{e.errors?.join(', ') ?? '—'}</td>
@@ -565,8 +566,8 @@ const SyncWorkLogsDialog = ({ open, onOpenChange, activeBusinessUnits = [] }) =>
 
                   {preview.valid_rows.map((row, idx) => (
                     <div key={idx} className="rounded-lg border bg-white p-3">
-                      <div className="flex items-center justify-between gap-2">
-                        <p className="truncate text-sm font-medium">{row.resourceName ?? '—'}</p>
+                      <div className="flex items-start justify-between gap-2">
+                        <PreviewEmployee row={row} className="min-w-0 text-sm" />
                         <span className="shrink-0 tabular-nums text-sm font-semibold">
                           {row.hours != null ? `${Number(row.hours).toFixed(2)}h` : '—'}
                         </span>
@@ -581,6 +582,7 @@ const SyncWorkLogsDialog = ({ open, onOpenChange, activeBusinessUnits = [] }) =>
                   {preview.error_rows.map((row, idx) => (
                     <div key={idx} className="rounded-lg border border-destructive/40 bg-destructive/5 p-3">
                       <p className="font-mono text-xs text-muted-foreground">Row {row.rowNumber ?? row.row_number ?? idx + 1}</p>
+                      {row.row && <PreviewEmployee row={row.row} className="mt-1 text-sm" />}
                       <p className="mt-1 text-sm text-destructive">
                         {row.errors?.length > 0 ? row.errors.join(', ') : row.message ?? row.error_message ?? row.error ?? '—'}
                       </p>

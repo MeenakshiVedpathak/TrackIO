@@ -572,7 +572,7 @@ const TimesheetList = () => {
       },
     })] : []),
     columnHelper.accessor('importer', {
-      header: 'Imported By',
+      header: 'Synced By',
       size: 200,
       cell: (info) => {
         const imp = info.getValue();
@@ -687,7 +687,7 @@ const TimesheetList = () => {
       },
     })] : []),
     columnHelper.accessor('created_at', {
-      header: 'Imported At',
+      header: 'Synced At',
       size: 150,
       cell: (info) => (
         <span className="text-xs text-muted-foreground tabular-nums">

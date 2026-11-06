@@ -19,25 +19,32 @@ import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
 import SearchInput from '@/components/common/SearchInput';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { MultiSelect } from '@/components/ui/multi-select';
 import { MonthYearPicker } from '@/components/ui/month-year-picker';
 import { DateRangePicker } from '@/components/ui/date-range-picker';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
 
 const columnHelper = createColumnHelper();
 
-const exportToExcel = (rows) => {
-  const hasOriginalBefore = rows.some((r) => r.original_hours_delivered_before_month != null);
-  const hasOriginalCurrent = rows.some((r) => r.original_hours_delivered_current_month != null);
+// Delivered-hours metrics carry an `original_*` twin (hours as logged, before the monthly-cap
+// sync); the "Hours basis" switch picks which one every column/total/export shows.
+const basisValue = (r, key, isOriginal) => (isOriginal ? r[`original_${key}`] : r[key]);
+
+const exportToExcel = (rows, isOriginal) => {
+  const sfx = isOriginal ? ' (Original)' : '';
+  const num = (r, key) => {
+    const v = basisValue(r, key, isOriginal);
+    return v != null ? Number(v) : '';
+  };
   const header = [
     'PO Code', 'PO Name', 'Client Name', 'Service Type', 'Category', 'Status', 'Billable',
     'Invoice Freq.', 'Start Date', 'End Date', 'Account Manager', 'PO Value',
     'Expected Hours',
-    'Hours Delivered Before Month',
-    ...(hasOriginalBefore ? ['Original Hours Delivered Before Month'] : []),
-    'Hours Delivered This Month',
-    ...(hasOriginalCurrent ? ['Original Hours Delivered This Month'] : []),
+    `Hours Delivered Before Month${sfx}`,
+    `Hours Delivered This Month${sfx}`,
     /* 'Available Hours', */
     'Billable Amount', 'Invoiced Amount', 'Billed Amount', 'Unbilled Amount',
   ];
@@ -55,10 +62,8 @@ const exportToExcel = (rows) => {
     r.account_manager ?? '',
     r.po_value != null ? Number(r.po_value) : '',
     r.exp_hours != null ? Number(r.exp_hours) : '',
-    r.hours_delivered_before_month != null ? Number(r.hours_delivered_before_month) : '',
-    ...(hasOriginalBefore ? [r.original_hours_delivered_before_month != null ? Number(r.original_hours_delivered_before_month) : ''] : []),
-    r.hours_delivered_current_month != null ? Number(r.hours_delivered_current_month) : '',
-    ...(hasOriginalCurrent ? [r.original_hours_delivered_current_month != null ? Number(r.original_hours_delivered_current_month) : ''] : []),
+    num(r, 'hours_delivered_before_month'),
+    num(r, 'hours_delivered_current_month'),
     // r.available_hours != null ? Number(r.available_hours) : '',
     r.monthly_billable_amount != null ? Number(r.monthly_billable_amount) : '',
     r.invoiced_amount != null ? Number(r.invoiced_amount) : '',
@@ -82,7 +87,7 @@ const ValueCell = ({ value, format = 'currency' }) => {
   return <span className="tabular-nums">{formatCurrency(value)}</span>;
 };
 
-const columns = [
+const buildColumns = (isOriginal) => [
   columnHelper.accessor('service_po_code', {
     header: 'PO Code',
     size: 160,
@@ -146,24 +151,16 @@ const columns = [
     size: 140,
     cell: (info) => <ValueCell value={info.getValue()} format="hours" />,
   }),
-  columnHelper.accessor('hours_delivered_before_month', {
+  columnHelper.accessor((r) => basisValue(r, 'hours_delivered_before_month', isOriginal), {
+    id: 'hours_delivered_before_month',
     header: 'Delivered Before Month',
     size: 180,
     cell: (info) => <ValueCell value={info.getValue()} format="hours" />,
   }),
-  columnHelper.accessor('original_hours_delivered_before_month', {
-    header: 'Original Delivered Before Month',
-    size: 220,
-    cell: (info) => <ValueCell value={info.getValue()} format="hours" />,
-  }),
-  columnHelper.accessor('hours_delivered_current_month', {
+  columnHelper.accessor((r) => basisValue(r, 'hours_delivered_current_month', isOriginal), {
+    id: 'hours_delivered_current_month',
     header: 'Delivered This Month',
     size: 170,
-    cell: (info) => <ValueCell value={info.getValue()} format="hours" />,
-  }),
-  columnHelper.accessor('original_hours_delivered_current_month', {
-    header: 'Original Delivered This Month',
-    size: 210,
     cell: (info) => <ValueCell value={info.getValue()} format="hours" />,
   }),
   // columnHelper.accessor('available_hours', {
@@ -203,6 +200,7 @@ const SummaryItem = ({ label, value, highlight = false, negative = false }) => (
 );
 
 const InvoicePOSummary = () => {
+  const confirmExport = useExportConfirm();
   const [monthYear, setMonthYear] = useState({
     month: prevMonth.getMonth() + 1,
     year: prevMonth.getFullYear(),
@@ -221,6 +219,7 @@ const InvoicePOSummary = () => {
   const [page, setPage] = useState(1);
   const [limit, setLimit] = useState(10);
   const [exporting, setExporting] = useState(false);
+  const [hoursSource, setHoursSource] = useState(HOURS_ADJUSTED);
 
   const debouncedSearch = useDebounce(search, 400);
   const scope = useMemo(() => ({ entityIds, businessUnitIds: buIds }), [entityIds, buIds]);
@@ -262,6 +261,8 @@ const InvoicePOSummary = () => {
   };
 
   const params = {
+    // Original basis: the server then sorts, ranks and totals on original hours too.
+    ...(hoursSource === HOURS_ORIGINAL && { hoursSource: 'O' }),
     ...(monthYear && { month: monthYear.month, year: monthYear.year }),
     ...(clientId.length > 0 && { clientId: clientId.join(',') }),
     ...(serviceTypeId.length > 0 && { serviceTypeId: serviceTypeId.join(',') }),
@@ -289,18 +290,13 @@ const InvoicePOSummary = () => {
   const summary = totalsSummary ?? data?.data?.summary ?? null;
   const meta = data?.meta ?? {};
 
-  const hasOriginalBefore = records.some((r) => r.original_hours_delivered_before_month != null);
-  const hasOriginalCurrent = records.some((r) => r.original_hours_delivered_current_month != null);
-
-  const visibleColumns = useMemo(() => {
-    if (hasOriginalBefore && hasOriginalCurrent) return columns;
-    return columns.filter((col) => {
-      const key = col.accessorKey || col.id;
-      if (key === 'original_hours_delivered_before_month' && !hasOriginalBefore) return false;
-      if (key === 'original_hours_delivered_current_month' && !hasOriginalCurrent) return false;
-      return true;
-    });
-  }, [hasOriginalBefore, hasOriginalCurrent]);
+  // The Hours basis switch only shows when the rows carry original_* data; without it the report
+  // behaves exactly as Adjusted.
+  const hasOriginal = records.some((r) =>
+    r.original_hours_delivered_before_month != null || r.original_hours_delivered_current_month != null
+  );
+  const isOriginal = hasOriginal && hoursSource === HOURS_ORIGINAL;
+  const visibleColumns = useMemo(() => buildColumns(isOriginal), [isOriginal]);
 
   const activeFilterCount = [
     entityIds.length > 0,
@@ -312,6 +308,7 @@ const InvoicePOSummary = () => {
     poId.length > 0,
     status.length > 0,
     billable.length > 0,
+    hoursSource !== HOURS_ADJUSTED,
   ].filter(Boolean).length;
 
   const clearFilters = () => {
@@ -324,6 +321,7 @@ const InvoicePOSummary = () => {
     setPoId([]);
     setStatus([]);
     setBillable([]);
+    setHoursSource(HOURS_ADJUSTED);
     setPage(1);
   };
 
@@ -334,7 +332,7 @@ const InvoicePOSummary = () => {
       const total = meta.total > 0 ? meta.total : 1000;
       const res = await reportsApi.getInvoicePOSummary({ ...params, page: 1, limit: total });
       const allRecords = Array.isArray(res?.data?.records) ? res.data.records : [];
-      exportToExcel(allRecords);
+      exportToExcel(allRecords, isOriginal);
     } finally {
       setExporting(false);
     }
@@ -358,7 +356,7 @@ const InvoicePOSummary = () => {
               activeCount={activeFilterCount}
             />
             {records.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport} disabled={exporting}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)} disabled={exporting}>
                 <Download className="h-4 w-4" />{exporting ? 'Exporting…' : 'Export Excel'}
               </Button>
             )}
@@ -383,6 +381,14 @@ const InvoicePOSummary = () => {
           />
         </div>
 
+        {hasOriginal && (
+          <HoursBasisToggle
+            value={hoursSource}
+            onChange={(v) => { setHoursSource(v); setPage(1); }}
+            labelClassName="text-xs"
+          />
+        )}
+
         <div className="flex flex-col gap-1.5">
           <Label className="text-xs">PO Start &amp; End Date</Label>
           <DateRangePicker
@@ -396,11 +402,7 @@ const InvoicePOSummary = () => {
         <div className="flex flex-col gap-1.5">
           <Label className="text-xs">Client</Label>
           <MultiSelect
-            options={activeClients.map((c) => ({ label: c.client_name, value: String(c.id) , 
-            ...(c.original_total_hours != null ? {'Original Total Hours': c.original_total_hours} : {}),
-            ...(c.original_billable_hours != null ? {'Original Billable Hours': c.original_billable_hours} : {}),
-            ...(c.original_hours != null ? {'Original Hours': c.original_hours} : {})
-          }))}
+            options={activeClients.map((c) => ({ label: c.client_name, value: String(c.id) }))}
             value={clientId}
             onValueChange={(v) => { setClientId(v); setPage(1); }}
             placeholder="All Clients"
@@ -412,11 +414,7 @@ const InvoicePOSummary = () => {
         <div className="flex flex-col gap-1.5">
           <Label className="text-xs">Category</Label>
           <MultiSelect
-            options={activeServiceCategories.map((c) => ({ label: c.name, value: String(c.id) , 
-            ...(c.original_total_hours != null ? {'Original Total Hours': c.original_total_hours} : {}),
-            ...(c.original_billable_hours != null ? {'Original Billable Hours': c.original_billable_hours} : {}),
-            ...(c.original_hours != null ? {'Original Hours': c.original_hours} : {})
-          }))}
+            options={activeServiceCategories.map((c) => ({ label: c.name, value: String(c.id) }))}
             value={categoryId}
             onValueChange={handleCategoryChange}
             placeholder="All Categories"
@@ -427,11 +425,7 @@ const InvoicePOSummary = () => {
         <div className="flex flex-col gap-1.5">
           <Label className="text-xs">Service Type</Label>
           <MultiSelect
-            options={filteredServiceTypes.map((st) => ({ label: st.service_type_name, value: String(st.id) , 
-            ...(st.original_total_hours != null ? {'Original Total Hours': st.original_total_hours} : {}),
-            ...(st.original_billable_hours != null ? {'Original Billable Hours': st.original_billable_hours} : {}),
-            ...(st.original_hours != null ? {'Original Hours': st.original_hours} : {})
-          }))}
+            options={filteredServiceTypes.map((st) => ({ label: st.service_type_name, value: String(st.id) }))}
             value={serviceTypeId}
             onValueChange={handleTypeChange}
             placeholder="All Service Types"
@@ -443,11 +437,7 @@ const InvoicePOSummary = () => {
         <div className="flex flex-col gap-1.5">
           <Label className="text-xs">Service PO</Label>
           <MultiSelect
-            options={filteredPOs.map((po) => ({ label: po.service_po_name || po.service_po_code || String(po.id), value: String(po.id) , 
-            ...(po.original_total_hours != null ? {'Original Total Hours': po.original_total_hours} : {}),
-            ...(po.original_billable_hours != null ? {'Original Billable Hours': po.original_billable_hours} : {}),
-            ...(po.original_hours != null ? {'Original Hours': po.original_hours} : {})
-          }))}
+            options={filteredPOs.map((po) => ({ label: po.service_po_name || po.service_po_code || String(po.id), value: String(po.id) }))}
             value={poId}
             onValueChange={(v) => { setPoId(v); setPage(1); }}
             placeholder="All POs"
@@ -508,20 +498,18 @@ const InvoicePOSummary = () => {
           <p className="mb-2.5 text-xs font-semibold text-muted-foreground uppercase tracking-wide">Totals (all pages)</p>
           <div className="flex flex-wrap gap-x-6 gap-y-2">
             <SummaryItem label="Exp. Hours" value={formatHours(summary.total_exp_hours)} />
-            <SummaryItem label="Delivered Before Month" value={formatHours(summary.total_hours_delivered_before_month)} />
-            {hasOriginalBefore && (
-              <SummaryItem
-                label="Original Delivered Before Month"
-                value={formatHours(summary.total_original_hours_delivered_before_month ?? summary.original_hours_delivered_before_month)}
-              />
-            )}
-            <SummaryItem label="Delivered This Month" value={formatHours(summary.total_hours_delivered_current_month)} />
-            {hasOriginalCurrent && (
-              <SummaryItem
-                label="Original Delivered This Month"
-                value={formatHours(summary.total_original_hours_delivered_current_month ?? summary.original_hours_delivered_current_month)}
-              />
-            )}
+            <SummaryItem
+              label="Delivered Before Month"
+              value={formatHours(isOriginal
+                ? summary.total_original_hours_delivered_before_month ?? summary.original_hours_delivered_before_month
+                : summary.total_hours_delivered_before_month)}
+            />
+            <SummaryItem
+              label="Delivered This Month"
+              value={formatHours(isOriginal
+                ? summary.total_original_hours_delivered_current_month ?? summary.original_hours_delivered_current_month
+                : summary.total_hours_delivered_current_month)}
+            />
             {/* <SummaryItem label="Available Hours" value={formatHours(summary.total_available_hours)} /> */}
             <SummaryItem label="Billable Amount" value={formatCurrency(summary.total_monthly_billable_amount)} highlight />
             <SummaryItem label="Invoiced Amount" value={formatCurrency(summary.total_invoiced_amount)} highlight />

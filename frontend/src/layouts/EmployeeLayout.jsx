@@ -1,4 +1,6 @@
+import { Suspense } from 'react';
 import { Outlet } from 'react-router-dom';
+import { LoadingBlock } from '@/components/ui/spinner';
 import EmployeeSidebar from '@/components/layout/EmployeeSidebar';
 import Topbar from '@/components/layout/Topbar';
 import { useSyncAccessibleForms, useSyncBusinessUnits } from '@/hooks/useAccessibleForms';
@@ -28,7 +30,9 @@ const EmployeeLayout = () => {
         {/* Same bounded-scroll-region pattern as MainLayout — see the comment there. */}
         <main className="flex-1 min-h-0 overflow-y-auto flex flex-col">
           <div className="mx-auto max-w-screen-2xl px-3 sm:px-4 md:px-6 pt-3 pb-4 flex-1 w-full flex flex-col min-h-0">
-            <Outlet />
+            <Suspense fallback={<LoadingBlock className="flex-1" />}>
+              <Outlet />
+            </Suspense>
           </div>
         </main>
         <footer className="shrink-0 w-full border-t bg-slate-50/80 py-2 px-3 sm:px-4 md:px-6">

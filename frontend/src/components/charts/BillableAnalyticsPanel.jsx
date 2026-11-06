@@ -135,7 +135,7 @@ const NBBadge = ({ name, hours, type, category }) => (
 /* ── main component ── */
 const BillableAnalyticsPanel = ({
   data = [], allData, meta = {}, isLoading, month, year, page = 1, onPageChange,
-  sortBy = 'nonBillable', onSortByChange,
+  sortBy = 'billable', onSortByChange,
 }) => {
   const [view, setView] = useState('charts');
 

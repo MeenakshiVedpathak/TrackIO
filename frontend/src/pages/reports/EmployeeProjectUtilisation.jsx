@@ -22,6 +22,8 @@ import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter from '@/components/common/EntityFilter';
 import SearchInput from '@/components/common/SearchInput';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Label } from '@/components/ui/label';
 import { MultiSelect } from '@/components/ui/multi-select';
 import { MonthYearPicker } from '@/components/ui/month-year-picker';
@@ -61,6 +63,28 @@ const SortableHeader = ({ label, column, sortBy, sortOrder, onSort, align }) => 
   );
 };
 
+// Per-basis field + server sort key for the two metrics that come in both flavours: Original
+// (as logged) reads `loggedHours` / `originalUtilizationPercentage`, Adjusted (after sync) reads
+// `adjustedHours` / `totalUtilizationPercentage`. Both sort keys of each pair are already in SORTABLE.
+const BASIS = {
+  [HOURS_ADJUSTED]: {
+    hours: 'adjustedHours', hoursSort: SORTABLE.ADJUSTED_HOURS,
+    util: 'totalUtilizationPercentage', utilSort: SORTABLE.TOTAL_UTILIZATION,
+  },
+  [HOURS_ORIGINAL]: {
+    hours: 'loggedHours', hoursSort: SORTABLE.LOGGED_HOURS,
+    util: 'originalUtilizationPercentage', utilSort: SORTABLE.ORIGINAL_UTILIZATION,
+  },
+};
+
+// Re-keys an active hours/util sort onto the other basis' twin key when the basis switches.
+const SORT_TWIN = {
+  [SORTABLE.ADJUSTED_HOURS]: 'hoursSort',
+  [SORTABLE.LOGGED_HOURS]: 'hoursSort',
+  [SORTABLE.TOTAL_UTILIZATION]: 'utilSort',
+  [SORTABLE.ORIGINAL_UTILIZATION]: 'utilSort',
+};
+
 const HoursCell = ({ value }) => (value == null ? <span className="text-muted-foreground">—</span> : <span className="tabular-nums">{formatHours(value)}</span>);
 
 // Row key — employeeId + servicePoId (one row per Employee/Project pair). `__isGroupStart` is
@@ -70,75 +94,63 @@ const HoursCell = ({ value }) => (value == null ? <span className="text-muted-fo
 // group-border styling and the name/%-blanking cells to agree on the exact same boundary.
 const employeeIdOf = (row) => row?.employeeId ?? row?.employee_id;
 
-// The two % columns are the employee's WHOLE-PERIOD totals, identical on every project row of
+// The Util % column is the employee's WHOLE-PERIOD total, identical on every project row of
 // that employee (never summed/averaged here) — consecutive same-employee rows merge into one
-// real spanning cell (via DataTable's `meta.mergeGroup`) for Employee Name and both % columns,
+// real spanning cell (via DataTable's `meta.mergeGroup`) for Employee Name and Util %,
 // since the records already arrive sorted by employee by default.
-const getColumns = (sortBy, sortOrder, onSort) => [
-  columnHelper.accessor('employeeName', {
-    header: () => <SortableHeader label="Employee Name" column={SORTABLE.EMPLOYEE_NAME} sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} />,
-    size: 220,
-    meta: { sticky: true, left: 0, mergeGroup: employeeIdOf },
-    enableSorting: false,
-    cell: ({ row }) => {
-      const r = row.original;
-      return (
-        <div className="min-w-0">
-          <div className="truncate font-medium max-w-[200px]" title={r.employeeName}>{r.employeeName || '—'}</div>
-          {r.employeeCode && <div className="font-mono text-[10px] text-muted-foreground">{r.employeeCode}</div>}
-        </div>
-      );
-    },
-  }),
-  columnHelper.accessor('projectName', {
-    header: () => <SortableHeader label="Project Name" column={SORTABLE.PROJECT_NAME} sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} />,
-    size: 220,
-    enableSorting: false,
-    cell: (info) => {
-      const row = info.row.original;
-      return (
-        <div className="min-w-0">
-          <div className="truncate font-medium max-w-[200px]" title={info.getValue()}>{info.getValue() || '—'}</div>
-          {row.clientName && <div className="truncate text-[11px] text-muted-foreground max-w-[200px]" title={row.clientName}>{row.clientName}</div>}
-        </div>
-      );
-    },
-  }),
-  columnHelper.accessor('loggedHours', {
-    header: () => <SortableHeader label="Logged Hrs" column={SORTABLE.LOGGED_HOURS} sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} align="right" />,
-    size: 130,
-    meta: { align: 'right' },
-    enableSorting: false,
-    cell: (info) => <HoursCell value={info.getValue()} />,
-  }),
-  columnHelper.accessor('adjustedHours', {
-    header: () => <SortableHeader label="Adjusted Hrs" column={SORTABLE.ADJUSTED_HOURS} sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} align="right" />,
-    size: 130,
-    meta: { align: 'right' },
-    enableSorting: false,
-    cell: (info) => <HoursCell value={info.getValue()} />,
-  }),
-  columnHelper.accessor('originalUtilizationPercentage', {
-    header: () => <SortableHeader label="Original Util %" column={SORTABLE.ORIGINAL_UTILIZATION} sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} align="right" />,
-    size: 150,
-    meta: { align: 'right', mergeGroup: employeeIdOf },
-    enableSorting: false,
-    cell: ({ row }) => {
-      const value = row.original.originalUtilizationPercentage;
-      return value == null ? <span className="text-muted-foreground">—</span> : <span className="tabular-nums font-medium">{formatPercentage(value, 2)}</span>;
-    },
-  }),
-  columnHelper.accessor('totalUtilizationPercentage', {
-    header: () => <SortableHeader label="Total Util % after Sync" column={SORTABLE.TOTAL_UTILIZATION} sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} align="right" />,
-    size: 170,
-    meta: { align: 'right', mergeGroup: employeeIdOf },
-    enableSorting: false,
-    cell: ({ row }) => {
-      const value = row.original.totalUtilizationPercentage;
-      return value == null ? <span className="text-muted-foreground">—</span> : <span className="tabular-nums font-medium">{formatPercentage(value, 2)}</span>;
-    },
-  }),
-];
+const getColumns = (sortBy, sortOrder, onSort, hoursSource) => {
+  const basis = BASIS[hoursSource] ?? BASIS[HOURS_ADJUSTED];
+  return [
+    columnHelper.accessor('employeeName', {
+      header: () => <SortableHeader label="Employee Name" column={SORTABLE.EMPLOYEE_NAME} sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} />,
+      size: 220,
+      meta: { sticky: true, left: 0, mergeGroup: employeeIdOf },
+      enableSorting: false,
+      cell: ({ row }) => {
+        const r = row.original;
+        return (
+          <div className="min-w-0">
+            <div className="truncate font-medium max-w-[200px]" title={r.employeeName}>{r.employeeName || '—'}</div>
+            {r.employeeCode && <div className="font-mono text-[10px] text-muted-foreground">{r.employeeCode}</div>}
+          </div>
+        );
+      },
+    }),
+    columnHelper.accessor('projectName', {
+      header: () => <SortableHeader label="Project Name" column={SORTABLE.PROJECT_NAME} sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} />,
+      size: 220,
+      enableSorting: false,
+      cell: (info) => {
+        const row = info.row.original;
+        return (
+          <div className="min-w-0">
+            <div className="truncate font-medium max-w-[200px]" title={info.getValue()}>{info.getValue() || '—'}</div>
+            {row.clientName && <div className="truncate text-[11px] text-muted-foreground max-w-[200px]" title={row.clientName}>{row.clientName}</div>}
+          </div>
+        );
+      },
+    }),
+    columnHelper.accessor((r) => r[basis.hours], {
+      id: 'hours',
+      header: () => <SortableHeader label="Hours" column={basis.hoursSort} sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} align="right" />,
+      size: 130,
+      meta: { align: 'right' },
+      enableSorting: false,
+      cell: (info) => <HoursCell value={info.getValue()} />,
+    }),
+    columnHelper.accessor((r) => r[basis.util], {
+      id: 'utilization',
+      header: () => <SortableHeader label="Total Util %" column={basis.utilSort} sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} align="right" />,
+      size: 150,
+      meta: { align: 'right', mergeGroup: employeeIdOf },
+      enableSorting: false,
+      cell: (info) => {
+        const value = info.getValue();
+        return value == null ? <span className="text-muted-foreground">—</span> : <span className="tabular-nums font-medium">{formatPercentage(value, 2)}</span>;
+      },
+    }),
+  ];
+};
 
 const SummaryItem = ({ label, value }) => (
   <div className="flex flex-col gap-0.5">
@@ -148,6 +160,7 @@ const SummaryItem = ({ label, value }) => (
 );
 
 const EmployeeProjectUtilisation = () => {
+  const confirmExport = useExportConfirm();
   const [periodMode, setPeriodMode] = useState('month');
   const [monthYear, setMonthYear] = useState({ month: now.getMonth() + 1, year: now.getFullYear() });
   const [dateRange, setDateRange] = useState(null);
@@ -171,6 +184,7 @@ const EmployeeProjectUtilisation = () => {
   // Records arrive sorted by employee by default — matches the row-grouping logic in getColumns.
   const [sortBy, setSortBy] = useState(SORTABLE.EMPLOYEE_NAME);
   const [sortOrder, setSortOrder] = useState('ASC');
+  const [hoursSource, setHoursSource] = useState(HOURS_ADJUSTED);
 
   const scope = useMemo(() => ({ entityIds, businessUnitIds: buIds }), [entityIds, buIds]);
   const { data: activeEmployees = [] } = useActiveEmployees(undefined, scope);
@@ -184,6 +198,8 @@ const EmployeeProjectUtilisation = () => {
     : !!(dateRange?.startDate && dateRange?.endDate);
 
   const params = {
+    // Original basis: the server then sorts, ranks and totals on original hours too.
+    ...(hoursSource === HOURS_ORIGINAL && { hoursSource: 'O' }),
     ...(periodMode === 'month'
       ? monthYear?.month && monthYear?.year && { month: monthYear.month, year: monthYear.year }
       : dateRange?.startDate && dateRange?.endDate && { startDate: dateRange.startDate, endDate: dateRange.endDate }),
@@ -230,6 +246,7 @@ const EmployeeProjectUtilisation = () => {
     projectIds.length > 0,
     serviceTypeIds.length > 0,
     categoryIds.length > 0,
+    hoursSource !== HOURS_ADJUSTED,
   ].filter(Boolean).length;
 
   const clearFilters = () => {
@@ -240,7 +257,15 @@ const EmployeeProjectUtilisation = () => {
     setProjectIds([]);
     setServiceTypeIds([]);
     setCategoryIds([]);
+    setHoursBasis(HOURS_ADJUSTED);
     setPage(1);
+  };
+
+  // Switching basis keeps an active Hours / Util % sort on the same column, re-keyed to the new
+  // basis' sort key (both keys of each pair are server-supported, see SORTABLE).
+  const setHoursBasis = (v) => {
+    setHoursSource(v);
+    setSortBy((s) => (SORT_TWIN[s] ? BASIS[v][SORT_TWIN[s]] : s));
   };
 
   const handleSort = (column) => {
@@ -273,7 +298,8 @@ const EmployeeProjectUtilisation = () => {
     setPage(1);
   };
 
-  const columns = getColumns(sortBy, sortOrder, handleSort);
+  const columns = getColumns(sortBy, sortOrder, handleSort, hoursSource);
+  const basis = BASIS[hoursSource] ?? BASIS[HOURS_ADJUSTED];
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -289,7 +315,7 @@ const EmployeeProjectUtilisation = () => {
               className="w-full sm:w-64"
             />
             {periodReady && records.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport} disabled={isExporting}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)} disabled={isExporting}>
                 <Download className="h-4 w-4" />{isExporting ? 'Exporting…' : 'Export Excel'}
               </Button>
             )}
@@ -341,6 +367,8 @@ const EmployeeProjectUtilisation = () => {
             />
           )}
         </div>
+
+        <HoursBasisToggle value={hoursSource} onChange={(v) => { setHoursBasis(v); setPage(1); }} labelClassName="text-xs" />
 
         <div className="flex flex-col gap-1.5">
           <Label className="text-xs">Employee</Label>
@@ -421,16 +449,15 @@ const EmployeeProjectUtilisation = () => {
         onPageSizeChange={(s) => { setLimit(s); setPage(1); }}
       />
 
-      {/* Only Logged/Adjusted are summed here — the % columns are per-employee totals that would
-          be meaningless summed or averaged across rows, so those cells are intentionally left
-          blank rather than showing a number that looks like a real total but isn't one. */}
+      {/* Only the hours are summed here (on the active basis) — the % column is a per-employee total
+          that would be meaningless summed or averaged across rows, so it is intentionally left out
+          rather than showing a number that looks like a real total but isn't one. */}
       {summary && (
         <div className="mt-4 rounded-lg border bg-muted/40 px-4 py-3">
           <p className="mb-2.5 text-xs font-semibold text-muted-foreground uppercase tracking-wide">Total (All Pages)</p>
           <div className="flex flex-wrap gap-x-6 gap-y-2">
             <SummaryItem label="Employees" value={summary.employeeCount ?? 0} />
-            <SummaryItem label="Logged Hrs" value={formatHours(summary.loggedHours)} />
-            <SummaryItem label="Adjusted Hrs" value={formatHours(summary.adjustedHours)} />
+            <SummaryItem label="Hours" value={formatHours(summary[basis.hours])} />
           </div>
         </div>
       )}

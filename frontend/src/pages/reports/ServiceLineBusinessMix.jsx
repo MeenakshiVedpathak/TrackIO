@@ -7,32 +7,47 @@ import { formatCurrency, formatHours, formatPercentage, formatMonthYear } from '
 import { cn } from '@/utils/cn';
 import DataTable from '@/components/common/DataTable';
 import PageHeader from '@/components/common/PageHeader';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
 import EmptyState from '@/components/common/EmptyState';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { MonthYearPicker } from '@/components/ui/month-year-picker';
 
 const columnHelper = createColumnHelper();
 
-const exportToExcel = (rows) => {
+// Hours basis: when 'Original' is selected, hours delivered and margin/hour are swapped for their
+// original_* twins (falling back to the adjusted value when the API didn't send one), so the
+// table, mobile cards and export all read the same keys whichever basis is active.
+const withBasis = (r, hoursSource) => (
+  hoursSource === HOURS_ORIGINAL
+    ? {
+      ...r,
+      hours_delivered: r.original_hours_delivered ?? r.hours_delivered,
+      margin_per_hour: r.original_margin_per_hour ?? r.margin_per_hour,
+    }
+    : r
+);
+
+// Rows arrive already mapped to the active hours basis.
+const exportToExcel = (rows, hoursSource) => {
+  const sfx = hoursSource === HOURS_ORIGINAL ? ' (Original)' : '';
   const header = [
-    'Service Category', 'Service Type', 'Hours Delivered', 'Original Hours Delivered', 'Delivery Cost',
-    'Invoiced Amount', 'Margin', 'Margin/Hour', 'Original Margin/Hour', 'Revenue Growth %',
+    'Service Category', 'Service Type', `Hours Delivered${sfx}`, 'Delivery Cost',
+    'Invoiced Amount', 'Margin', `Margin/Hour${sfx}`, 'Revenue Growth %',
   ];
   const dataRows = rows.map((r) => [
     r.service_category_name ?? '',
     r.service_type_name ?? '',
     r.hours_delivered != null ? Number(r.hours_delivered) : '',
-    r.original_hours_delivered != null ? Number(r.original_hours_delivered) : '',
     r.delivery_cost != null ? Number(r.delivery_cost) : '',
     r.invoiced_amount != null ? Number(r.invoiced_amount) : '',
     r.margin != null ? Number(r.margin) : '',
     r.margin_per_hour != null ? Number(r.margin_per_hour) : '',
-    r.original_margin_per_hour != null ? Number(r.original_margin_per_hour) : '',
     r.revenue_growth_pct != null ? Number(r.revenue_growth_pct) : '',
   ]);
   const ws = XLSX.utils.aoa_to_sheet([header, ...dataRows]);
@@ -85,15 +100,6 @@ const columns = [
     size: 150,
     cell: (info) => <span className="tabular-nums">{formatHours(info.getValue())}</span>,
   }),
-  columnHelper.accessor('original_hours_delivered', {
-    header: 'Original Hours Delivered',
-    size: 170,
-    cell: (info) => {
-      const value = info.getValue();
-      if (value == null || value === '') return null;
-      return <span className="tabular-nums text-muted-foreground">{formatHours(value)}</span>;
-    },
-  }),
   columnHelper.accessor('delivery_cost', {
     header: 'Delivery Cost',
     size: 160,
@@ -114,11 +120,6 @@ const columns = [
     size: 150,
     cell: (info) => <MoneyCell value={info.getValue()} />,
   }),
-  columnHelper.accessor('original_margin_per_hour', {
-    header: 'Original Margin/Hour',
-    size: 170,
-    cell: (info) => <MoneyCell value={info.getValue()} />,
-  }),
   columnHelper.accessor('revenue_growth_pct', {
     header: 'Revenue Growth',
     size: 160,
@@ -136,6 +137,7 @@ const SummaryItem = ({ label, value, negative = false }) => (
 );
 
 const ServiceLineBusinessMix = () => {
+  const confirmExport = useExportConfirm();
   const [monthYear, setMonthYear] = useState({
     month: prevMonth.getMonth() + 1,
     year: prevMonth.getFullYear(),
@@ -144,8 +146,11 @@ const ServiceLineBusinessMix = () => {
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [entityIds, setEntityIds] = useState([]);
   const [buIds, setBuIds] = useState([]);
+  const [hoursSource, setHoursSource] = useState(HOURS_ADJUSTED);
 
   const params = {
+    // Original basis: the server then sorts, ranks and totals on original hours too.
+    ...(hoursSource === HOURS_ORIGINAL && { hoursSource: 'O' }),
     ...(monthYear && { month: monthYear.month, year: monthYear.year }),
     ...(compareMonthYear && { compareMonth: compareMonthYear.month, compareYear: compareMonthYear.year }),
     buId: ALL_BUS,
@@ -158,18 +163,25 @@ const ServiceLineBusinessMix = () => {
   // Envelope is { success, data: { data: [...rows], summary, comparison_period } }, so the rows
   // live at data.data.data — the sibling of summary/comparison_period, NOT data.data.records
   // (which never existed and silently left the table empty while the Totals card still worked).
-  const records = data?.data?.data ?? [];
+  const records = (data?.data?.data ?? []).map((r) => withBasis(r, hoursSource));
+  const summary = data?.data?.summary ?? null;
+  // Original uses the summary's original total when the API sends one; otherwise it falls back to
+  // the adjusted total (the summary isn't known to carry an original twin yet).
+  const summaryHours = hoursSource === HOURS_ORIGINAL
+    ? (summary?.original_total_hours_delivered ?? summary?.total_hours_delivered)
+    : summary?.total_hours_delivered;
   const comparisonPeriod = data?.data?.comparison_period ?? null;
 
-  const activeFilterCount = [compareMonthYear !== null, entityIds.length > 0, buIds.length > 0].filter(Boolean).length;
+  const activeFilterCount = [compareMonthYear !== null, entityIds.length > 0, buIds.length > 0, hoursSource !== HOURS_ADJUSTED].filter(Boolean).length;
 
   const clearFilters = () => {
     setEntityIds([]);
     setBuIds([]);
     setCompareMonthYear(null);
+    setHoursSource(HOURS_ADJUSTED);
   };
 
-  const handleExport = () => exportToExcel(records);
+  const handleExport = () => exportToExcel(records, hoursSource);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -183,7 +195,7 @@ const ServiceLineBusinessMix = () => {
               activeCount={activeFilterCount}
             />
             {records.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)}>
                 <Download className="h-4 w-4" />Export Excel
               </Button>
             )}
@@ -205,6 +217,8 @@ const ServiceLineBusinessMix = () => {
             className="w-full"
           />
         </div>
+
+        <HoursBasisToggle value={hoursSource} onChange={setHoursSource} labelClassName="text-xs" />
 
         <div className="flex flex-col gap-1.5">
           <Label className="text-xs">Compare To (optional)</Label>
@@ -237,17 +251,17 @@ const ServiceLineBusinessMix = () => {
         }
       />
 
-      {data?.data?.summary && (
+      {summary && (
         <div className="mt-4 rounded-lg border bg-muted/40 px-4 py-3">
           <p className="mb-2.5 text-xs font-semibold text-muted-foreground uppercase tracking-wide">Totals</p>
           <div className="flex flex-wrap gap-x-6 gap-y-2">
-            <SummaryItem label="Total Hours Delivered" value={formatHours(data.data.summary.total_hours_delivered)} />
-            <SummaryItem label="Total Delivery Cost" value={formatCurrency(data.data.summary.total_delivery_cost)} />
-            <SummaryItem label="Total Invoiced Amount" value={formatCurrency(data.data.summary.total_invoiced_amount)} />
+            <SummaryItem label="Total Hours Delivered" value={formatHours(summaryHours)} />
+            <SummaryItem label="Total Delivery Cost" value={formatCurrency(summary.total_delivery_cost)} />
+            <SummaryItem label="Total Invoiced Amount" value={formatCurrency(summary.total_invoiced_amount)} />
             <SummaryItem
               label="Total Margin"
-              value={formatCurrency(data.data.summary.total_margin)}
-              negative={data.data.summary.total_margin < 0}
+              value={formatCurrency(summary.total_margin)}
+              negative={summary.total_margin < 0}
             />
           </div>
         </div>

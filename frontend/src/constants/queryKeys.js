@@ -205,6 +205,12 @@ export const QUERY_KEYS = {
   REPORT_EMPLOYEE_ROLE_BU_MAPPING: (params) => ['reports', 'employee-role-bu-mapping', params],
   REPORT_TEAM_LEAD_EMPLOYEE_PROJECT_HOURS: (params) => ['reports', 'team-lead-employee-project-hours', params],
   REPORT_TEAM_LEAD_EMPLOYEE_PROJECT_HOURS_FILTER_OPTIONS: (params) => ['reports', 'team-lead-employee-project-hours', 'filter-options', params],
+  REPORT_TEAM_LEAD_EMPLOYEE_PO_HOURS: (params) => ['reports', 'team-lead-employee-po-hours', params],
+  REPORT_TEAM_LEAD_EMPLOYEE_PO_HOURS_FILTER_OPTIONS: (params) => ['reports', 'team-lead-employee-po-hours', 'filter-options', params],
+  REPORT_BU_ADMIN_EMPLOYEE_PO_HOURS: (params) => ['reports', 'bu-admin-employee-po-hours', params],
+  REPORT_BU_ADMIN_EMPLOYEE_PO_HOURS_FILTER_OPTIONS: (params) => ['reports', 'bu-admin-employee-po-hours', 'filter-options', params],
+  REPORT_PROJECT_MANAGER_EMPLOYEE_PO_HOURS: (params) => ['reports', 'project-manager-employee-po-hours', params],
+  REPORT_PROJECT_MANAGER_EMPLOYEE_PO_HOURS_FILTER_OPTIONS: (params) => ['reports', 'project-manager-employee-po-hours', 'filter-options', params],
 
   // Notifications
   NOTIFICATIONS: (params) => ['notifications', params],
@@ -258,4 +264,6 @@ export const QUERY_KEYS = {
 
   // System Settings (Admin / Platform Admin) — month/year optional; both undefined = latest cap
   MONTHLY_CAP: (month, year) => ['system-settings', 'monthly-cap', month ?? null, year ?? null],
+  SITE_LOGO: ['site-logo', 'active'],
+  SITE_LOGOS: ['site-logo', 'list'],
 };

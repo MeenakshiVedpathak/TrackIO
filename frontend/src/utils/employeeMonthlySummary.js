@@ -12,6 +12,8 @@
 // one day, on top of whatever its CHILD nodes logged) — `hours` is never just a placeholder
 // that becomes 0 once children exist. So every node is editable for its own hours regardless of
 // whether it `hasChildren`.
+import { isApprovedLog } from './approvedWorkLog';
+
 const dayNumberOf = (dateStr) => Number(dateStr.slice(-2));
 
 // `id` is carried through defensively wherever the source node has one — the Work Log grid
@@ -20,7 +22,7 @@ const dayNumberOf = (dateStr) => Number(dateStr.slice(-2));
 // can identify an existing row, so this stays a no-op passthrough until/unless a given backend
 // response actually includes it.
 const ensureNode = (map, key, name) => {
-  if (!map.has(key)) map.set(key, { name, id: undefined, hoursByDay: {}, descriptionByDay: {}, childMap: new Map() });
+  if (!map.has(key)) map.set(key, { name, id: undefined, hoursByDay: {}, descriptionByDay: {}, approvedByDay: {}, childMap: new Map() });
   return map.get(key);
 };
 
@@ -34,26 +36,34 @@ const walkChildren = (children = [], parentChildMap, day) => {
     const node = ensureNode(parentChildMap, child.hierarchy_id, child.name);
     node.hoursByDay[day] = Number(child.hours || 0);
     node.descriptionByDay[day] = child.description ?? '';
+    node.approvedByDay[day] = isApprovedLog(child);
     node.id = child.id ?? child.entry_id ?? node.id;
     walkChildren(child.children, node.childMap, day);
   });
 };
 
-const flattenChildren = (childMap, depth, days, servicePOId, ancestorKeys) => {
+// True when `node` or anything beneath it is approved on `day` — the backend locks per Service PO
+// per date, so a single approved line anywhere in a PO's subtree locks the whole PO that day.
+const subtreeApproved = (node, day) =>
+  !!node.approvedByDay[day] || [...node.childMap.values()].some((c) => subtreeApproved(c, day));
+
+const flattenChildren = (childMap, depth, days, servicePOId, ancestorKeys, poLockedByDay) => {
   const rows = [];
   childMap.forEach((node, hierarchyId) => {
     const hasChildren = node.childMap.size > 0;
     const hoursByDay = {};
     const descriptionByDay = {};
+    const approvedByDay = {};
     days.forEach((day) => {
       hoursByDay[day] = node.hoursByDay[day] || 0;
       descriptionByDay[day] = node.descriptionByDay[day] || '';
+      approvedByDay[day] = !!node.approvedByDay[day];
     });
     const rowKey = `h:${hierarchyId}`;
     rows.push({
-      servicePOId, hierarchyId, label: node.name, depth, hasChildren, editable: true, hoursByDay, descriptionByDay, rowKey, ancestorKeys, id: node.id,
+      servicePOId, hierarchyId, label: node.name, depth, hasChildren, editable: true, hoursByDay, descriptionByDay, approvedByDay, lockedByDay: poLockedByDay, rowKey, ancestorKeys, id: node.id,
     });
-    rows.push(...flattenChildren(node.childMap, depth + 1, days, servicePOId, [...ancestorKeys, rowKey]));
+    rows.push(...flattenChildren(node.childMap, depth + 1, days, servicePOId, [...ancestorKeys, rowKey], poLockedByDay));
   });
   return rows;
 };
@@ -69,6 +79,7 @@ export const buildMonthlySummaryRows = (dayEntries = []) => {
       const poNode = ensureNode(poMap, po.service_po_id, po.service_po_name);
       poNode.hoursByDay[day] = Number(po.hours || 0);
       poNode.descriptionByDay[day] = po.description ?? '';
+      poNode.approvedByDay[day] = isApprovedLog(po);
       poNode.id = po.id ?? po.entry_id ?? poNode.id;
       walkChildren(po.children, poNode.childMap, day);
     });
@@ -80,15 +91,19 @@ export const buildMonthlySummaryRows = (dayEntries = []) => {
     const hasChildren = node.childMap.size > 0;
     const hoursByDay = {};
     const descriptionByDay = {};
+    const approvedByDay = {};
+    const lockedByDay = {};
     dayList.forEach((day) => {
       hoursByDay[day] = node.hoursByDay[day] || 0;
       descriptionByDay[day] = node.descriptionByDay[day] || '';
+      approvedByDay[day] = !!node.approvedByDay[day];
+      lockedByDay[day] = subtreeApproved(node, day);
     });
     const rowKey = `po:${servicePOId}`;
     rows.push({
-      servicePOId, label: node.name, depth: 0, hasChildren, editable: true, hoursByDay, descriptionByDay, rowKey, ancestorKeys: [], id: node.id,
+      servicePOId, label: node.name, depth: 0, hasChildren, editable: true, hoursByDay, descriptionByDay, approvedByDay, lockedByDay, rowKey, ancestorKeys: [], id: node.id,
     });
-    rows.push(...flattenChildren(node.childMap, 1, dayList, servicePOId, [rowKey]));
+    rows.push(...flattenChildren(node.childMap, 1, dayList, servicePOId, [rowKey], lockedByDay));
   });
   return rows;
 };
@@ -113,8 +128,14 @@ export const buildMonthlySummaryRows = (dayEntries = []) => {
 // indistinguishable from "didn't save" to the user. Needs the three GET endpoints to start
 // returning that day's `description` per node; buildMonthlySummaryRows already reads it
 // defensively (`po.description` / `child.description`) and will pick it up the moment it's there.
+//
+// Approved lines are never sent: a row whose Service PO has an approved log that day is locked
+// (see utils/approvedWorkLog.js) and the backend 409s a payload that names it. Approved rows are
+// not deleted or changed by a save, so omitting them here is exactly right — but their hours still
+// count towards the daily cap, which validateDayEntries takes as `lockedHours`.
 export const buildDayEntries = (rows, day, edits, descriptions) =>
   rows
+    .filter((row) => !row.lockedByDay?.[day])
     .map((row) => {
       const edited = edits?.[row.rowKey]?.[day];
       const hours = edited !== undefined ? Number(edited || 0) : Number(row.hoursByDay?.[day] ?? 0);
@@ -132,7 +153,7 @@ export const buildDayEntries = (rows, day, edits, descriptions) =>
 
 // Mirrors the 400s the server enforces on a whole-day save, so the user sees the same wording
 // without a round trip. Returns the error string, or null if the day is valid.
-export const validateDayEntries = (entries, dateLabel, dailyHoursCap) => {
+export const validateDayEntries = (entries, dateLabel, dailyHoursCap, lockedHours = 0) => {
   const seen = new Set();
   for (const entry of entries) {
     const key = `${entry.service_po_id}:${entry.hierarchy_node_id ?? 'null'}`;
@@ -143,7 +164,7 @@ export const validateDayEntries = (entries, dateLabel, dailyHoursCap) => {
     seen.add(key);
   }
 
-  const total = entries.reduce((sum, entry) => sum + Number(entry.hours || 0), 0);
+  const total = entries.reduce((sum, entry) => sum + Number(entry.hours || 0), 0) + lockedHours;
   if (total > dailyHoursCap) {
     return `Total hours for ${dateLabel} cannot exceed ${dailyHoursCap}. This request totals ${total} hours.`;
   }

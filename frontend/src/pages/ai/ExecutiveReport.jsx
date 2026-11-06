@@ -14,6 +14,7 @@ import { useDashboardAnalytics } from '@/hooks/useDashboard';
 import { useServicePOs } from '@/hooks/useServicePOs';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Skeleton } from '@/components/ui/skeleton';
 import { formatCurrency, formatNumber, formatPercentage } from '@/utils/formatters';
 
@@ -39,6 +40,7 @@ const Tile = ({ icon: Icon, label, value, loading }) => (
 );
 
 const ExecutiveReport = () => {
+  const confirmExport = useExportConfirm();
   const [fiscalYear, setFiscalYear] = useState(DEFAULT_FY);
   const { data: analytics, isLoading: analyticsLoading } = useDashboardAnalytics({ fiscalYear });
   const { data: poRes } = useServicePOs({ limit: 200 });
@@ -150,10 +152,10 @@ const ExecutiveReport = () => {
                 <option key={fy} value={fy}>FY {fy}–{String(fy + 1).slice(-2)}</option>
               ))}
             </select>
-            <Button variant="outline" size="sm" onClick={handleExportExcel} className="gap-1.5">
+            <Button variant="outline" size="sm" onClick={() => confirmExport(handleExportExcel)} className="gap-1.5">
               <FileSpreadsheet className="h-4 w-4" /> Excel
             </Button>
-            <Button variant="outline" size="sm" onClick={handleExportPDF} className="gap-1.5">
+            <Button variant="outline" size="sm" onClick={() => confirmExport(handleExportPDF)} className="gap-1.5">
               <FileDown className="h-4 w-4" /> PDF
             </Button>
             <Button variant="outline" size="sm" onClick={() => window.print()} className="gap-1.5">

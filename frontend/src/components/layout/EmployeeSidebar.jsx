@@ -11,6 +11,7 @@ import { resolveFormRoute } from '@/constants/rbacForms';
 import { ROUTES } from '@/constants/routes';
 import { ChevronLeft, ChevronRight, ChevronDown, Folder, LayoutDashboard } from 'lucide-react';
 import ScrollOnHoverText from '@/components/common/ScrollOnHoverText';
+import SiteLogo from '@/components/common/SiteLogo';
 
 // Modules whose group label becomes a direct link to a hub/landing page instead of a plain
 // collapsible header — same pattern as Sidebar.jsx's MODULE_OVERVIEW_ROUTES. The key is the
@@ -290,9 +291,7 @@ const EmployeeSidebar = () => {
               collapsed ? 'h-[clamp(2.25rem,4.5vw,2.75rem)] w-[clamp(2.25rem,4.5vw,2.75rem)] justify-center' : 'h-[clamp(2.75rem,5.5vw,3.5rem)] justify-start px-1'
             )}
           >
-            <img
-              src="/logo-dark.png"
-              alt="Trackio"
+            <SiteLogo
               className={collapsed ? 'h-full w-full object-cover object-left' : 'h-full w-auto object-contain'}
             />
           </div>

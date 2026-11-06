@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import { CheckCircle2, AlertCircle, ChevronDown, ChevronUp } from 'lucide-react';
 import { formatDate } from '@/utils/formatters';
+import { PreviewEmployee, previewEmployeeSearchFields } from '@/utils/timesheetPreview';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
@@ -54,8 +55,7 @@ const ImportPreviewPanel = ({ preview, onConfirm, onCancel, isConfirming }) => {
     const term = search.trim().toLowerCase();
     if (!term) return preview.valid_rows;
     return preview.valid_rows.filter((row) => [
-      row.resourceName,
-      row.employeeId,
+      ...previewEmployeeSearchFields(row),
       row.servicePOName,
       row.poId,
       row.subProjectName,
@@ -161,10 +161,7 @@ const ImportPreviewPanel = ({ preview, onConfirm, onCancel, isConfirming }) => {
                       {row.rowNumber ?? idx + 1}
                     </TableCell>
                     <TableCell className="text-sm">
-                      <p className="font-medium">{row.resourceName ?? '—'}</p>
-                      {row.employeeId && (
-                        <p className="text-xs text-muted-foreground font-mono">ID: {row.employeeId}</p>
-                      )}
+                      <PreviewEmployee row={row} />
                     </TableCell>
                     <TableCell className="text-sm">
                       {row.servicePOName || (row.poId ? `PO #${row.poId}` : '—')}
@@ -202,6 +199,7 @@ const ImportPreviewPanel = ({ preview, onConfirm, onCancel, isConfirming }) => {
               <TableHeader className="sticky top-0 z-10 bg-slate-50 dark:bg-slate-900 shadow-sm">
                 <TableRow className="bg-destructive/5">
                   <TableHead className="w-24">Row #</TableHead>
+                  <TableHead className="w-56">Employee</TableHead>
                   <TableHead>Error Message</TableHead>
                 </TableRow>
               </TableHeader>
@@ -210,6 +208,10 @@ const ImportPreviewPanel = ({ preview, onConfirm, onCancel, isConfirming }) => {
                   <TableRow key={idx} className="hover:bg-destructive/5">
                     <TableCell className="font-mono text-xs">
                       {row.rowNumber ?? row.row_number ?? idx + 1}
+                    </TableCell>
+                    <TableCell className="max-w-[14rem] text-sm">
+                      {/* Error entries carry the row itself under `row` (errors[].row). */}
+                      <PreviewEmployee row={row.row} />
                     </TableCell>
                     <TableCell className="text-sm text-destructive">
                       {row.errors?.length > 0

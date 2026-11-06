@@ -3,7 +3,6 @@ import * as XLSX from 'xlsx';
 import { createColumnHelper } from '@tanstack/react-table';
 import { Download } from 'lucide-react';
 import { useResourceAllocationReport, useResourceAllocationAllRows } from '@/hooks/useReports';
-import { useCanViewOriginalData } from '@/hooks/usePermissions';
 import { reportsApi } from '@/api/reports.api';
 import { useDebounce } from '@/hooks/useDebounce';
 import { useActiveEmployees } from '@/hooks/useEmployees';
@@ -14,11 +13,13 @@ import { useActiveServiceCategories } from '@/hooks/useServiceCategories';
 import { formatHours } from '@/utils/formatters';
 import DataTable from '@/components/common/DataTable';
 import PageHeader from '@/components/common/PageHeader';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter from '@/components/common/EntityFilter';
 import SearchInput from '@/components/common/SearchInput';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { MultiSelect } from '@/components/ui/multi-select';
@@ -29,8 +30,12 @@ import { useAuth } from '@/hooks/useAuth';
 const columnHelper = createColumnHelper();
 
 
-const exportToExcel = (rows) => {
-  const hasOriginal = rows.some((r) => r.original_total_hours_logged != null);
+// One Hours Logged value per row, picked by the Hours basis switch — Adjusted and Original are
+// never shown side by side.
+const getHoursLogged = (row, hoursSource) =>
+  hoursSource === HOURS_ORIGINAL ? (row.original_total_hours_logged ?? row.total_hours_logged) : row.total_hours_logged;
+
+const exportToExcel = (rows, hoursSource) => {
   const header = [
     'Code',
     'Employee',
@@ -41,8 +46,7 @@ const exportToExcel = (rows) => {
     'Service Type',
     'PO Status',
     'Category',
-    'Hours Logged',
-    ...(hasOriginal ? ['Original Hours Logged'] : []),
+    hoursSource === HOURS_ORIGINAL ? 'Hours Logged (Original)' : 'Hours Logged',
   ];
   const dataRows = rows.map((r) => [
     r.employee_code ?? '',
@@ -54,8 +58,7 @@ const exportToExcel = (rows) => {
     r.service_type_name ?? '',
     r.po_status ?? '',
     r.service_category_name ?? '',
-    r.total_hours_logged != null ? Number(r.total_hours_logged) : '',
-    ...(hasOriginal ? [r.original_total_hours_logged != null ? Number(r.original_total_hours_logged) : ''] : []),
+    getHoursLogged(r, hoursSource) != null ? Number(getHoursLogged(r, hoursSource)) : '',
   ]);
   const ws = XLSX.utils.aoa_to_sheet([header, ...dataRows]);
   const wb = XLSX.utils.book_new();
@@ -84,7 +87,7 @@ const CATEGORY_COLORS = {
 const categoryBadgeClass = (category) =>
   CATEGORY_COLORS[category?.toLowerCase()] ?? 'bg-muted text-muted-foreground';
 
-const columns = [
+const getColumns = (hoursSource) => [
   columnHelper.accessor('employee_code', {
     header: 'Code',
     meta: { sticky: true, left: 0 },
@@ -180,18 +183,12 @@ const columns = [
       );
     },
   }),
-  columnHelper.accessor('total_hours_logged', {
+  columnHelper.accessor((row) => getHoursLogged(row, hoursSource), {
+    id: 'total_hours_logged',
     header: 'Hours Logged',
     size: 140,
     cell: (info) => (
       <span className="tabular-nums font-medium">{formatHours(info.getValue())}</span>
-    ),
-  }),
-  columnHelper.accessor('original_total_hours_logged', {
-    header: 'Original Hours Logged',
-    size: 180,
-    cell: (info) => (
-      <span className="tabular-nums">{formatHours(info.getValue())}</span>
     ),
   }),
 ];
@@ -200,6 +197,7 @@ const now = new Date();
 const prevMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
 
 const ResourceAllocation = () => {
+  const confirmExport = useExportConfirm();
   const [monthYear, setMonthYear] = useState({
     month: prevMonth.getMonth() + 1,
     year: prevMonth.getFullYear(),
@@ -210,12 +208,8 @@ const ResourceAllocation = () => {
   const [categoryIds, setCategoryIds] = useState([]);
   const [serviceTypeIds, setServiceTypeIds] = useState([]);
   const [poStatus, setPoStatus] = useState([]);
-  const canViewOriginal = useCanViewOriginalData();
   const [hoursSource, setHoursSource] = useState('M');
 
-  useEffect(() => {
-    if (!canViewOriginal) setHoursSource('M');
-  }, [canViewOriginal]);
 
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(1);
@@ -304,16 +298,7 @@ const ResourceAllocation = () => {
   const { data: fullRows } = useResourceAllocationAllRows(params);
   const summaryRows = fullRows ?? rows;
 
-  const hasOriginalData = records.some((r) => r.original_total_hours_logged != null);
-  const visibleColumns = useMemo(() => {
-    if (hasOriginalData) return columns;
-    return columns.filter((col) => {
-      const key = col.accessorKey || col.id;
-      const isOriginal = (typeof key === 'string' && key.startsWith('original_')) ||
-        (typeof col.header === 'string' && col.header.startsWith('Original'));
-      return !isOriginal;
-    });
-  }, [hasOriginalData]);
+  const columns = useMemo(() => getColumns(hoursSource), [hoursSource]);
 
   // This report is a flat allocation list (one row per employee × PO × service
   // type), not a per-employee pivot, so billable/non-billable/leave totals are
@@ -323,8 +308,7 @@ const ResourceAllocation = () => {
   // Customer Non-Billable is additionally broken out on its own; leave hours
   // are identified by service type name and subtracted from utilization.
   const reportSummary = summaryRows.reduce((acc, r) => {
-    const hours = Number(r.total_hours_logged) || 0;
-    const origHours = Number(r.original_total_hours_logged) || 0;
+    const hours = Number(getHoursLogged(r, hoursSource)) || 0;
     const catLower = (r.service_category_name || '').toLowerCase();
     const typeLower = (r.service_type_name || '').toLowerCase();
 
@@ -334,35 +318,26 @@ const ResourceAllocation = () => {
 
     if (isBillable) {
       acc.billable_total += hours;
-      acc.original_billable_total += origHours;
     } else {
       acc.non_billable_total += hours;
-      acc.original_non_billable_total += origHours;
     }
 
     if (isCustomerNonBillable) {
       acc.customer_non_billable_total += hours;
-      acc.original_customer_non_billable_total += origHours;
     }
     if (isLeave) {
       acc.leaves_hours += hours;
-      acc.original_leaves_hours += origHours;
     }
 
     return acc;
   }, {
     billable_total: 0,
-    original_billable_total: 0,
     non_billable_total: 0,
-    original_non_billable_total: 0,
     customer_non_billable_total: 0,
-    original_customer_non_billable_total: 0,
     leaves_hours: 0,
-    original_leaves_hours: 0,
   });
 
   const totalUtilization = reportSummary.billable_total + reportSummary.non_billable_total - reportSummary.leaves_hours;
-  const originalTotalUtilization = reportSummary.original_billable_total + reportSummary.original_non_billable_total - reportSummary.original_leaves_hours;
 
   // Export pulls every matching record (not just the current page); reuses the
   // already-fetched full dataset above when available instead of firing a new request.
@@ -370,7 +345,7 @@ const ResourceAllocation = () => {
     setExporting(true);
     try {
       const all = fullRows ?? await reportsApi.fetchAllResourceAllocationRows(params);
-      exportToExcel(all);
+      exportToExcel(all, hoursSource);
     } finally {
       setExporting(false);
     }
@@ -385,9 +360,11 @@ const ResourceAllocation = () => {
     categoryIds.length > 0 ? 1 : 0,
     serviceTypeIds.length > 0 ? 1 : 0,
     poStatus.length > 0 ? 1 : 0,
+    hoursSource !== HOURS_ADJUSTED ? 1 : 0,
   ].reduce((a, b) => a + b, 0);
 
   const clearFilters = () => {
+    setHoursSource(HOURS_ADJUSTED);
     setEntityIds([]);
     setBuIds([]);
     setEmployeeIds([]);
@@ -411,32 +388,13 @@ const ResourceAllocation = () => {
               placeholder="Employee, PO…"
               className="w-full sm:w-full md:w-56"
             />
-            {canViewOriginal && (
-              <div className="flex items-center gap-0.5 p-0.5 rounded-xl bg-muted border shrink-0">
-                {[
-                  { value: 'O', label: 'Original' },
-                  { value: 'M', label: 'Published' },
-                ].map(({ value, label }) => (
-                  <button
-                    key={value}
-                    type="button"
-                    onClick={() => { setHoursSource(value); setPage(1); }}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-                      hoursSource === value ? 'bg-card shadow-sm text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground hover:text-foreground'
-                    }`}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-            )}
             <FilterToggleButton
               isOpen={filtersOpen}
               onToggle={() => setFiltersOpen((prev) => !prev)}
               activeCount={activeFilterCount}
             />
             {rows.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport} disabled={exporting}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)} disabled={exporting}>
                 <Download className="h-4 w-4" />{exporting ? 'Exporting…' : 'Export Excel'}
               </Button>
             )}
@@ -459,6 +417,8 @@ const ResourceAllocation = () => {
               className="w-full"
             />
           </div>
+
+          <HoursBasisToggle value={hoursSource} onChange={(v) => { setHoursSource(v); setPage(1); }} labelClassName="text-xs" />
 
           <div className="flex flex-col gap-1.5">
             <Label className="text-xs">Client</Label>

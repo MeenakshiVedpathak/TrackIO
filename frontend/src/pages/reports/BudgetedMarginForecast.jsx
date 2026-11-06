@@ -10,6 +10,7 @@ import PageHeader from '@/components/common/PageHeader';
 import StatusBadge from '@/components/common/StatusBadge';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
 import SearchInput from '@/components/common/SearchInput';
@@ -127,6 +128,7 @@ const SummaryItem = ({ label, value, negative = false }) => (
 );
 
 const BudgetedMarginForecast = () => {
+  const confirmExport = useExportConfirm();
   const [monthYear, setMonthYear] = useState(defaultMonthYear);
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [entityIds, setEntityIds] = useState([]);
@@ -205,7 +207,7 @@ const BudgetedMarginForecast = () => {
               activeCount={activeFilterCount}
             />
             {filteredRecords.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)}>
                 <Download className="h-4 w-4" />Export Excel
               </Button>
             )}

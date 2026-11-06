@@ -24,13 +24,17 @@ const NAV = [
   { label: 'Work Log Time Report', to: ROUTES.EMPLOYEE_WORK_LOG_TIME_REPORT, form: FORM_NAMES.EMPLOYEE_WORK_LOG_TIME_REPORT },
 ];
 
-// Module-level so the context value keeps a stable identity across renders.
+// Module-level so the context values keep a stable identity across renders.
 const BACK_TO_REPORTS = { to: ROUTES.EMPLOYEE_REPORTS_CENTER, label: 'Back to Report' };
+// A report in this section can also be opened from the admin Reports Center (e.g. a Project Manager
+// granted "Timesheet Approval Status Report" under the Reports module). Back must return there, not
+// to the employee hub, which lists only the employee-section reports and would show a lone report.
+const BACK_TO_ADMIN_REPORTS = { to: ROUTES.REPORTS, label: 'Back to Report' };
 
 const normalize = (s) => (s ?? '').trim().toLowerCase();
 
 const EmployeeReportsLayout = () => {
-  const { pathname } = useLocation();
+  const { pathname, state } = useLocation();
   const { accessibleForms, isPlatformAdmin } = useAuth();
 
   const grantedFormNames = useMemo(
@@ -48,7 +52,7 @@ const EmployeeReportsLayout = () => {
   // carries no formName guard (see routes/index.jsx), so it's reachable by anyone who can reach a
   // report in the first place.
   const isHub = pathname.replace(/\/+$/, '') === ROUTES.EMPLOYEE_REPORTS_CENTER;
-  const backTarget = isHub ? null : BACK_TO_REPORTS;
+  const backTarget = isHub ? null : state?.backTo === ROUTES.REPORTS ? BACK_TO_ADMIN_REPORTS : BACK_TO_REPORTS;
 
   return (
     // `h-full min-h-0 flex-col` passes the bounded height EmployeeLayout's <main> hands this

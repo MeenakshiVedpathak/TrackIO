@@ -174,6 +174,9 @@ export const ROUTES = {
   REPORT_CROSS_BU_EMPLOYEE_PO_HOURS: '/reports/cross-bu-employee-po-hours',
   REPORT_EMPLOYEE_ROLE_BU_MAPPING: '/reports/employee-role-bu-mapping',
   REPORT_TEAM_LEAD_EMPLOYEE_PROJECT_HOURS: '/reports/team-lead-employee-project-hours',
+  REPORT_TEAM_LEAD_EMPLOYEE_PO_HOURS: '/reports/team-lead-employee-po-hours',
+  REPORT_BU_ADMIN_EMPLOYEE_PO_HOURS: '/reports/bu-employee-po-hours',
+  REPORT_PROJECT_MANAGER_EMPLOYEE_PO_HOURS: '/reports/project-manager-employee-po-hours',
 
   // Team Mapping — Service PO Admin self-service (§7)
   TEAM_MAPPINGS: '/team-mappings',
@@ -203,6 +206,8 @@ export const ROUTES = {
   SETTINGS: '/settings',
   // Admin / Platform Admin only — system-wide monthly cap hours (GET/PUT /system-settings/monthly-cap)
   SETTINGS_MONTHLY_CAP: '/settings/monthly-cap',
+  // Platform Admin only — uploaded site logos (GET/POST /system-settings/logos)
+  SETTINGS_SITE_LOGO: '/settings/site-logo',
 
   // Error
   NOT_FOUND: '*',

@@ -13,6 +13,7 @@ import { extractApiError } from '@/services/apiClient';
 import {
   buildMonthlySummaryRows, buildDayEntries, validateDayEntries,
 } from '@/utils/employeeMonthlySummary';
+import { lockedHoursForDay, isApprovedConflict } from '@/utils/approvedWorkLog';
 import MonthNavigator from '@/components/employee/MonthNavigator';
 import SummaryTable from '@/components/employee/SummaryTable';
 import WorkLogEntryTable from '@/components/employee/WorkLogEntryTable';
@@ -22,6 +23,7 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import ConfirmDialog from '@/components/common/ConfirmDialog';
 import PageHeader from '@/components/common/PageHeader';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 
 // Month View has no real per-day date, so every row is bucketed under this one pseudo-day key —
 // same trick My Work Log's Monthly tab uses — letting it reuse the exact same row-building
@@ -95,6 +97,7 @@ const exportMonthlyWorkLogToExcel = (rows, edits, month, year) => {
 // Log entry for the month at once, gated by the backend's `eligible` flag. That's a materially
 // bigger blast radius than one day's save, so it goes through a confirm dialog first.
 const MonthlySummaryPage = () => {
+  const confirmExport = useExportConfirm();
   const today = dayjs().startOf('day');
   const [month, setMonth] = useState(today.month() + 1);
   const [year, setYear] = useState(today.year());
@@ -115,6 +118,9 @@ const MonthlySummaryPage = () => {
   const [isMonthlyDeleting, setIsMonthlyDeleting] = useState(false);
   const [confirmSaveOpen, setConfirmSaveOpen] = useState(false);
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+  // "YYYY-M" months the backend has refused (409) because they contain approved logs — the monthly
+  // GET may not flag them itself, so Delete stays off for them instead of inviting a refused call.
+  const [approvedMonthKeys, setApprovedMonthKeys] = useState(() => new Set());
 
   const { success, error: showError } = useNotification();
   const qc = useQueryClient();
@@ -165,6 +171,10 @@ const MonthlySummaryPage = () => {
   // `eligible` comes straight from the backend response — never computed here.
   const isMonthlyIneligible = !isMonthlyLoading && monthlyData != null && monthlyData.eligible === false;
   const hasExistingMonthlyEntries = monthlyRows.some((r) => Number(r.hoursByDay?.[MONTH_DAY_KEY] ?? 0) > 0);
+  const monthKey = `${year}-${month}`;
+  const markMonthApproved = () => setApprovedMonthKeys((prev) => new Set(prev).add(monthKey));
+  // Approved logs anywhere in the month block deleting it (the backend refuses the whole delete).
+  const monthHasApproved = monthlyRows.some((r) => r.approvedByDay?.[MONTH_DAY_KEY]) || approvedMonthKeys.has(monthKey);
 
   const handleMonthChange = (m, y) => {
     setMonth(m);
@@ -204,7 +214,9 @@ const MonthlySummaryPage = () => {
     });
 
     for (const { date, entries } of dayPayloads) {
-      const validationError = validateDayEntries(entries, date, DAILY_HOURS_CAP);
+      const day = Number(date.slice(-2));
+      // `entries` omits approved lines, but their hours still count towards the daily cap.
+      const validationError = validateDayEntries(entries, date, DAILY_HOURS_CAP, lockedHoursForDay(rows, day));
       if (validationError) {
         showError(validationError);
         return;
@@ -268,7 +280,11 @@ const MonthlySummaryPage = () => {
       // GET /monthly-worklog doesn't expose a per-line sync flag yet — a synced line only
       // surfaces here as a 409 after the attempt. Refetch so the table reflects it instead of
       // leaving the user free to just hit Save again against the same stale read.
-      if (err?.response?.status === 409) qc.invalidateQueries({ queryKey: ['employee-worklog'] });
+      if (err?.response?.status === 409) {
+        if (isApprovedConflict(err)) markMonthApproved();
+        setConfirmSaveOpen(false);
+        qc.invalidateQueries({ queryKey: ['employee-worklog'] });
+      }
     } finally {
       setIsMonthlySaving(false);
     }
@@ -287,7 +303,11 @@ const MonthlySummaryPage = () => {
       showError(extractApiError(err));
       // At least one entry in this month has synced — refetch so the table reflects the current
       // (now-unclearable) state instead of leaving stale, still-"deletable"-looking rows on screen.
-      if (err?.response?.status === 409) qc.invalidateQueries({ queryKey: ['employee-worklog'] });
+      if (err?.response?.status === 409) {
+        if (isApprovedConflict(err)) markMonthApproved();
+        setConfirmDeleteOpen(false);
+        qc.invalidateQueries({ queryKey: ['employee-worklog'] });
+      }
     } finally {
       setIsMonthlyDeleting(false);
     }
@@ -313,9 +333,9 @@ const MonthlySummaryPage = () => {
             <Button
               variant="outline"
               size="sm"
-              onClick={() => (viewMode === 'day'
+              onClick={() => confirmExport(() => (viewMode === 'day'
                 ? exportSummaryToExcel(rows, edits, month, year)
-                : exportMonthlyWorkLogToExcel(monthlyRows, monthlyEdits, month, year))}
+                : exportMonthlyWorkLogToExcel(monthlyRows, monthlyEdits, month, year)))}
               disabled={viewMode === 'day' ? (isLoading || rows.length === 0) : (isMonthlyLoading || monthlyRows.length === 0)}
             >
               <Download className="mr-1.5 h-4 w-4" />
@@ -351,6 +371,14 @@ const MonthlySummaryPage = () => {
         />
       ) : (
         <div className="space-y-3">
+          {monthHasApproved && (
+            <Alert variant="warning">
+              <AlertDescription>
+                This month has approved work logs. Approved logs are locked and can&apos;t be edited or deleted —
+                ask your approver to revert them first. Delete is disabled for this month.
+              </AlertDescription>
+            </Alert>
+          )}
           {isMonthlyIneligible && (
             <Alert variant="warning">
               <AlertDescription>
@@ -400,7 +428,8 @@ const MonthlySummaryPage = () => {
               size="sm"
               className="text-destructive"
               onClick={() => setConfirmDeleteOpen(true)}
-              disabled={isMonthlyDeleting || isMonthlySaving}
+              disabled={isMonthlyDeleting || isMonthlySaving || monthHasApproved}
+              title={monthHasApproved ? 'This month has approved logs, so it cannot be deleted. Ask your approver to revert them first.' : undefined}
             >
               <Trash2 className="mr-1.5 h-4 w-4" />
               Delete

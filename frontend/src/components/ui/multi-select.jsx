@@ -16,6 +16,10 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover"
+import { DELAYED_REVEAL, Spinner } from "@/components/ui/spinner"
+import { useLazyOptions, useOptionsLoading } from "@/components/ui/use-select-options"
+
+const optionSearchText = (opt) => String(opt.label)
 
 // options: [{ label, value, depth? }] — `depth` (e.g. 1 for a Sub-BU) indents the row under its
 // parent. value: array of selected values (as strings).
@@ -31,6 +35,9 @@ export function MultiSelect({
   disabled = false,
   lockedValues = [],
   className,
+  // Same as SearchableSelect's: undefined = inferred from "no options yet while a query loads".
+  loading,
+  loadingMessage = "Loading…",
 }) {
   const [open, setOpen] = React.useState(false)
   const [search, setSearch] = React.useState("")
@@ -68,6 +75,15 @@ export function MultiSelect({
       : options.filter((opt) => !opt.depth || expanded.has(parentOf.get(String(opt.value))))),
     [options, expanded, parentOf, search]
   )
+
+  const isLoading = useOptionsLoading(loading, options.length)
+  // Search filtering happens here (cmdk's own filter is off) so only a window of the matching rows
+  // is mounted at a time; the rest render as the list scrolls.
+  const { visible: renderedOptions, hasMore, onScroll } = useLazyOptions(visibleOptions, {
+    search,
+    open,
+    getText: optionSearchText,
+  })
 
   const locked = React.useMemo(() => new Set(lockedValues.map(String)), [lockedValues])
   const selected = React.useMemo(() => new Set(value.map(String)), [value])
@@ -128,6 +144,7 @@ export function MultiSelect({
             variant="outline"
             role="combobox"
             aria-expanded={open}
+            aria-busy={isLoading || undefined}
             disabled={disabled}
             className={cn(
               // Fluid clamp() sizing (see button.jsx's own comment) instead of a fixed h-9/text-sm.
@@ -144,11 +161,13 @@ export function MultiSelect({
                 ? selectedLabels[0]
                 : `${selectedLabels.length} selected`}
             </span>
-            <ChevronDown className="h-[1em] w-[1em] shrink-0 opacity-50" />
+            {isLoading
+              ? <Spinner className="h-[1em] w-[1em] shrink-0 text-muted-foreground" />
+              : <ChevronDown className="h-[1em] w-[1em] shrink-0 opacity-50" />}
           </Button>
         </PopoverTrigger>
         <PopoverContent className="min-w-[var(--radix-popover-trigger-width)] w-max max-w-xs p-0" align="start">
-          <Command>
+          <Command shouldFilter={false}>
             <CommandInput placeholder={searchPlaceholder} value={search} onValueChange={setSearch} />
             <div className="flex items-center justify-between border-b px-2 py-1.5">
               <button
@@ -168,10 +187,17 @@ export function MultiSelect({
                 Clear all
               </button>
             </div>
-            <CommandEmpty>{emptyMessage}</CommandEmpty>
-            <CommandList>
+            {isLoading && renderedOptions.length === 0 ? (
+              <div role="status" className={cn("flex items-center justify-center gap-2 py-6 text-sm text-muted-foreground", DELAYED_REVEAL)}>
+                <Spinner />
+                {loadingMessage}
+              </div>
+            ) : (
+              <CommandEmpty>{emptyMessage}</CommandEmpty>
+            )}
+            <CommandList onScroll={onScroll}>
               <CommandGroup>
-                {visibleOptions.map((option) => {
+                {renderedOptions.map((option) => {
                   const isSelected = selected.has(String(option.value))
                   const hasChildren = parentsWithChildren.has(String(option.value))
                   const isLocked = locked.has(String(option.value))
@@ -211,6 +237,12 @@ export function MultiSelect({
                   )
                 })}
               </CommandGroup>
+              {hasMore && (
+                <div className="flex items-center justify-center gap-2 py-2 text-xs text-muted-foreground">
+                  <Spinner className="h-3.5 w-3.5" />
+                  Loading more…
+                </div>
+              )}
             </CommandList>
           </Command>
         </PopoverContent>

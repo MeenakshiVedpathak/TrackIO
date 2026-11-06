@@ -11,6 +11,7 @@ import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
 import SearchInput from '@/components/common/SearchInput';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { MonthYearPicker } from '@/components/ui/month-year-picker';
@@ -106,6 +107,7 @@ const SummaryItem = ({ label, value, colorClass }) => (
 );
 
 const InvoiceRealizationTrend = () => {
+  const confirmExport = useExportConfirm();
   const [fromMonthYear, setFromMonthYear] = useState({
     month: startMonthDate.getMonth() + 1,
     year: startMonthDate.getFullYear(),
@@ -178,7 +180,7 @@ const InvoiceRealizationTrend = () => {
               activeCount={(entityIds.length > 0 ? 1 : 0) + (buIds.length > 0 ? 1 : 0)}
             />
             {filteredRecords.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)}>
                 <Download className="h-4 w-4" />Export Excel
               </Button>
             )}

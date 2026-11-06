@@ -15,6 +15,8 @@ import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
 import SearchInput from '@/components/common/SearchInput';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
@@ -85,7 +87,17 @@ const SortableHeader = ({ label, column, sortBy, sortOrder, onSort, align }) => 
   );
 };
 
-const getColumns = (sortBy, sortOrder, onSort, { hasOrigBenchHours, hasOrigTotalHours, hasOrigBenchPct } = {}) => [
+// Metrics that carry an `original_*` twin. Under the Original basis each reads its `original_*`
+// field — but only when the API actually sent that field for some row; otherwise it stays on the
+// adjusted value, so a response without original data behaves exactly like Adjusted.
+const BASIS_FIELDS = ['bench_hours', 'total_hours', 'bench_pct'];
+
+const getBasisFields = (rows, hoursSource) => Object.fromEntries(BASIS_FIELDS.map((f) => [
+  f,
+  hoursSource === HOURS_ORIGINAL && rows.some((r) => r[`original_${f}`] != null) ? `original_${f}` : f,
+]));
+
+const getColumns = (sortBy, sortOrder, onSort, fields) => [
   columnHelper.accessor('employee_code', {
     header: 'Employee Code',
     size: 150,
@@ -114,7 +126,8 @@ const getColumns = (sortBy, sortOrder, onSort, { hasOrigBenchHours, hasOrigTotal
       );
     },
   }),
-  columnHelper.accessor('bench_hours', {
+  columnHelper.accessor((r) => r[fields.bench_hours], {
+    id: 'bench_hours',
     header: () => (
       <SortableHeader label="Bench Hours" column="bench_hours" sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} align="right" />
     ),
@@ -123,20 +136,8 @@ const getColumns = (sortBy, sortOrder, onSort, { hasOrigBenchHours, hasOrigTotal
     enableSorting: false,
     cell: (info) => <span className="tabular-nums">{formatHours(info.getValue())}</span>,
   }),
-  ...(hasOrigBenchHours ? [
-    columnHelper.accessor('original_bench_hours', {
-      header: 'Original Bench Hours',
-      size: 160,
-      meta: { align: 'right' },
-      enableSorting: false,
-      cell: (info) => {
-        const value = info.getValue();
-        if (value == null || value === '') return <span className="text-muted-foreground">—</span>;
-        return <span className="tabular-nums text-muted-foreground">{formatHours(value)}</span>;
-      },
-    }),
-  ] : []),
-  columnHelper.accessor('total_hours', {
+  columnHelper.accessor((r) => r[fields.total_hours], {
+    id: 'total_hours',
     header: () => (
       <SortableHeader label="Total Hours" column="total_hours" sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} align="right" />
     ),
@@ -145,20 +146,8 @@ const getColumns = (sortBy, sortOrder, onSort, { hasOrigBenchHours, hasOrigTotal
     enableSorting: false,
     cell: (info) => <span className="tabular-nums">{formatHours(info.getValue())}</span>,
   }),
-  ...(hasOrigTotalHours ? [
-    columnHelper.accessor('original_total_hours', {
-      header: 'Original Total Hours',
-      size: 160,
-      meta: { align: 'right' },
-      enableSorting: false,
-      cell: (info) => {
-        const value = info.getValue();
-        if (value == null || value === '') return <span className="text-muted-foreground">—</span>;
-        return <span className="tabular-nums text-muted-foreground">{formatHours(value)}</span>;
-      },
-    }),
-  ] : []),
-  columnHelper.accessor('bench_pct', {
+  columnHelper.accessor((r) => r[fields.bench_pct], {
+    id: 'bench_pct',
     header: () => (
       <SortableHeader label="Bench %" column="bench_pct" sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} align="right" />
     ),
@@ -167,47 +156,27 @@ const getColumns = (sortBy, sortOrder, onSort, { hasOrigBenchHours, hasOrigTotal
     enableSorting: false,
     cell: (info) => <BenchPctBadge value={info.getValue()} />,
   }),
-  ...(hasOrigBenchPct ? [
-    columnHelper.accessor('original_bench_pct', {
-      header: 'Original Bench %',
-      size: 150,
-      meta: { align: 'right' },
-      enableSorting: false,
-      cell: (info) => {
-        const value = info.getValue();
-        if (value == null || value === '') return <span className="text-muted-foreground">—</span>;
-        return <BenchPctBadge value={value} />;
-      },
-    }),
-  ] : []),
 ];
 
-const exportToExcel = (rows) => {
-  const hasOrigBenchHours = rows.some((r) => r.original_bench_hours != null);
-  const hasOrigTotalHours = rows.some((r) => r.original_total_hours != null);
-  const hasOrigBenchPct = rows.some((r) => r.original_bench_pct != null);
-
+const exportToExcel = (rows, fields) => {
+  // " (Original)" only on the columns actually exported from an `original_*` field.
+  const suffix = (f) => (fields[f] !== f ? ' (Original)' : '');
   const hasNoHoursLogged = rows.some((r) => r.no_hours_logged);
   const header = [
     'Employee Code',
     'Full Name',
-    'Bench Hours',
-    ...(hasOrigBenchHours ? ['Original Bench Hours'] : []),
-    'Total Hours',
-    ...(hasOrigTotalHours ? ['Original Total Hours'] : []),
-    'Bench %',
-    ...(hasOrigBenchPct ? ['Original Bench %'] : []),
+    `Bench Hours${suffix('bench_hours')}`,
+    `Total Hours${suffix('total_hours')}`,
+    `Bench %${suffix('bench_pct')}`,
     ...(hasNoHoursLogged ? ['No Hours Logged'] : []),
   ];
+  const num = (v) => (v != null ? Number(v) : '');
   const dataRows = rows.map((r) => [
     r.employee_code ?? '',
     r.full_name ?? '',
-    r.bench_hours != null ? Number(r.bench_hours) : '',
-    ...(hasOrigBenchHours ? [r.original_bench_hours != null ? Number(r.original_bench_hours) : ''] : []),
-    r.total_hours != null ? Number(r.total_hours) : '',
-    ...(hasOrigTotalHours ? [r.original_total_hours != null ? Number(r.original_total_hours) : ''] : []),
-    r.bench_pct != null ? Number(r.bench_pct) : '',
-    ...(hasOrigBenchPct ? [r.original_bench_pct != null ? Number(r.original_bench_pct) : ''] : []),
+    num(r[fields.bench_hours]),
+    num(r[fields.total_hours]),
+    num(r[fields.bench_pct]),
     ...(hasNoHoursLogged ? [r.no_hours_logged ? 'Yes' : ''] : []),
   ]);
   const ws = XLSX.utils.aoa_to_sheet([header, ...dataRows]);
@@ -224,6 +193,7 @@ const SummaryItem = ({ label, value }) => (
 );
 
 const EmployeeBenchPercentage = () => {
+  const confirmExport = useExportConfirm();
   const [periodMode, setPeriodMode] = useState('month');
   const [monthYear, setMonthYear] = useState({
     month: prevMonth.getMonth() + 1,
@@ -242,6 +212,7 @@ const EmployeeBenchPercentage = () => {
   const [limit, setLimit] = useState(10);
   const [sortBy, setSortBy] = useState('bench_pct');
   const [sortOrder, setSortOrder] = useState('desc');
+  const [hoursSource, setHoursSource] = useState(HOURS_ADJUSTED);
 
   const scope = useMemo(() => ({ entityIds, businessUnitIds: buIds }), [entityIds, buIds]);
   const { data: activeEmployees = [] } = useActiveEmployees(undefined, scope);
@@ -254,6 +225,8 @@ const EmployeeBenchPercentage = () => {
       : !!(dateRange?.startDate && dateRange?.endDate);
 
   const params = {
+    // Original basis: the server then sorts, ranks and totals on original hours too.
+    ...(hoursSource === HOURS_ORIGINAL && { hoursSource: 'O' }),
     ...(periodMode === 'month'
       ? monthYear?.month && monthYear?.year && { month: monthYear.month, year: monthYear.year }
       : dateRange?.startDate && dateRange?.endDate && { startDate: dateRange.startDate, endDate: dateRange.endDate }),
@@ -285,18 +258,15 @@ const EmployeeBenchPercentage = () => {
   const pagedRecords = filteredRecords.slice((page - 1) * limit, page * limit);
   const showLoading = periodReady && isPending;
 
-  const hasOrigBenchHours = useMemo(() => records.some((r) => r.original_bench_hours != null), [records]);
-  const hasOrigTotalHours = useMemo(() => records.some((r) => r.original_total_hours != null), [records]);
-  const hasOrigBenchPct = useMemo(() => records.some((r) => r.original_bench_pct != null), [records]);
+  const hasOriginal = useMemo(
+    () => records.some((r) => BASIS_FIELDS.some((f) => r[`original_${f}`] != null)),
+    [records],
+  );
+  const fields = useMemo(() => getBasisFields(records, hoursSource), [records, hoursSource]);
 
   const avgBenchPct =
     filteredRecords.length > 0
-      ? filteredRecords.reduce((sum, r) => sum + (Number(r.bench_pct) || 0), 0) / filteredRecords.length
-      : null;
-
-  const avgOrigBenchPct =
-    hasOrigBenchPct && filteredRecords.length > 0
-      ? filteredRecords.reduce((sum, r) => sum + (Number(r.original_bench_pct) || 0), 0) / filteredRecords.length
+      ? filteredRecords.reduce((sum, r) => sum + (Number(r[fields.bench_pct]) || 0), 0) / filteredRecords.length
       : null;
 
   const activeFilterCount = [
@@ -305,6 +275,7 @@ const EmployeeBenchPercentage = () => {
     employeeId.length > 0,
     clientId.length > 0,
     poId.length > 0,
+    hoursSource !== HOURS_ADJUSTED,
   ].filter(Boolean).length;
 
   const clearFilters = () => {
@@ -313,6 +284,7 @@ const EmployeeBenchPercentage = () => {
     setEmployeeId([]);
     setClientId([]);
     setPoId([]);
+    setHoursSource(HOURS_ADJUSTED);
     setPage(1);
   };
 
@@ -332,15 +304,13 @@ const EmployeeBenchPercentage = () => {
   };
 
   // Already have the full matching set in memory — no need for a second network round-trip.
-  const handleExport = () => exportToExcel(filteredRecords);
+  const handleExport = () => exportToExcel(filteredRecords, fields);
 
+  // Sorting stays server-side on the adjusted keys (bench_hours / total_hours / bench_pct) — the
+  // API has no known original_* sort keys, so under Original the order follows the adjusted values.
   const columns = useMemo(() => {
-    return getColumns(sortBy, sortOrder, handleSort, {
-      hasOrigBenchHours,
-      hasOrigTotalHours,
-      hasOrigBenchPct,
-    });
-  }, [sortBy, sortOrder, hasOrigBenchHours, hasOrigTotalHours, hasOrigBenchPct]);
+    return getColumns(sortBy, sortOrder, handleSort, fields);
+  }, [sortBy, sortOrder, fields]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -360,7 +330,7 @@ const EmployeeBenchPercentage = () => {
               activeCount={activeFilterCount}
             />
             {filteredRecords.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)}>
                 <Download className="h-4 w-4" />Export Excel
               </Button>
             )}
@@ -435,6 +405,10 @@ const EmployeeBenchPercentage = () => {
             />
           )}
         </div>
+
+        {(hasOriginal || hoursSource !== HOURS_ADJUSTED) && (
+          <HoursBasisToggle value={hoursSource} onChange={(v) => { setHoursSource(v); setPage(1); }} labelClassName={FILTER_LABEL} />
+        )}
 
         <div className="flex flex-col gap-1.5">
           <Label className={FILTER_LABEL}>Employee</Label>

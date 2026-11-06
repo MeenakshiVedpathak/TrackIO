@@ -48,8 +48,15 @@ export const useAICopilot = () => {
       const res = await aiCopilotApi.query({ question: query, roleId: roleObjects[0]?.id, hoursSource: 'M' });
       const answer = res?.data?.answer;
       const text = formatAnswerAsMarkdown(answer);
+      // Only present when the backend couldn't answer the question — absent on a normal answer.
+      const rawSuggestions = res?.data?.suggested_questions;
+      const suggestedQuestions = Array.isArray(rawSuggestions)
+        ? rawSuggestions.filter((q) => typeof q === 'string' && q.trim()).map((q) => q.trim())
+        : [];
       setMessages((prev) =>
-        prev.map((m) => (m.id === thinkingId ? { ...m, thinking: false, streaming: true, text, priority: answer?.priority } : m)),
+        prev.map((m) => (m.id === thinkingId
+          ? { ...m, thinking: false, streaming: true, text, priority: answer?.priority, suggestedQuestions }
+          : m)),
       );
     } catch (err) {
       const text = `Sorry, I ran into a problem: ${extractApiError(err)}`;

@@ -18,6 +18,7 @@ import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import SearchInput from '@/components/common/SearchInput';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
 import { MultiSelect } from '@/components/ui/multi-select';
@@ -35,6 +36,7 @@ const columnHelper = createColumnHelper();
 // { sessionId?, deviceId?, actorIds?, search?, nonce } — `nonce` changes on every click so the same
 // session/device can be re-applied even if it's already the active filter.
 const AuditLogsActivityTab = ({ preset, toolbarSlot }) => {
+  const confirmExport = useExportConfirm();
   const { error: notifyError, success: notifySuccess } = useNotification();
 
   // Filters state
@@ -419,7 +421,7 @@ const AuditLogsActivityTab = ({ preset, toolbarSlot }) => {
         Refresh
       </Button>
       {records.length > 0 && (
-        <Button variant="outline" size="toolbar" onClick={handleExport} disabled={isExporting}>
+        <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)} disabled={isExporting}>
           <Download className="h-4 w-4" />
           {isExporting ? 'Exporting…' : 'Export Excel'}
         </Button>

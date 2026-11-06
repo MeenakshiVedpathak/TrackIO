@@ -8,12 +8,14 @@ import { useServicePOTimelineRisk } from '@/hooks/useReports';
 import { formatHours, formatPercentage, formatDate } from '@/utils/formatters';
 import DataTable from '@/components/common/DataTable';
 import PageHeader from '@/components/common/PageHeader';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import StatusBadge from '@/components/common/StatusBadge';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
 import SearchInput from '@/components/common/SearchInput';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { DatePicker } from '@/components/ui/date-picker';
@@ -58,12 +60,14 @@ const RiskLevelBadge = ({ value }) => {
 // expected_man_hours column — so restoring them is an uncomment once the backend returns them.
 // Note that risk_level, still shown, is elapsed-time-only until consumed_hours_pct exists.
 // ──────────────────────────────────────────────────────────────────────────────────────────────
-const exportToExcel = (rows, showMonthColumns) => {
+// Rows arrive already mapped to the active hours basis (see `records` in the component).
+const exportToExcel = (rows, showMonthColumns, hoursSource) => {
+  const sfx = hoursSource === HOURS_ORIGINAL ? ' (Original)' : '';
   const header = [
     'PO Code', 'PO Name', 'Client', 'Status', 'Start Date', 'End Date',
     // 'PO Value', 'Expected Man Hours',
-    'Adjusted Hours Delivered To Date', 'Original Hours Delivered To Date',
-    ...(showMonthColumns ? ['Hours In Month', 'Original Hours In Month'] : []),
+    `Hours Delivered To Date${sfx}`,
+    ...(showMonthColumns ? [`Hours In Month${sfx}`] : []),
     'Elapsed Time %',
     // 'Consumed Hours %',
     'Risk Level',
@@ -79,10 +83,8 @@ const exportToExcel = (rows, showMonthColumns) => {
     // r.po_value != null ? Number(r.po_value) : '',
     // r.expected_man_hours != null ? Number(r.expected_man_hours) : '',
     r.hours_delivered_to_date != null ? Number(r.hours_delivered_to_date) : '',
-    r.original_hours_delivered_to_date != null ? Number(r.original_hours_delivered_to_date) : '',
     ...(showMonthColumns ? [
       r.hours_in_month != null ? Number(r.hours_in_month) : '',
-      r.original_hours_in_month != null ? Number(r.original_hours_in_month) : '',
     ] : []),
     r.elapsed_time_pct != null ? Number(r.elapsed_time_pct) : '',
     // r.consumed_hours_pct != null ? Number(r.consumed_hours_pct) : '',
@@ -144,18 +146,9 @@ const getColumns = (showMonthColumns) => [
   //   cell: (info) => <span className="tabular-nums">{formatHours(info.getValue())}</span>,
   // }),
   columnHelper.accessor('hours_delivered_to_date', {
-    header: 'Adjusted Hours Delivered To Date',
+    header: 'Hours Delivered To Date',
     size: 190,
     cell: (info) => <span className="tabular-nums">{formatHours(info.getValue())}</span>,
-  }),
-  columnHelper.accessor('original_hours_delivered_to_date', {
-    header: 'Original Hours Delivered To Date',
-    size: 210,
-    cell: (info) => {
-      const value = info.getValue();
-      if (value == null || value === '') return null;
-      return <span className="tabular-nums text-muted-foreground">{formatHours(value)}</span>;
-    },
   }),
   // Only meaningful once a month is actually selected (see `period` in the response) — a plain
   // "as of today"/"as of an explicit date" query has no single month to total hours within.
@@ -164,14 +157,6 @@ const getColumns = (showMonthColumns) => [
       header: 'Hours In Month',
       size: 150,
       cell: (info) => <span className="tabular-nums">{formatHours(info.getValue())}</span>,
-    }),
-    columnHelper.accessor('original_hours_in_month', {
-      header: 'Original Hrs In Month',
-      size: 170,
-      cell: (info) => {
-        const value = info.getValue();
-        return <span className="tabular-nums text-muted-foreground">{value != null ? formatHours(value) : '—'}</span>;
-      },
     }),
   ] : []),
   columnHelper.accessor('elapsed_time_pct', {
@@ -209,6 +194,7 @@ const SummaryItem = ({ label, value }) => (
 );
 
 const ServicePOTimelineRisk = () => {
+  const confirmExport = useExportConfirm();
   const [periodMode, setPeriodMode] = useState('month'); // 'date' | 'month'
   const [asOfDate, setAsOfDate] = useState('');
   const [monthYear, setMonthYear] = useState(null);
@@ -218,10 +204,13 @@ const ServicePOTimelineRisk = () => {
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(1);
   const [limit, setLimit] = useState(10);
+  const [hoursSource, setHoursSource] = useState(HOURS_ADJUSTED);
 
   // An explicit As Of Date always wins over Month & Year when both happen to be set — never sent
   // together. With neither, the backend defaults to "as of today".
   const params = {
+    // Original basis: the server then sorts, ranks and totals on original hours too.
+    ...(hoursSource === HOURS_ORIGINAL && { hoursSource: 'O' }),
     ...(asOfDate
       ? { asOfDate }
       : (monthYear?.month && monthYear?.year ? { month: monthYear.month, year: monthYear.year } : {})),
@@ -234,7 +223,22 @@ const ServicePOTimelineRisk = () => {
 
   const { data, isPending } = useServicePOTimelineRisk(params);
 
-  const records = data?.data?.records ?? [];
+  // Hours basis: when 'Original' is selected, the hours fields are swapped for their original_*
+  // twins (falling back to the adjusted value when the API didn't send one), so the table, mobile
+  // cards and export all read the same keys whichever basis is active.
+  const rawRecords = data?.data?.records;
+  const records = useMemo(
+    () => (rawRecords ?? []).map((r) => (
+      hoursSource === HOURS_ORIGINAL
+        ? {
+          ...r,
+          hours_delivered_to_date: r.original_hours_delivered_to_date ?? r.hours_delivered_to_date,
+          hours_in_month: r.original_hours_in_month ?? r.hours_in_month,
+        }
+        : r
+    )),
+    [rawRecords, hoursSource]
+  );
   const showMonthColumns = !!data?.period;
   const columns = useMemo(() => getColumns(showMonthColumns), [showMonthColumns]);
 
@@ -249,7 +253,7 @@ const ServicePOTimelineRisk = () => {
   }, [records, search]);
   const pagedRecords = filteredRecords.slice((page - 1) * limit, page * limit);
 
-  const activeFilterCount = (asOfDate ? 1 : 0) + (monthYear ? 1 : 0) + (buIds.length > 0 ? 1 : 0) + (entityIds.length > 0 ? 1 : 0);
+  const activeFilterCount = (asOfDate ? 1 : 0) + (monthYear ? 1 : 0) + (buIds.length > 0 ? 1 : 0) + (entityIds.length > 0 ? 1 : 0) + (hoursSource !== HOURS_ADJUSTED ? 1 : 0);
 
   const clearFilters = () => {
     setEntityIds([]);
@@ -257,11 +261,12 @@ const ServicePOTimelineRisk = () => {
     setAsOfDate('');
     setMonthYear(null);
     setPeriodMode('month');
+    setHoursSource(HOURS_ADJUSTED);
     setPage(1);
   };
 
   // Already have the full matching set in memory — no need for a second network round-trip.
-  const handleExport = () => exportToExcel(filteredRecords, showMonthColumns);
+  const handleExport = () => exportToExcel(filteredRecords, showMonthColumns, hoursSource);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -281,7 +286,7 @@ const ServicePOTimelineRisk = () => {
               activeCount={activeFilterCount}
             />
             {filteredRecords.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)}>
                 <Download className="h-4 w-4" />Export Excel
               </Button>
             )}
@@ -342,6 +347,8 @@ const ServicePOTimelineRisk = () => {
             )}
           </div>
         </div>
+
+        <HoursBasisToggle value={hoursSource} onChange={(v) => { setHoursSource(v); setPage(1); }} labelClassName="text-xs font-medium" />
       </FilterPanel>
 
       <DataTable

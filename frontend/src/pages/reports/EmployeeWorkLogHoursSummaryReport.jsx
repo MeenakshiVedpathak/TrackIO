@@ -31,6 +31,8 @@ import {
 } from '@/components/ui/dialog';
 import { Skeleton } from '@/components/ui/skeleton';
 import EmptyState from '@/components/common/EmptyState';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
 
 // Filter labels read as uppercase micro-labels, echoing the data table's own column headers so
 // the panel and the table below it look like one surface (same treatment as ClientWiseAnalytics).
@@ -49,15 +51,18 @@ const formatClock = (value) => {
   return `${String(hour12).padStart(2, '0')}:${m ?? '00'} ${suffix}`;
 };
 
-const exportToExcel = (records, periodLabel) => {
-  const hasOriginal = records.some((r) => r.original_hours_logged != null || r.original_total_hours != null);
+// Original (as-logged, pre monthly-cap) total for a summary row — the API has shipped it under
+// either name.
+const originalRowTotal = (row) => row.original_hours_logged ?? row.original_total_hours;
+
+const exportToExcel = (records, periodLabel, isOriginal) => {
+  const sfx = isOriginal ? ' (Original)' : '';
   const header = [
     'Employee Name',
     'Employee Code',
     'Period',
-    'Total Hours (Decimal)',
-    'Total Hours (Formatted)',
-    ...(hasOriginal ? ['Original Total Hours (Decimal)', 'Original Total Hours (Formatted)'] : []),
+    `Total Hours (Decimal)${sfx}`,
+    `Total Hours (Formatted)${sfx}`,
   ];
   const aoa = [
     ['Employee Work Log Hours Summary Report'],
@@ -67,19 +72,13 @@ const exportToExcel = (records, periodLabel) => {
   ];
 
   records.forEach((emp) => {
-    const orig = emp.original_hours_logged ?? emp.original_total_hours;
+    const hours = isOriginal ? originalRowTotal(emp) : emp.total_hours;
     aoa.push([
       emp.employee_name ?? '—',
       emp.employee_code ?? '—',
       periodLabel,
-      Number(emp.total_hours) || 0,
-      formatHoursMinutes(emp.total_hours),
-      ...(hasOriginal
-        ? [
-            orig != null ? Number(orig) : '',
-            orig != null ? formatHoursMinutes(orig) : '',
-          ]
-        : []),
+      isOriginal ? (hours != null ? Number(hours) : '') : (Number(hours) || 0),
+      isOriginal ? (hours != null ? formatHoursMinutes(hours) : '') : formatHoursMinutes(hours),
     ]);
   });
 
@@ -88,14 +87,12 @@ const exportToExcel = (records, periodLabel) => {
     { wch: 28 },
     { wch: 18 },
     { wch: 22 },
-    { wch: 22 },
-    { wch: 24 },
-    ...(hasOriginal ? [{ wch: 24 }, { wch: 24 }] : []),
+    { wch: isOriginal ? 30 : 22 },
+    { wch: isOriginal ? 32 : 24 },
   ];
-  const mergeEndCol = hasOriginal ? 6 : 4;
   ws['!merges'] = [
-    { s: { r: 0, c: 0 }, e: { r: 0, c: mergeEndCol } },
-    { s: { r: 1, c: 0 }, e: { r: 1, c: mergeEndCol } },
+    { s: { r: 0, c: 0 }, e: { r: 0, c: 4 } },
+    { s: { r: 1, c: 0 }, e: { r: 1, c: 4 } },
   ];
 
   const wb = XLSX.utils.book_new();
@@ -118,6 +115,8 @@ const EmployeeDetailModal = ({
   companyIds,
   periodLabel,
   summaryRowTotal,
+  summaryRowOriginalTotal,
+  isOriginal,
 }) => {
   const [detailPage, setDetailPage] = useState(1);
   const detailLimit = 10;
@@ -149,7 +148,13 @@ const EmployeeDetailModal = ({
   const entries = detailData.entries ?? [];
   const meta = detailRes?.meta ?? {};
   const employeeInfo = detailData.employee ?? {};
-  const totalHours = detailData.total_hours ?? summaryRowTotal ?? 0;
+  // Entries carry their own original_* twin; if none do, the modal behaves exactly as Adjusted.
+  const hasOriginalEntry = entries.some((e) => e.original_hours != null || e.original_hours_logged != null);
+  const showOriginal = isOriginal && (hasOriginalEntry || summaryRowOriginalTotal != null);
+  const entryHours = (entry) => (showOriginal ? entry.original_hours ?? entry.original_hours_logged : entry.hours);
+  const totalHours = showOriginal
+    ? detailData.original_total_hours ?? detailData.original_hours_logged ?? summaryRowOriginalTotal ?? 0
+    : detailData.total_hours ?? summaryRowTotal ?? 0;
   const workLogCount = detailData.work_log_count ?? meta.total ?? entries.length;
 
   return (
@@ -208,7 +213,6 @@ const EmployeeDetailModal = ({
           ) : (
             <>
               {(() => {
-                const hasOriginalEntry = entries.some((e) => e.original_hours != null || e.original_hours_logged != null);
                 const hasCrossBu = entries.some((e) => e.is_cross_bu);
                 return (
                   <>
@@ -221,9 +225,6 @@ const EmployeeDetailModal = ({
                           <TableHead className="text-xs font-semibold uppercase tracking-wider">Module / Task</TableHead>
                           <TableHead className="text-xs font-semibold uppercase tracking-wider">Time Slot</TableHead>
                           <TableHead className="text-xs font-semibold uppercase tracking-wider text-right">Hours</TableHead>
-                          {hasOriginalEntry && (
-                            <TableHead className="text-xs font-semibold uppercase tracking-wider text-right">Original Hours</TableHead>
-                          )}
                           <TableHead className="text-xs font-semibold uppercase tracking-wider">Type</TableHead>
                           <TableHead className="text-xs font-semibold uppercase tracking-wider">Status</TableHead>
                           {hasCrossBu && (
@@ -240,7 +241,7 @@ const EmployeeDetailModal = ({
                           const hierarchy = [entry.module, entry.hierarchy_task].filter(Boolean).join(' > ');
                           const poLabel = [entry.service_po_code, entry.service_po_name].filter(Boolean).join(' - ');
                           const projLabel = [entry.project_code, entry.project_name].filter(Boolean).join(' - ');
-                          const origHours = entry.original_hours ?? entry.original_hours_logged;
+                          const hours = entryHours(entry);
 
                           return (
                             <TableRow key={entry.work_log_id || idx} className="hover:bg-muted/30">
@@ -260,13 +261,8 @@ const EmployeeDetailModal = ({
                                 {timeSlot}
                               </TableCell>
                               <TableCell className="text-xs font-semibold text-right tabular-nums">
-                                {formatHourMinuteValue(entry.hours)}
+                                {hours != null ? formatHourMinuteValue(hours) : '—'}
                               </TableCell>
-                              {hasOriginalEntry && (
-                                <TableCell className="text-xs font-semibold text-right tabular-nums text-muted-foreground">
-                                  {origHours != null ? formatHourMinuteValue(origHours) : '—'}
-                                </TableCell>
-                              )}
                               <TableCell className="text-xs">
                                 <Badge variant="outline" className="text-[10px] uppercase tracking-wider">
                                   {entry.entry_type || 'HOURLY'}
@@ -302,19 +298,14 @@ const EmployeeDetailModal = ({
                         const hierarchy = [entry.module, entry.hierarchy_task].filter(Boolean).join(' > ');
                         const poLabel = [entry.service_po_code, entry.service_po_name].filter(Boolean).join(' - ');
                         const projLabel = [entry.project_code, entry.project_name].filter(Boolean).join(' - ');
-                        const origHours = entry.original_hours ?? entry.original_hours_logged;
+                        const hours = entryHours(entry);
 
                         return (
                           <div key={entry.work_log_id || idx} className="rounded-lg border bg-white p-3">
                             <div className="flex items-start justify-between gap-2">
                               <p className="text-xs font-medium">{formatDate(entry.date)}</p>
                               <p className="text-xs font-semibold tabular-nums">
-                                {formatHourMinuteValue(entry.hours)}h
-                                {origHours != null && (
-                                  <span className="text-muted-foreground text-[10px] ml-1">
-                                    (orig: {formatHourMinuteValue(origHours)}h)
-                                  </span>
-                                )}
+                                {hours != null ? `${formatHourMinuteValue(hours)}h` : '—'}
                               </p>
                             </div>
                             <p className="mt-1 truncate text-xs text-muted-foreground" title={poLabel}>{poLabel || '—'}</p>
@@ -383,6 +374,7 @@ const EmployeeDetailModal = ({
 };
 
 const EmployeeWorkLogHoursSummaryReport = () => {
+  const confirmExport = useExportConfirm();
   const [showFilters, setShowFilters] = useState(false);
   const [periodMode, setPeriodMode] = useState('date'); // 'date' | 'month'
   const [selectedDate, setSelectedDate] = useState(now.format('YYYY-MM-DD'));
@@ -400,12 +392,14 @@ const EmployeeWorkLogHoursSummaryReport = () => {
   const [page, setPage] = useState(1);
   const [limit, setLimit] = useState(10);
   const [exporting, setExporting] = useState(false);
+  const [hoursSource, setHoursSource] = useState(HOURS_ADJUSTED);
 
   // Selected row for detail modal
   const [modalState, setModalState] = useState({
     open: false,
     employeeId: null,
     summaryTotalHours: 0,
+    summaryOriginalTotalHours: null,
   });
 
   // BU-wise employee dropdown fetching
@@ -487,6 +481,11 @@ const EmployeeWorkLogHoursSummaryReport = () => {
   const records = summaryRes?.data?.records ?? [];
   const meta = summaryRes?.meta ?? {};
 
+  // The Hours basis switch only shows when the rows carry original_* data; without it the report
+  // behaves exactly as Adjusted.
+  const hasOriginal = records.some((r) => originalRowTotal(r) != null);
+  const isOriginal = hasOriginal && hoursSource === HOURS_ORIGINAL;
+
   const periodLabel = useMemo(() => {
     if (periodMode === 'date') {
       return formatDate(selectedDate, 'DD MMMM YYYY');
@@ -502,7 +501,7 @@ const EmployeeWorkLogHoursSummaryReport = () => {
       const total = meta.total > 0 ? meta.total : 1000;
       const res = await reportsApi.getEmployeeWorkLogHoursSummary({ ...queryParams, page: 1, limit: total });
       const allRecords = res?.data?.records ?? [];
-      exportToExcel(allRecords, periodLabel);
+      exportToExcel(allRecords, periodLabel, isOriginal);
     } finally {
       setExporting(false);
     }
@@ -513,6 +512,7 @@ const EmployeeWorkLogHoursSummaryReport = () => {
     entityIds.length > 0,
     companyIds.length > 0,
     selectedEmployeeIds.length > 0,
+    hoursSource !== HOURS_ADJUSTED,
   ].filter(Boolean).length;
 
   const handleSortingChange = (updater) => {
@@ -529,6 +529,7 @@ const EmployeeWorkLogHoursSummaryReport = () => {
     setCompanyIds([]);
     setSelectedEmployeeIds([]);
     setSearchInput('');
+    setHoursSource(HOURS_ADJUSTED);
     setSorting([{ id: 'employee_name', desc: false }]);
     setPage(1);
   };
@@ -538,6 +539,7 @@ const EmployeeWorkLogHoursSummaryReport = () => {
       open: true,
       employeeId: emp.employee_id,
       summaryTotalHours: emp.total_hours,
+      summaryOriginalTotalHours: originalRowTotal(emp) ?? null,
     });
   };
 
@@ -572,42 +574,27 @@ const EmployeeWorkLogHoursSummaryReport = () => {
           </span>
         ),
       }),
-      columnHelper.accessor('total_hours', {
+      // Server-sorted: the column id stays `total_hours` on both bases — the API has no known
+      // original-hours sort key.
+      columnHelper.accessor((row) => (isOriginal ? originalRowTotal(row) : row.total_hours), {
+        id: 'total_hours',
         header: 'Total Hours',
         meta: { align: 'right' },
         size: 140,
-        cell: (info) => (
-          <span className="text-right text-xs font-semibold tabular-nums block text-foreground">
-            {formatHoursMinutes(info.getValue())}
-          </span>
-        ),
+        cell: (info) => {
+          const val = info.getValue();
+          if (isOriginal && (val == null || val === '')) {
+            return <span className="text-right text-xs text-muted-foreground block">—</span>;
+          }
+          return (
+            <span className="text-right text-xs font-semibold tabular-nums block text-foreground">
+              {formatHoursMinutes(val)}
+            </span>
+          );
+        },
       }),
-      ...(records.some((r) => r.original_hours_logged != null || r.original_total_hours != null)
-        ? [
-            columnHelper.accessor(
-              (row) => row.original_hours_logged ?? row.original_total_hours,
-              {
-                id: 'original_total_hours',
-                header: 'Original Total Hours',
-                meta: { align: 'right' },
-                size: 150,
-                cell: (info) => {
-                  const val = info.getValue();
-                  if (val == null || val === '') {
-                    return <span className="text-right text-xs text-muted-foreground block">—</span>;
-                  }
-                  return (
-                    <span className="text-right text-xs font-semibold tabular-nums block text-muted-foreground">
-                      {formatHoursMinutes(val)}
-                    </span>
-                  );
-                },
-              }
-            ),
-          ]
-        : []),
     ],
-    [periodMode, periodLabel, records]
+    [periodMode, periodLabel, isOriginal]
   );
 
   return (
@@ -635,7 +622,7 @@ const EmployeeWorkLogHoursSummaryReport = () => {
               <Button
                 variant="outline"
                 size="toolbar"
-                onClick={handleExport}
+                onClick={() => confirmExport(handleExport)}
                 disabled={exporting}
               >
                 <Download className="h-4 w-4" /> {exporting ? 'Exporting…' : 'Export Excel'}
@@ -704,6 +691,14 @@ const EmployeeWorkLogHoursSummaryReport = () => {
             />
           )}
         </div>
+
+        {hasOriginal && (
+          <HoursBasisToggle
+            value={hoursSource}
+            onChange={(v) => { setHoursSource(v); setPage(1); }}
+            labelClassName={FILTER_LABEL}
+          />
+        )}
 
         <EntityFilter
           multiple
@@ -788,6 +783,8 @@ const EmployeeWorkLogHoursSummaryReport = () => {
         companyIds={companyIds}
         periodLabel={periodLabel}
         summaryRowTotal={modalState.summaryTotalHours}
+        summaryRowOriginalTotal={modalState.summaryOriginalTotalHours}
+        isOriginal={isOriginal}
       />
     </div>
   );

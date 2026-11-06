@@ -27,6 +27,10 @@ import { ROUTES } from '@/constants/routes';
 export const FORM_NAMES = {
   DASHBOARD: 'Dashboard',
   AI_INSIGHTS: 'AI Insights',
+  // Not in FORM_ROUTE_CONFIG on purpose — the floating chatbot has no page/sidebar item. Kept here
+  // only so useHasForm() can gate it per role via Role Form Mapping (needs a Form Master row named
+  // exactly this).
+  AI_COPILOT: 'AI Copilot',
   EMPLOYEES: 'Employee Master',
   ROLES: 'Roles',
   FORMS: 'Forms',
@@ -200,6 +204,12 @@ export const FORM_NAMES = {
   // the route below uses allowIfNoFormsMapped so it still works by direct link before then, same
   // as REPORT_PROJECT_TIMESHEET above.
   REPORT_TEAM_LEAD_EMPLOYEE_PROJECT_HOURS: 'Team Lead Employee Project Hours',
+  // Guessed name, same caveat as REPORT_TEAM_LEAD_EMPLOYEE_PROJECT_HOURS above — must match the
+  // Form Master row exactly and be mapped to the same roles as that report (backend gates both on
+  // manager.view_mapped_employees). allowIfNoFormsMapped keeps the direct link working until then.
+  REPORT_TEAM_LEAD_EMPLOYEE_PO_HOURS: 'Team Lead Employee PO Hours',
+  REPORT_BU_ADMIN_EMPLOYEE_PO_HOURS: 'BU Employee PO Hours',
+  REPORT_PROJECT_MANAGER_EMPLOYEE_PO_HOURS: 'Project Manager Employee PO Hours',
   // Project Manager Dashboard (net-new, backend spec 2026-09-11) — not formName-gated (see
   // ProtectedRoute's allowedRoles in routes/index.jsx, same as Team Mapping), so this entry
   // exists purely so the sidebar picks it up automatically the moment a real Form Master row
@@ -292,6 +302,9 @@ export const FORM_ROUTE_CONFIG = {
   [FORM_NAMES.REPORT_CROSS_BU_EMPLOYEE_PO_HOURS]: { to: ROUTES.REPORT_CROSS_BU_EMPLOYEE_PO_HOURS, icon: ArrowLeftRight, description: 'Employees logging hours on Service POs outside their own Business Unit, and how much of each BU’s work is covered cross-BU.' },
   [FORM_NAMES.REPORT_EMPLOYEE_ROLE_BU_MAPPING]: { to: ROUTES.REPORT_EMPLOYEE_ROLE_BU_MAPPING, icon: UserCog, description: "Each employee's assigned roles, Business Units, and Sub-BUs in one place." },
   [FORM_NAMES.REPORT_TEAM_LEAD_EMPLOYEE_PROJECT_HOURS]: { to: ROUTES.REPORT_TEAM_LEAD_EMPLOYEE_PROJECT_HOURS, icon: Users, description: 'Work-log entries of the employees mapped to you as Primary or Secondary manager.' },
+  [FORM_NAMES.REPORT_TEAM_LEAD_EMPLOYEE_PO_HOURS]: { to: ROUTES.REPORT_TEAM_LEAD_EMPLOYEE_PO_HOURS, icon: Table2, description: 'Hours per Service PO for each employee mapped to you, as an employee × PO matrix.' },
+  [FORM_NAMES.REPORT_BU_ADMIN_EMPLOYEE_PO_HOURS]: { to: ROUTES.REPORT_BU_ADMIN_EMPLOYEE_PO_HOURS, icon: Table2, description: 'Hours per Service PO for employees in the Business Units you can access, as an employee × PO matrix.' },
+  [FORM_NAMES.REPORT_PROJECT_MANAGER_EMPLOYEE_PO_HOURS]: { to: ROUTES.REPORT_PROJECT_MANAGER_EMPLOYEE_PO_HOURS, icon: Table2, description: 'Hours per Service PO for employees on your managed Service POs, as an employee × PO matrix.' },
   // RBAC form name stays "Project Manager Dashboard" (must match the backend Form Master
   // record); `label` only shortens what the sidebar displays, same short "Dashboard" every
   // other role's landing page uses.

@@ -3,7 +3,6 @@ import * as XLSX from 'xlsx';
 import { createColumnHelper } from '@tanstack/react-table';
 import { Download } from 'lucide-react';
 import { useResourceMonthlyUtilization } from '@/hooks/useReports';
-import { useCanViewOriginalData } from '@/hooks/usePermissions';
 import { reportsApi } from '@/api/reports.api';
 import { extractReportRows } from '@/utils/reportEnvelope';
 import { useDebounce } from '@/hooks/useDebounce';
@@ -12,12 +11,14 @@ import { useActiveClients } from '@/hooks/useClients';
 import { useActiveServicePOs } from '@/hooks/useServicePOs';
 import DataTable from '@/components/common/DataTable';
 import PageHeader from '@/components/common/PageHeader';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import EmptyState from '@/components/common/EmptyState';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
 import SearchInput from '@/components/common/SearchInput';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { MultiSelect } from '@/components/ui/multi-select';
@@ -43,7 +44,20 @@ const UtilizationPercentCell = ({ value }) => {
   return <span className="tabular-nums">{Number(value).toFixed(2)}%</span>;
 };
 
-const columns = [
+// One value per metric, chosen by the Hours basis switch — never Adjusted and Original side by
+// side. In Original mode, read the `original*` twin (falling back to the plain field, which the
+// API may already have filled with original values).
+const ORIGINAL_FIELD = {
+  billableHours: 'originalBillableHours',
+  nonBillableHours: 'originalNonBillableHours',
+  totalHours: 'originalTotalHours',
+  billableUtilizationPercentage: 'originalBillableUtilizationPercentage',
+  nonBillableUtilizationPercentage: 'originalNonBillableUtilizationPercentage',
+  overallUtilizationPercentage: 'originalOverallUtilizationPercentage',
+};
+const pickBasis = (obj, field, isOriginal) => (isOriginal ? (obj?.[ORIGINAL_FIELD[field]] ?? obj?.[field]) : obj?.[field]);
+
+const buildColumns = (isOriginal) => [
   columnHelper.accessor('employeeName', {
     id: 'employeeName',
     header: 'Employee',
@@ -64,87 +78,45 @@ const columns = [
     size: 110,
     cell: (info) => <span className="whitespace-nowrap">{info.getValue()}</span>,
   }),
-  columnHelper.accessor('billableHours', {
+  columnHelper.accessor((row) => pickBasis(row, 'billableHours', isOriginal), {
     id: 'billableHours',
     header: 'Billable (hrs)',
     size: 140,
     meta: { align: 'right' },
     cell: (info) => <span className="tabular-nums">{formatHours2(info.getValue())}</span>,
   }),
-  columnHelper.accessor('originalBillableHours', {
-    id: 'originalBillableHours',
-    header: 'Original Billable (hrs)',
-    size: 170,
-    meta: { align: 'right' },
-    cell: (info) => <span className="tabular-nums">{formatHours2(info.getValue())}</span>,
-  }),
-  columnHelper.accessor('nonBillableHours', {
+  columnHelper.accessor((row) => pickBasis(row, 'nonBillableHours', isOriginal), {
     id: 'nonBillableHours',
     header: 'Non-Billable (hrs)',
     size: 160,
     meta: { align: 'right' },
     cell: (info) => <span className="tabular-nums">{formatHours2(info.getValue())}</span>,
   }),
-  columnHelper.accessor('originalNonBillableHours', {
-    id: 'originalNonBillableHours',
-    header: 'Original Non-Billable (hrs)',
-    size: 190,
-    meta: { align: 'right' },
-    cell: (info) => <span className="tabular-nums">{formatHours2(info.getValue())}</span>,
-  }),
-  columnHelper.accessor('totalHours', {
+  columnHelper.accessor((row) => pickBasis(row, 'totalHours', isOriginal), {
     id: 'totalHours',
     header: 'Total Hours',
     size: 130,
     meta: { align: 'right' },
     cell: (info) => <span className="tabular-nums font-medium">{formatHours2(info.getValue())}</span>,
   }),
-  columnHelper.accessor('originalTotalHours', {
-    id: 'originalTotalHours',
-    header: 'Original Total Hours',
-    size: 160,
-    meta: { align: 'right' },
-    cell: (info) => <span className="tabular-nums font-medium">{formatHours2(info.getValue())}</span>,
-  }),
-  columnHelper.accessor('billableUtilizationPercentage', {
+  columnHelper.accessor((row) => pickBasis(row, 'billableUtilizationPercentage', isOriginal), {
     id: 'billableUtilizationPercentage',
     header: 'Billable Utilisation %',
     size: 170,
     meta: { align: 'right' },
     cell: (info) => <UtilizationPercentCell value={info.getValue()} />,
   }),
-  columnHelper.accessor('originalBillableUtilizationPercentage', {
-    id: 'originalBillableUtilizationPercentage',
-    header: 'Original Billable Utilisation %',
-    size: 220,
-    meta: { align: 'right' },
-    cell: (info) => <UtilizationPercentCell value={info.getValue()} />,
-  }),
-  columnHelper.accessor('nonBillableUtilizationPercentage', {
+  columnHelper.accessor((row) => pickBasis(row, 'nonBillableUtilizationPercentage', isOriginal), {
     id: 'nonBillableUtilizationPercentage',
     header: 'Non-Billable Utilisation %',
     size: 190,
     meta: { align: 'right' },
     cell: (info) => <UtilizationPercentCell value={info.getValue()} />,
   }),
-  columnHelper.accessor('originalNonBillableUtilizationPercentage', {
-    id: 'originalNonBillableUtilizationPercentage',
-    header: 'Original Non-Billable Utilisation %',
-    size: 240,
-    meta: { align: 'right' },
-    cell: (info) => <UtilizationPercentCell value={info.getValue()} />,
-  }),
-  columnHelper.accessor('overallUtilizationPercentage', {
+  columnHelper.accessor((row) => pickBasis(row, 'overallUtilizationPercentage', isOriginal), {
     id: 'overallUtilizationPercentage',
     header: 'Overall Utilisation %',
     size: 170,
-    meta: { align: 'right' },
-    cell: (info) => <UtilizationPercentCell value={info.getValue()} />,
-  }),
-  columnHelper.accessor('originalOverallUtilizationPercentage', {
-    id: 'originalOverallUtilizationPercentage',
-    header: 'Original Overall Utilisation %',
-    size: 220,
     meta: { align: 'right' },
     cell: (info) => <UtilizationPercentCell value={info.getValue()} />,
   }),
@@ -162,51 +134,34 @@ const SummaryItem = ({ label, value }) => (
 // EmployeeUtilizationSummary's "export every matching record, not just the current page" pattern
 // (one extra request with a wide `limit`) since this endpoint is server-paginated the same way.
 const exportToExcel = (rows, isOriginalMode = false) => {
-  // In Original mode the API already returns original values in the normal fields,
-  // so no extra "Original ..." columns are needed — they'd duplicate the same numbers.
-  const hasOriginal = !isOriginalMode && rows.some(
-    (r) =>
-      r.originalBillableHours != null ||
-      r.originalNonBillableHours != null ||
-      r.originalTotalHours != null ||
-      r.originalBillableUtilizationPercentage != null ||
-      r.originalNonBillableUtilizationPercentage != null ||
-      r.originalOverallUtilizationPercentage != null
-  );
+  // Only the active hours basis is exported — one column per metric.
+  const suffix = isOriginalMode ? ' (Original)' : '';
+  const num = (r, field) => {
+    const v = pickBasis(r, field, isOriginalMode);
+    return v != null ? Number(v) : '';
+  };
 
   const header = [
     'Employee',
     'Employee Code',
     'Month',
-    'Billable (hrs)',
-    ...(hasOriginal ? ['Original Billable (hrs)'] : []),
-    'Non-Billable (hrs)',
-    ...(hasOriginal ? ['Original Non-Billable (hrs)'] : []),
-    'Total Hours',
-    ...(hasOriginal ? ['Original Total Hours'] : []),
-    'Billable Utilisation %',
-    ...(hasOriginal ? ['Original Billable Utilisation %'] : []),
-    'Non-Billable Utilisation %',
-    ...(hasOriginal ? ['Original Non-Billable Utilisation %'] : []),
-    'Overall Utilisation %',
-    ...(hasOriginal ? ['Original Overall Utilisation %'] : []),
+    `Billable (hrs)${suffix}`,
+    `Non-Billable (hrs)${suffix}`,
+    `Total Hours${suffix}`,
+    `Billable Utilisation %${suffix}`,
+    `Non-Billable Utilisation %${suffix}`,
+    `Overall Utilisation %${suffix}`,
   ];
   const dataRows = rows.map((r) => [
     r.employeeName ?? '',
     r.employeeCode ?? '',
     shortMonthLabel(r.month, r.year),
-    r.billableHours != null ? Number(r.billableHours) : '',
-    ...(hasOriginal ? [r.originalBillableHours != null ? Number(r.originalBillableHours) : ''] : []),
-    r.nonBillableHours != null ? Number(r.nonBillableHours) : '',
-    ...(hasOriginal ? [r.originalNonBillableHours != null ? Number(r.originalNonBillableHours) : ''] : []),
-    r.totalHours != null ? Number(r.totalHours) : '',
-    ...(hasOriginal ? [r.originalTotalHours != null ? Number(r.originalTotalHours) : ''] : []),
-    r.billableUtilizationPercentage != null ? Number(r.billableUtilizationPercentage) : '',
-    ...(hasOriginal ? [r.originalBillableUtilizationPercentage != null ? Number(r.originalBillableUtilizationPercentage) : ''] : []),
-    r.nonBillableUtilizationPercentage != null ? Number(r.nonBillableUtilizationPercentage) : '',
-    ...(hasOriginal ? [r.originalNonBillableUtilizationPercentage != null ? Number(r.originalNonBillableUtilizationPercentage) : ''] : []),
-    r.overallUtilizationPercentage != null ? Number(r.overallUtilizationPercentage) : '',
-    ...(hasOriginal ? [r.originalOverallUtilizationPercentage != null ? Number(r.originalOverallUtilizationPercentage) : ''] : []),
+    num(r, 'billableHours'),
+    num(r, 'nonBillableHours'),
+    num(r, 'totalHours'),
+    num(r, 'billableUtilizationPercentage'),
+    num(r, 'nonBillableUtilizationPercentage'),
+    num(r, 'overallUtilizationPercentage'),
   ]);
   const ws = XLSX.utils.aoa_to_sheet([header, ...dataRows]);
   const wb = XLSX.utils.book_new();
@@ -228,6 +183,7 @@ const exportToExcel = (rows, isOriginalMode = false) => {
 // the real figures), and labeled "This Page's Totals" rather than "Total (all pages)" so it's
 // never mistaken for a grand total the way IRT/PM-wise Utilization's own Total row is.
 const ResourceMonthlyUtilization = () => {
+  const confirmExport = useExportConfirm();
   const [monthYear, setMonthYear] = useState({ month: now.getMonth() + 1, year: now.getFullYear() });
   const [employeeIds, setEmployeeIds] = useState([]);
   const [clientIds, setClientIds] = useState([]);
@@ -242,12 +198,8 @@ const ResourceMonthlyUtilization = () => {
   const [page, setPage] = useState(1);
   const [limit, setLimit] = useState(10);
   const [exporting, setExporting] = useState(false);
-  const canViewOriginal = useCanViewOriginalData();
   const [hoursSource, setHoursSource] = useState('M');
 
-  useEffect(() => {
-    if (!canViewOriginal) setHoursSource('M');
-  }, [canViewOriginal]);
 
   const debouncedSearch = useDebounce(search, 400);
   const scope = useMemo(() => ({ entityIds, businessUnitIds: buIds }), [entityIds, buIds]);
@@ -286,33 +238,8 @@ const ResourceMonthlyUtilization = () => {
   const summary = data?.data?.summary ?? null;
   const showLoading = periodReady && isPending;
 
-  const hasOriginal = useMemo(
-    () =>
-      records.some(
-        (r) =>
-          r.originalBillableHours != null ||
-          r.originalNonBillableHours != null ||
-          r.originalTotalHours != null ||
-          r.originalBillableUtilizationPercentage != null ||
-          r.originalNonBillableUtilizationPercentage != null ||
-          r.originalOverallUtilizationPercentage != null
-      ),
-    [records]
-  );
-
-  const visibleColumns = useMemo(() => {
-    if (!records.length) return columns;
-    return columns.filter((col) => {
-      const key = col.id || col.accessorKey;
-      if (typeof key === 'string' && key.startsWith('original')) {
-        // In Original mode the API already returns original values in the normal fields,
-        // so original* columns would just duplicate them — hide them.
-        if (hoursSource === 'O') return false;
-        return records.some((r) => r[key] != null);
-      }
-      return true;
-    });
-  }, [records, hoursSource]);
+  const isOriginal = hoursSource === HOURS_ORIGINAL;
+  const visibleColumns = useMemo(() => buildColumns(isOriginal), [isOriginal]);
 
   // Export pulls every matching record (not just the current page) with one extra request —
   // same tradeoff EmployeeUtilizationSummary documents for its own export.
@@ -331,9 +258,11 @@ const ResourceMonthlyUtilization = () => {
     + (buIds.length > 0 ? 1 : 0)
     + (employeeIds.length > 0 ? 1 : 0)
     + (clientIds.length > 0 ? 1 : 0)
-    + (poIds.length > 0 ? 1 : 0);
+    + (poIds.length > 0 ? 1 : 0)
+    + (hoursSource !== HOURS_ADJUSTED ? 1 : 0);
 
   const clearFilters = () => {
+    setHoursSource(HOURS_ADJUSTED);
     setEntityIds([]);
     setBuIds([]);
     setEmployeeIds([]);
@@ -362,37 +291,13 @@ const ResourceMonthlyUtilization = () => {
               placeholder="Search employee name or code…"
               className="w-full sm:w-full md:w-72"
             />
-            {canViewOriginal && (
-              <div className="flex flex-col items-start gap-0.5 shrink-0">
-                <div className="flex items-center gap-0.5 p-0.5 rounded-xl bg-muted border">
-                  {[
-                    { value: 'O', label: 'Original' },
-                    { value: 'M', label: 'Adjusted' },
-                  ].map(({ value, label }) => (
-                    <button
-                      key={value}
-                      type="button"
-                      onClick={() => { setHoursSource(value); setPage(1); }}
-                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-                        hoursSource === value ? 'bg-card shadow-sm text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground hover:text-foreground'
-                      }`}
-                    >
-                      {label}
-                    </button>
-                  ))}
-                </div>
-                <span className="text-[10px] text-muted-foreground pl-1">
-                  {hoursSource === 'O' ? 'Original (as logged, before the monthly cap)' : 'Adjusted (after sync)'}
-                </span>
-              </div>
-            )}
             <FilterToggleButton
               isOpen={filtersOpen}
               onToggle={() => setFiltersOpen((p) => !p)}
               activeCount={activeFilterCount}
             />
             {records.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport} disabled={exporting}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)} disabled={exporting}>
                 <Download className="h-4 w-4" />{exporting ? 'Exporting…' : 'Export Excel'}
               </Button>
             )}
@@ -420,6 +325,8 @@ const ResourceMonthlyUtilization = () => {
             className="w-full"
           />
         </div>
+
+        <HoursBasisToggle value={hoursSource} onChange={(v) => { setHoursSource(v); setPage(1); }} labelClassName="text-xs" />
 
         <div className="flex flex-col gap-1.5">
           <Label className="text-xs">Employee</Label>
@@ -487,22 +394,12 @@ const ResourceMonthlyUtilization = () => {
             Reflects only the rows shown on this page — not a grand total across every page of results.
           </p>
           <div className="flex flex-wrap gap-x-6 gap-y-2">
-            <SummaryItem label="Billable Hrs" value={formatHours2(summary.billableHours)} />
-            <SummaryItem label="Non-Billable Hrs" value={formatHours2(summary.nonBillableHours)} />
-            <SummaryItem label="Total Hrs" value={formatHours2(summary.totalHours)} />
-            <SummaryItem label="Billable Utilisation %" value={<UtilizationPercentCell value={summary.billableUtilizationPercentage} />} />
-            <SummaryItem label="Non-Billable Utilisation %" value={<UtilizationPercentCell value={summary.nonBillableUtilizationPercentage} />} />
-            <SummaryItem label="Overall Utilisation %" value={<UtilizationPercentCell value={summary.overallUtilizationPercentage} />} />
-            {hasOriginal && hoursSource !== 'O' && (
-              <>
-                <SummaryItem label="Original Billable Hrs" value={formatHours2(summary.originalBillableHours)} />
-                <SummaryItem label="Original Non-Billable Hrs" value={formatHours2(summary.originalNonBillableHours)} />
-                <SummaryItem label="Original Total Hrs" value={formatHours2(summary.originalTotalHours)} />
-                <SummaryItem label="Original Billable Utilisation %" value={<UtilizationPercentCell value={summary.originalBillableUtilizationPercentage} />} />
-                <SummaryItem label="Original Non-Billable Utilisation %" value={<UtilizationPercentCell value={summary.originalNonBillableUtilizationPercentage} />} />
-                <SummaryItem label="Original Overall Utilisation %" value={<UtilizationPercentCell value={summary.originalOverallUtilizationPercentage} />} />
-              </>
-            )}
+            <SummaryItem label="Billable Hrs" value={formatHours2(pickBasis(summary, 'billableHours', isOriginal))} />
+            <SummaryItem label="Non-Billable Hrs" value={formatHours2(pickBasis(summary, 'nonBillableHours', isOriginal))} />
+            <SummaryItem label="Total Hrs" value={formatHours2(pickBasis(summary, 'totalHours', isOriginal))} />
+            <SummaryItem label="Billable Utilisation %" value={<UtilizationPercentCell value={pickBasis(summary, 'billableUtilizationPercentage', isOriginal)} />} />
+            <SummaryItem label="Non-Billable Utilisation %" value={<UtilizationPercentCell value={pickBasis(summary, 'nonBillableUtilizationPercentage', isOriginal)} />} />
+            <SummaryItem label="Overall Utilisation %" value={<UtilizationPercentCell value={pickBasis(summary, 'overallUtilizationPercentage', isOriginal)} />} />
           </div>
         </div>
       )}

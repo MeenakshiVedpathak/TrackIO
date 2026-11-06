@@ -78,15 +78,13 @@ const FormFields = ({ id, isEdit, isModule, formRecord, onClose }) => {
   );
 
   // Changing the Module must reset the Category selection — a category from the previous module
-  // is never valid for the new one. Skip the very first render so loading an existing form's
-  // saved module_name doesn't wipe its saved category_id.
-  const isFirstModuleRender = useRef(true);
+  // is never valid for the new one. Compares against the last-seen module rather than skipping
+  // the first run: StrictMode runs effects twice on mount, and a "first run" flag let the second
+  // run wipe an existing form's saved category_id.
+  const lastModuleName = useRef(formRecord?.module_name ?? '');
   useEffect(() => {
-    if (isModule) return;
-    if (isFirstModuleRender.current) {
-      isFirstModuleRender.current = false;
-      return;
-    }
+    if (isModule || watchedModuleName === lastModuleName.current) return;
+    lastModuleName.current = watchedModuleName;
     rhForm.setValue('category_id', 'none');
   }, [watchedModuleName, isModule, rhForm]);
 

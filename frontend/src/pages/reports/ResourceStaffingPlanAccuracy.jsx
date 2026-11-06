@@ -3,14 +3,17 @@ import * as XLSX from 'xlsx';
 import { createColumnHelper } from '@tanstack/react-table';
 import { Download, Info } from 'lucide-react';
 import { useResourceStaffingPlanAccuracy } from '@/hooks/useReports';
+import { useActiveEmployees } from '@/hooks/useEmployees';
 import { formatHours, formatPercentage } from '@/utils/formatters';
 import DataTable from '@/components/common/DataTable';
 import PageHeader from '@/components/common/PageHeader';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter from '@/components/common/EntityFilter';
 import SearchInput from '@/components/common/SearchInput';
+import HoursBasisToggle, { HOURS_ADJUSTED } from '@/components/common/HoursBasisToggle';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -47,7 +50,7 @@ const StatusBadge = ({ status }) => {
 };
 
 const exportToExcel = (rows, hoursSource) => {
-  const hoursLabel = hoursSource === 'O' ? 'Original Hours (as logged)' : 'Actual Hours (After Sync)';
+  const hoursLabel = hoursSource === 'O' ? 'Actual Hours (Original)' : 'Actual Hours';
   const header = [
     'Employee Code', 'Employee Name', 'PO Code', 'PO Name',
     'Planned Hours', hoursLabel, 'Variance', 'Variance %', 'Status',
@@ -80,6 +83,7 @@ const SummaryItem = ({ label, value }) => (
 );
 
 const ResourceStaffingPlanAccuracy = () => {
+  const confirmExport = useExportConfirm();
   const [monthYear, setMonthYear] = useState({
     month: prevMonth.getMonth() + 1,
     year: prevMonth.getFullYear(),
@@ -88,6 +92,7 @@ const ResourceStaffingPlanAccuracy = () => {
   // 'M' = Adjusted (after monthly-cap sync), 'O' = Original (as logged)
   const [hoursSource, setHoursSource] = useState('M');
   const [statusFilter, setStatusFilter] = useState([]);
+  const [employeeFilter, setEmployeeFilter] = useState([]);
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [entityIds, setEntityIds] = useState([]);
   const [buIds, setBuIds] = useState([]);
@@ -120,7 +125,21 @@ const ResourceStaffingPlanAccuracy = () => {
     buId: ALL_BUS,
     ...(entityIds.length > 0 && { entityIds: entityIds.join(',') }),
     ...(buIds.length > 0 && { businessUnitIds: buIds.join(',') }),
+    ...(employeeFilter.length > 0 && { employeeId: employeeFilter.join(',') }),
   };
+
+  // Every employee reachable in the chosen Entity/BU scope — not just the ones with rows this month.
+  // No Entity/BU picked → header-less request, i.e. all of the caller's reach (same as Employee
+  // Bench Percentage).
+  const scope = useMemo(() => ({ entityIds, businessUnitIds: buIds }), [entityIds, buIds]);
+  const { data: activeEmployees = [], isLoading: employeesLoading } = useActiveEmployees(undefined, scope);
+  const employeeOptions = useMemo(
+    () => activeEmployees.map((e) => ({
+      label: e.employee_code ? `${e.full_name} (${e.employee_code})` : e.full_name,
+      value: String(e.id),
+    })),
+    [activeEmployees],
+  );
 
   const { data, isPending } = useResourceStaffingPlanAccuracy(params);
   const records = data?.data?.records ?? [];
@@ -128,9 +147,9 @@ const ResourceStaffingPlanAccuracy = () => {
   // Map each record to the active basis (Adjusted or Original) so all downstream logic
   // (status, totals, export) is basis-agnostic — no refetch needed, both sets live in the response.
   const withBasis = useMemo(() => records.map((r) => {
-    const actual      = hoursSource === 'O' ? r.original_actual_hours : r.actual_hours;
-    const variance    = hoursSource === 'O' ? r.original_variance     : r.variance;
-    const variancePct = hoursSource === 'O' ? r.original_variance_pct : r.variance_pct;
+    const actual      = hoursSource === 'O' ? (r.original_actual_hours ?? r.actual_hours) : r.actual_hours;
+    const variance    = hoursSource === 'O' ? (r.original_variance     ?? r.variance)     : r.variance;
+    const variancePct = hoursSource === 'O' ? (r.original_variance_pct ?? r.variance_pct) : r.variance_pct;
     return {
       ...r,
       _actual:      actual,
@@ -162,7 +181,8 @@ const ResourceStaffingPlanAccuracy = () => {
     total_variance: filteredRecords.reduce((s, r) => s + (Number(r._variance) || 0), 0),
   } : null;
 
-  const hoursColHeader = hoursSource === 'O' ? 'Original Hours (as logged)' : 'Actual Hours (After Sync)';
+  // Neutral on screen, like every other report — the Filters switch shows which basis is active.
+  const hoursColHeader = 'Actual Hours';
 
   // Columns rebuilt when hoursSource changes so the hours column header updates immediately.
   const columns = useMemo(() => [
@@ -225,17 +245,19 @@ const ResourceStaffingPlanAccuracy = () => {
   const activeFilterCount = [
     entityIds.length > 0,
     buIds.length > 0,
+    employeeFilter.length > 0,
     varianceThresholdPct !== String(DEFAULT_THRESHOLD_PCT),
     statusFilter.length > 0,
-    hoursSource !== 'M',
+    hoursSource !== HOURS_ADJUSTED,
   ].filter(Boolean).length;
 
   const clearFilters = () => {
     setEntityIds([]);
     setBuIds([]);
+    setEmployeeFilter([]);
     setVarianceThresholdPct(String(DEFAULT_THRESHOLD_PCT));
     setStatusFilter([]);
-    setHoursSource('M');
+    setHoursSource(HOURS_ADJUSTED);
     setPage(1);
   };
 
@@ -259,7 +281,7 @@ const ResourceStaffingPlanAccuracy = () => {
               activeCount={activeFilterCount}
             />
             {filteredRecords.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)}>
                 <Download className="h-4 w-4" />Export Excel
               </Button>
             )}
@@ -275,9 +297,25 @@ const ResourceStaffingPlanAccuracy = () => {
         showClear={activeFilterCount > 0}
         onClose={() => setFiltersOpen(false)}
       >
-        <EntityFilter multiple value={entityIds} onChange={(v) => { setEntityIds(v); setBuIds([]); }} />
+        {/* Changing Entity/BU changes which employees are reachable, so a picked employee may no
+            longer be in scope — reset the Employee filter rather than silently showing nothing. */}
+        <EntityFilter multiple value={entityIds} onChange={(v) => { setEntityIds(v); setBuIds([]); setEmployeeFilter([]); }} />
 
-        <BusinessUnitFilter multiple value={buIds} entityId={entityIds} onChange={setBuIds} />
+        <BusinessUnitFilter multiple value={buIds} entityId={entityIds} onChange={(v) => { setBuIds(v); setEmployeeFilter([]); }} />
+
+        <div className="flex flex-col gap-1.5">
+          <Label className="text-xs font-medium">Employee</Label>
+          <MultiSelect
+            options={employeeOptions}
+            value={employeeFilter}
+            onValueChange={(v) => { setEmployeeFilter(v); setPage(1); }}
+            placeholder="All Employees"
+            searchPlaceholder="Search employee..."
+            emptyMessage="No employees found."
+            loading={employeesLoading}
+            className="h-[clamp(1.875rem,2vw,2.25rem)] w-full text-[clamp(0.75rem,0.85vw,0.875rem)]"
+          />
+        </div>
 
         <div className="flex flex-col gap-1.5">
           <Label className="text-xs font-medium">Month &amp; Year <span className="text-destructive">*</span></Label>
@@ -289,42 +327,7 @@ const ResourceStaffingPlanAccuracy = () => {
           />
         </div>
 
-        <div className="flex flex-col gap-1.5">
-          <div className="flex items-center gap-1">
-            <Label className="text-xs font-medium">Hours basis</Label>
-            <TooltipProvider delayDuration={200}>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Info className="h-3 w-3 text-muted-foreground cursor-help shrink-0" />
-                </TooltipTrigger>
-                <TooltipContent side="top" className="max-w-[220px] text-xs">
-                  {hoursSource === 'O'
-                    ? 'Original (as logged, before the monthly cap)'
-                    : 'Adjusted (after sync)'}
-                </TooltipContent>
-              </Tooltip>
-            </TooltipProvider>
-          </div>
-          <div className="flex items-center gap-0.5 p-0.5 rounded-lg bg-muted border w-fit">
-            {[
-              { value: 'M', label: 'Adjusted' },
-              { value: 'O', label: 'Original' },
-            ].map(({ value, label }) => (
-              <button
-                key={value}
-                type="button"
-                onClick={() => { setHoursSource(value); setPage(1); }}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-                  hoursSource === value
-                    ? 'bg-card shadow-sm text-emerald-600 dark:text-emerald-400'
-                    : 'text-muted-foreground hover:text-foreground'
-                }`}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-        </div>
+        <HoursBasisToggle value={hoursSource} onChange={(v) => { setHoursSource(v); setPage(1); }} />
 
         <div className="flex flex-col gap-1.5">
           <div className="flex items-center gap-1">

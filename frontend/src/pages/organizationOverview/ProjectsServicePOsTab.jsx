@@ -19,6 +19,7 @@ import {
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
 import EmptyState from '@/components/common/EmptyState';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { useNotification } from '@/hooks/useNotification';
 import { useCompanies } from '@/hooks/useCompanies';
 import ServicePOHierarchyNode from './components/ServicePOHierarchyNode';
@@ -55,6 +56,7 @@ const toExportRows = (rows, buRootNameById, subBuNameById) => rows.map((r) => ({
 // hierarchy, built from the backend's own parent_id-linked `hierarchy` array — never recreated
 // or re-derived on the frontend.
 const ProjectsServicePOsTab = ({ servicePOs, search, isLoading, toolbarSlot }) => {
+  const confirmExport = useExportConfirm();
   const roots = servicePOs;
   const { success, error: showError } = useNotification();
 
@@ -185,11 +187,11 @@ const ProjectsServicePOsTab = ({ servicePOs, search, isLoading, toolbarSlot }) =
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
-              <DropdownMenuItem onClick={handleExportExcel} className="cursor-pointer">
+              <DropdownMenuItem onClick={() => confirmExport(handleExportExcel)} className="cursor-pointer">
                 <FileSpreadsheet className="mr-2 h-4 w-4 text-green-600" />
                 Excel
               </DropdownMenuItem>
-              <DropdownMenuItem onClick={handleExportPDF} className="cursor-pointer">
+              <DropdownMenuItem onClick={() => confirmExport(handleExportPDF)} className="cursor-pointer">
                 <FileText className="mr-2 h-4 w-4 text-red-500" />
                 PDF
               </DropdownMenuItem>

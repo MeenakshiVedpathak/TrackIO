@@ -12,6 +12,8 @@ import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFil
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
 import DataTable from '@/components/common/DataTable';
 import SearchInput from '@/components/common/SearchInput';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { MonthYearPicker } from '@/components/ui/month-year-picker';
@@ -23,10 +25,16 @@ const columnHelper = createColumnHelper();
 // and paginated client-side from there.
 const MAX_RECORDS_FETCH = 5000;
 
-const exportToExcel = (rows) => {
+// One Avg Utilization % per row, picked by the Hours basis switch — Adjusted and Original are never
+// shown side by side.
+const getAvgUtilization = (row, hoursSource) =>
+  hoursSource === HOURS_ORIGINAL ? (row.original_avg_utilization_pct ?? row.avg_utilization_pct) : row.avg_utilization_pct;
+
+const exportToExcel = (rows, hoursSource) => {
   const header = [
     'Company Code', 'Company Name', 'Entity ID', 'Active Employees', 'Active POs',
-    'Total Invoiced', 'Total Delivery Cost', 'Total Margin', 'Avg Utilization %', 'Original Avg Utilization %',
+    'Total Invoiced', 'Total Delivery Cost', 'Total Margin',
+    hoursSource === HOURS_ORIGINAL ? 'Avg Utilization % (Original)' : 'Avg Utilization %',
   ];
   const dataRows = rows.map((r) => [
     r.company_code ?? '',
@@ -37,8 +45,7 @@ const exportToExcel = (rows) => {
     r.total_invoiced != null ? Number(r.total_invoiced) : '',
     r.total_delivery_cost != null ? Number(r.total_delivery_cost) : '',
     r.total_margin != null ? Number(r.total_margin) : '',
-    r.avg_utilization_pct != null ? Number(r.avg_utilization_pct) : '',
-    r.original_avg_utilization_pct != null ? Number(r.original_avg_utilization_pct) : '',
+    getAvgUtilization(r, hoursSource) != null ? Number(getAvgUtilization(r, hoursSource)) : '',
   ]);
   const ws = XLSX.utils.aoa_to_sheet([header, ...dataRows]);
   const wb = XLSX.utils.book_new();
@@ -59,7 +66,7 @@ const MarginCell = ({ value }) => {
   );
 };
 
-const columns = [
+const getColumns = (hoursSource) => [
   columnHelper.accessor('company_code', {
     header: 'Company Code',
     size: 150,
@@ -104,22 +111,14 @@ const columns = [
     size: 160,
     cell: (info) => <MarginCell value={info.getValue()} />,
   }),
-  columnHelper.accessor('avg_utilization_pct', {
+  columnHelper.accessor((row) => getAvgUtilization(row, hoursSource), {
+    id: 'avg_utilization_pct',
     header: 'Avg Utilization %',
     size: 150,
     cell: (info) => {
       const value = info.getValue();
       if (value == null || value === '') return <span className="text-muted-foreground">—</span>;
       return <span className="tabular-nums">{formatPercentage(Number(value))}</span>;
-    },
-  }),
-  columnHelper.accessor('original_avg_utilization_pct', {
-    header: 'Original Avg Utilization %',
-    size: 170,
-    cell: (info) => {
-      const value = info.getValue();
-      if (value == null || value === '') return null;
-      return <span className="tabular-nums text-muted-foreground">{formatPercentage(Number(value))}</span>;
     },
   }),
 ];
@@ -134,6 +133,7 @@ const SummaryItem = ({ label, value, negative = false }) => (
 );
 
 const BUPerformanceScorecard = () => {
+  const confirmExport = useExportConfirm();
   const [monthYear, setMonthYear] = useState({
     month: prevMonth.getMonth() + 1,
     year: prevMonth.getFullYear(),
@@ -144,6 +144,7 @@ const BUPerformanceScorecard = () => {
   const [buIds, setBuIds] = useState([]);
   const [page, setPage] = useState(1);
   const [limit, setLimit] = useState(10);
+  const [hoursSource, setHoursSource] = useState(HOURS_ADJUSTED);
 
   // NOT `buId` — unlike every other report, this endpoint doesn't go through
   // authenticateMultiBU/resolveReportCompanyScope (it's scoped to the caller's
@@ -156,6 +157,8 @@ const BUPerformanceScorecard = () => {
   // caller's own req.entityIds (authorization), not a query filter, so the Entity
   // control here only narrows which BUs the BU dropdown below it offers.
   const params = {
+    // Original basis: the server then sorts, ranks and totals on original hours too.
+    ...(hoursSource === HOURS_ORIGINAL && { hoursSource: 'O' }),
     ...(monthYear && { month: monthYear.month, year: monthYear.year }),
     page: 1,
     limit: MAX_RECORDS_FETCH,
@@ -191,7 +194,12 @@ const BUPerformanceScorecard = () => {
 
   // Already have the full matching set in memory — no need for a second network round-trip.
   // Exports what the search actually leaves on screen, not the unfiltered set.
-  const handleExport = () => exportToExcel(filteredRecords);
+  const handleExport = () => exportToExcel(filteredRecords, hoursSource);
+
+  const columns = useMemo(() => getColumns(hoursSource), [hoursSource]);
+
+  const activeFilterCount = (entityIds.length > 0 ? 1 : 0) + (buIds.length > 0 ? 1 : 0)
+    + (hoursSource !== HOURS_ADJUSTED ? 1 : 0);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -208,10 +216,10 @@ const BUPerformanceScorecard = () => {
             <FilterToggleButton
               isOpen={filtersOpen}
               onToggle={() => setFiltersOpen((p) => !p)}
-              activeCount={(entityIds.length > 0 ? 1 : 0) + (buIds.length > 0 ? 1 : 0)}
+              activeCount={activeFilterCount}
             />
             {!errorMessage && filteredRecords.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)}>
                 <Download className="h-4 w-4" />Export Excel
               </Button>
             )}
@@ -223,8 +231,8 @@ const BUPerformanceScorecard = () => {
       <FilterPanel
         isOpen={filtersOpen}
         maxHeightClass="max-h-[300px]"
-        onClear={() => { setEntityIds([]); setBuIds([]); }}
-        showClear={entityIds.length > 0 || buIds.length > 0}
+        onClear={() => { setEntityIds([]); setBuIds([]); setHoursSource(HOURS_ADJUSTED); setPage(1); }}
+        showClear={activeFilterCount > 0}
       >
         <EntityFilter multiple value={entityIds} onChange={(v) => { setEntityIds(v); setBuIds([]); }} />
 
@@ -240,6 +248,8 @@ const BUPerformanceScorecard = () => {
             className="w-full"
           />
         </div>
+
+        <HoursBasisToggle value={hoursSource} onChange={(v) => { setHoursSource(v); setPage(1); }} labelClassName="text-xs" />
       </FilterPanel>
 
       {errorMessage && (

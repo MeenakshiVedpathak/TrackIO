@@ -3,11 +3,13 @@ import { AlertTriangle, Download, Search, X } from 'lucide-react';
 import { useTimesheetImportById } from '@/hooks/useTimesheets';
 import { useIsMobile } from '@/hooks/useMediaQuery';
 import { formatDate, formatMonthYear } from '@/utils/formatters';
+import { PreviewEmployee, previewEmployeeCode, previewEmployeeName, previewEmployeeSearchFields } from '@/utils/timesheetPreview';
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
 } from '@/components/ui/dialog';
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription } from '@/components/ui/sheet';
 import { Button } from '@/components/ui/button';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Skeleton } from '@/components/ui/skeleton';
 import { cn } from '@/utils/cn';
 
@@ -23,17 +25,18 @@ const applySearch = (errors, q) => {
   const lower = q.toLowerCase();
   return errors.filter(
     (e) =>
-      (e.row_data?.resourceName ?? '').toLowerCase().includes(lower) ||
+      previewEmployeeSearchFields(e.row_data).some((v) => (v ?? '').toLowerCase().includes(lower)) ||
       (e.row_data?.servicePOName ?? '').toLowerCase().includes(lower) ||
       (e.error_message ?? '').toLowerCase().includes(lower),
   );
 };
 
 const downloadCsv = (errors, importId) => {
-  const header = ['Row #', 'Employee', 'Service PO', 'Sub-project', 'Date', 'Hours', 'Reason'];
+  const header = ['Row #', 'Employee', 'Employee Code', 'Service PO', 'Sub-project', 'Date', 'Hours', 'Reason'];
   const rows = errors.map((e) => [
     e.row_number ?? '',
-    e.row_data?.resourceName ?? '',
+    e.row_data ? previewEmployeeName(e.row_data) : '',
+    previewEmployeeCode(e.row_data) ?? '',
     e.row_data?.servicePOName ?? '',
     e.row_data?.subProject ?? '',
     e.row_data?.date ?? '',
@@ -100,7 +103,7 @@ const FailedRowsTable = ({ errors }) => (
         return (
           <tr key={e.id ?? idx} className="hover:bg-muted/30 align-top">
             <td className="px-3 py-2 font-mono tabular-nums">{e.row_number ?? idx + 1}</td>
-            <td className="px-3 py-2 max-w-[120px] truncate" title={e.row_data?.resourceName}>{e.row_data?.resourceName ?? '—'}</td>
+            <td className="px-3 py-2 max-w-[160px]"><PreviewEmployee row={e.row_data} /></td>
             <td className="px-3 py-2 max-w-[140px] truncate" title={e.row_data?.servicePOName}>{e.row_data?.servicePOName ?? '—'}</td>
             <td className="px-3 py-2 max-w-[100px] truncate" title={e.row_data?.subProject}>{e.row_data?.subProject ?? '—'}</td>
             <td className="px-3 py-2 whitespace-nowrap">{e.row_data?.date ? formatDate(e.row_data.date) : '—'}</td>
@@ -128,7 +131,7 @@ const FailedRowCard = ({ entry, idx }) => {
         <p className="font-mono text-[10px] text-muted-foreground">Row {entry.row_number ?? idx + 1}</p>
         <p className="tabular-nums text-xs font-semibold">{entry.row_data?.hours != null ? `${entry.row_data.hours}h` : ''}</p>
       </div>
-      <p className="text-sm font-medium">{entry.row_data?.resourceName ?? '—'}</p>
+      <PreviewEmployee row={entry.row_data} className="text-sm" />
       <p className="text-xs text-muted-foreground truncate">{entry.row_data?.servicePOName ?? '—'}</p>
       {entry.row_data?.date && (
         <p className="text-xs text-muted-foreground">{formatDate(entry.row_data.date)}</p>
@@ -148,6 +151,7 @@ const FOOTER_HINT =
 // ── Main content (shared between Dialog and Sheet) ────────────────────────────
 
 const FailureContent = ({ importId, isMobile }) => {
+  const confirmExport = useExportConfirm();
   const [search, setSearch] = useState('');
 
   const { data: detail, isLoading, isError } = useTimesheetImportById(importId, {
@@ -243,7 +247,7 @@ const FailureContent = ({ importId, isMobile }) => {
                 variant="outline"
                 size="sm"
                 className="h-8 shrink-0 gap-1.5"
-                onClick={() => downloadCsv(filteredErrors, importId)}
+                onClick={() => confirmExport(() => downloadCsv(filteredErrors, importId))}
                 disabled={filteredErrors.length === 0}
               >
                 <Download className="h-3.5 w-3.5" />

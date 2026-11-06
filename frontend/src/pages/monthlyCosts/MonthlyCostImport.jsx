@@ -18,6 +18,7 @@ import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import PageHeader from '@/components/common/PageHeader';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 
 // ---------------------------------------------------------------------------
 // Column name aliases — maps header spellings to canonical field names
@@ -124,6 +125,7 @@ const validateRow = (row, index) => {
 const MONTH_LABELS = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 const MonthlyCostImport = () => {
+  const confirmExport = useExportConfirm();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const { success, error: showError } = useNotification();
@@ -601,7 +603,7 @@ const MonthlyCostImport = () => {
               There were errors in your file. Please check the file format and try again.
             </p>
             <div className="mt-3 flex w-full max-w-xs flex-col gap-2">
-              <Button variant="outline" className="w-full text-destructive hover:text-destructive" onClick={handleDownloadErrorReport}>
+              <Button variant="outline" className="w-full text-destructive hover:text-destructive" onClick={() => confirmExport(handleDownloadErrorReport)}>
                 <Download className="mr-1.5 h-4 w-4" /> Download Error Report
               </Button>
               <Button className="w-full" onClick={handleImport} disabled={importMutation.isPending}>

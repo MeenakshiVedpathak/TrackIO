@@ -19,6 +19,7 @@ import PageHeader from '@/components/common/PageHeader';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
 import SearchInput from '@/components/common/SearchInput';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { SearchableSelect } from '@/components/ui/searchable-select';
@@ -66,6 +67,7 @@ const monthYearToRange = ({ month, year }) => {
 // id is confirmed to belong to a mapped employee — unknown ids are silently ignored so a stale
 // link can't leave the page in a broken state.
 const ManagerTimesheetApproval = () => {
+  const confirmExport = useExportConfirm();
   const navigate = useNavigate();
   const isMobile = useIsMobile();
   // "Check Pending & Remind" leads to the compliance report's reminder-sending flow, so it's a
@@ -424,7 +426,7 @@ const ManagerTimesheetApproval = () => {
               activeCount={activeFilterCount}
             />
             {!isWeekendTab && employeeList.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport} disabled={isExporting}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)} disabled={isExporting}>
                 <Download className="mr-1.5 h-4 w-4" />
                 {isExporting ? 'Exporting…' : 'Export Excel'}
               </Button>
@@ -493,7 +495,7 @@ const ManagerTimesheetApproval = () => {
             activeCount={activeFilterCount}
           />
           {!isWeekendTab && employeeList.length > 0 && (
-            <Button variant="outline" size="toolbar" onClick={handleExport} disabled={isExporting}>
+            <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)} disabled={isExporting}>
               <Download className="mr-1.5 h-4 w-4" />
               {isExporting ? 'Exporting…' : 'Export'}
             </Button>

@@ -9,6 +9,7 @@ import { formatFileSize } from '@/utils/formatters';
 import { cn } from '@/utils/cn';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import { Badge } from '@/components/ui/badge';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 
@@ -64,6 +65,7 @@ const downloadSkippedRows = (skipped) => {
 // the same value selected at the top of the screen (see TeamLeadFillWorkLog.jsx), passed down as
 // props so both modes always act on the same period.
 const TeamLeadFillWorkLogBulkUpload = ({ monthYear, monthLabel }) => {
+  const confirmExport = useExportConfirm();
   const { error: showError, success: showSuccess, warning: showWarning } = useNotification();
   const [selectedFile, setSelectedFile] = useState(null);
   const [result, setResult] = useState(null);
@@ -337,7 +339,7 @@ const TeamLeadFillWorkLogBulkUpload = ({ monthYear, monthLabel }) => {
                   </div>
                 </CardContent>
                 <CardContent className="flex justify-end pt-0">
-                  <Button variant="outline" size="sm" onClick={() => downloadSkippedRows(skipped)}>
+                  <Button variant="outline" size="sm" onClick={() => confirmExport(() => downloadSkippedRows(skipped))}>
                     <Download className="mr-1.5 h-3.5 w-3.5" /> Download skipped rows
                   </Button>
                 </CardContent>

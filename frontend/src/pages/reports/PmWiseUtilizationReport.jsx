@@ -9,6 +9,8 @@ import { formatNumber, formatHours } from '@/utils/formatters';
 import { UtilizationCell } from '@/components/reports/UtilizationCell';
 import DataTable from '@/components/common/DataTable';
 import PageHeader from '@/components/common/PageHeader';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
 import EmptyState from '@/components/common/EmptyState';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
@@ -40,7 +42,13 @@ const PERIOD_MODES = [
   { value: 'range', label: 'Date Range' },
 ];
 
+// Logged hours and Utilization % each carry an `original_*` twin (hours as logged, before the
+// monthly-cap sync); the "Hours basis" switch picks which one the table/totals/export show.
+const basisValue = (r, key, isOriginal) => (isOriginal ? r[`original_${key}`] : r[key]);
+
 // Server-side sort keys the endpoint accepts (GET /reports/pm-wise-utilization?sortBy=...).
+// No original_* sort key is known, so the hours/utilization headers keep sorting by the
+// adjusted values even when the Original basis is shown.
 const SORTABLE = {
   PM_NAME: 'pm_name',
   RESOURCE_COUNT: 'resource_count',
@@ -67,7 +75,7 @@ const SortableHeader = ({ label, column, sortBy, sortOrder, onSort, align }) => 
 
 // enableSorting is false throughout: sorting is the SERVER's (sortBy/sortOrder) via the header
 // buttons above, so TanStack must not also reorder the page it was handed.
-const getColumns = (sortBy, sortOrder, onSort) => [
+const getColumns = (sortBy, sortOrder, onSort, isOriginal) => [
   columnHelper.accessor('project_manager_name', {
     header: () => <SortableHeader label="PM Name" column={SORTABLE.PM_NAME} sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} />,
     size: 220,
@@ -94,23 +102,13 @@ const getColumns = (sortBy, sortOrder, onSort) => [
     enableSorting: false,
     cell: (info) => <span className="tabular-nums">{formatNumber(info.getValue())}</span>,
   }),
-  columnHelper.accessor('total_logged_hours', {
+  columnHelper.accessor((row) => basisValue(row, 'total_logged_hours', isOriginal), {
+    id: 'total_logged_hours',
     header: () => <SortableHeader label="Total Logged Hrs" column={SORTABLE.LOGGED_HOURS} sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} align="right" />,
     size: 160,
     meta: { align: 'right' },
     enableSorting: false,
     cell: (info) => <span className="tabular-nums">{formatHours(info.getValue())}</span>,
-  }),
-  columnHelper.accessor('original_total_logged_hours', {
-    header: 'Original Total Logged Hrs',
-    size: 180,
-    meta: { align: 'right' },
-    enableSorting: false,
-    cell: (info) => {
-      const value = info.getValue();
-      if (value == null || value === '') return null;
-      return <span className="tabular-nums text-muted-foreground">{formatHours(value)}</span>;
-    },
   }),
   columnHelper.accessor('total_available_hours', {
     header: () => <SortableHeader label="Total Available Hrs" column={SORTABLE.AVAILABLE_HOURS} sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} align="right" />,
@@ -119,7 +117,8 @@ const getColumns = (sortBy, sortOrder, onSort) => [
     enableSorting: false,
     cell: (info) => <span className="tabular-nums">{formatHours(info.getValue())}</span>,
   }),
-  columnHelper.accessor('utilization_pct', {
+  columnHelper.accessor((row) => basisValue(row, 'utilization_pct', isOriginal), {
+    id: 'utilization_pct',
     header: () => <SortableHeader label="Utilization %" column={SORTABLE.UTILIZATION} sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} align="right" />,
     size: 150,
     meta: { align: 'right' },
@@ -130,20 +129,9 @@ const getColumns = (sortBy, sortOrder, onSort) => [
         <UtilizationCell
           utilizationPct={info.getValue()}
           totalAvailableHours={row.total_available_hours}
-          totalLoggedHours={row.total_logged_hours}
+          totalLoggedHours={basisValue(row, 'total_logged_hours', isOriginal)}
         />
       );
-    },
-  }),
-  columnHelper.accessor('original_utilization_pct', {
-    header: 'Original Utilization %',
-    size: 170,
-    meta: { align: 'right' },
-    enableSorting: false,
-    cell: (info) => {
-      const value = info.getValue();
-      if (value == null || value === '') return null;
-      return <span className="tabular-nums text-muted-foreground">{Number(value).toFixed(2)}%</span>;
     },
   }),
 ];
@@ -157,18 +145,21 @@ const SummaryItem = ({ label, value }) => (
 
 // Exports the current page only — this report is server-paginated, so the rest of the result
 // set is not in memory (same tradeoff ResourceUtilizationTrend documents for its own export).
-const exportToExcel = (rows) => {
-  const header = ['PM Name', 'PM Code', 'No. of Resources', 'No. of Projects', 'Total Logged Hrs', 'Total Available Hrs', 'Utilization %'];
+const exportToExcel = (rows, isOriginal) => {
+  const sfx = isOriginal ? ' (Original)' : '';
+  const num = (r, key) => {
+    const v = basisValue(r, key, isOriginal);
+    return v != null ? Number(v) : '';
+  };
+  const header = ['PM Name', 'PM Code', 'No. of Resources', 'No. of Projects', `Total Logged Hrs${sfx}`, 'Total Available Hrs', `Utilization %${sfx}`];
   const dataRows = rows.map((r) => [
     r.project_manager_name ?? '',
     r.project_manager_code ?? '',
     r.resource_count != null ? Number(r.resource_count) : '',
     r.project_count != null ? Number(r.project_count) : '',
-    r.total_logged_hours != null ? Number(r.total_logged_hours) : '',
-    r.original_total_logged_hours != null ? Number(r.original_total_logged_hours) : '',
+    num(r, 'total_logged_hours'),
     r.total_available_hours != null ? Number(r.total_available_hours) : '',
-    r.utilization_pct != null ? Number(r.utilization_pct) : '',
-    r.original_utilization_pct != null ? Number(r.original_utilization_pct) : '',
+    num(r, 'utilization_pct'),
   ]);
   const ws = XLSX.utils.aoa_to_sheet([header, ...dataRows]);
   const wb = XLSX.utils.book_new();
@@ -183,6 +174,7 @@ const exportToExcel = (rows) => {
 // carries the grand total across the full filtered set, not just the current page, so there's
 // nothing to recompute client-side for the Total row.
 const PmWiseUtilizationReport = () => {
+  const confirmExport = useExportConfirm();
   // "Date Range" mode's from/to default to a trailing 6-month window; "Month" mode's single
   // picker defaults to the current month. Whichever mode is active always has a fully-populated
   // value (neither MonthYearPicker nor MonthRangePicker below is clearable), so the request is
@@ -203,6 +195,7 @@ const PmWiseUtilizationReport = () => {
   const [limit, setLimit] = useState(10);
   const [sortBy, setSortBy] = useState(SORTABLE.UTILIZATION);
   const [sortOrder, setSortOrder] = useState('DESC');
+  const [hoursSource, setHoursSource] = useState(HOURS_ADJUSTED);
 
   const debouncedSearch = useDebounce(search, 400);
 
@@ -211,6 +204,8 @@ const PmWiseUtilizationReport = () => {
     : !!(fromMonthYear?.month && fromMonthYear?.year && toMonthYear?.month && toMonthYear?.year);
 
   const params = {
+    // Original basis: the server then sorts, ranks and totals on original hours too.
+    ...(hoursSource === HOURS_ORIGINAL && { hoursSource: 'O' }),
     ...(periodMode === 'month'
       ? { month: monthYear.month, year: monthYear.year }
       : { startMonth: fromMonthYear.month, startYear: fromMonthYear.year, endMonth: toMonthYear.month, endYear: toMonthYear.year }),
@@ -240,7 +235,13 @@ const PmWiseUtilizationReport = () => {
   const summary = data?.data?.summary ?? null;
   const showLoading = periodReady && isPending;
 
-  const activeFilterCount = (entityIds.length > 0 ? 1 : 0) + (buIds.length > 0 ? 1 : 0);
+  // Without any original_* data in the response the report behaves exactly as Adjusted.
+  const hasOriginal = records.some((r) => r.original_total_logged_hours != null || r.original_utilization_pct != null)
+    || summary?.original_total_logged_hours != null || summary?.original_utilization_pct != null;
+  const isOriginal = hasOriginal && hoursSource === HOURS_ORIGINAL;
+
+  const activeFilterCount = (entityIds.length > 0 ? 1 : 0) + (buIds.length > 0 ? 1 : 0)
+    + (hoursSource !== HOURS_ADJUSTED ? 1 : 0);
 
   const handleSort = (column) => {
     if (sortBy === column) {
@@ -252,10 +253,10 @@ const PmWiseUtilizationReport = () => {
     setPage(1);
   };
 
-  const columns = getColumns(sortBy, sortOrder, handleSort);
+  const columns = getColumns(sortBy, sortOrder, handleSort, isOriginal);
 
   // Exports the current page only — see exportToExcel's comment above.
-  const handleExport = () => exportToExcel(records);
+  const handleExport = () => exportToExcel(records, isOriginal);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -270,7 +271,7 @@ const PmWiseUtilizationReport = () => {
               className="w-full sm:w-full md:w-72"
             />
             {records.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport} className="order-2 md:order-none">
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)} className="order-2 md:order-none">
                 <Download className="h-4 w-4" />Export Excel
               </Button>
             )}
@@ -287,7 +288,7 @@ const PmWiseUtilizationReport = () => {
       <FilterPanel
         isOpen={filtersOpen}
         maxHeightClass="max-h-[300px]"
-        onClear={() => { setEntityIds([]); setBuIds([]); setPage(1); }}
+        onClear={() => { setEntityIds([]); setBuIds([]); setHoursSource(HOURS_ADJUSTED); setPage(1); }}
         showClear={activeFilterCount > 0}
       >
         <EntityFilter multiple value={entityIds} onChange={(v) => { setEntityIds(v); setBuIds([]); setPage(1); }} />
@@ -329,6 +330,12 @@ const PmWiseUtilizationReport = () => {
             />
           )}
         </div>
+
+        <HoursBasisToggle
+          value={hoursSource}
+          onChange={(v) => { setHoursSource(v); setPage(1); }}
+          labelClassName="text-xs"
+        />
       </FilterPanel>
 
       <DataTable
@@ -352,27 +359,18 @@ const PmWiseUtilizationReport = () => {
           <div className="flex flex-wrap gap-x-6 gap-y-2">
             <SummaryItem label="No. of Resources" value={formatNumber(summary.total_resource_count)} />
             <SummaryItem label="No. of Projects" value={formatNumber(summary.total_project_count)} />
-            <SummaryItem label="Total Logged Hrs" value={formatHours(summary.total_logged_hours)} />
-            {summary.original_total_logged_hours != null && <SummaryItem label="Original Total Logged Hrs" value={formatHours(summary.original_total_logged_hours)} />}
+            <SummaryItem label="Total Logged Hrs" value={formatHours(basisValue(summary, 'total_logged_hours', isOriginal))} />
             <SummaryItem label="Total Available Hrs" value={formatHours(summary.total_available_hours)} />
             <SummaryItem
               label="Utilization %"
               value={(
                 <UtilizationCell
-                  utilizationPct={summary.utilization_pct}
+                  utilizationPct={basisValue(summary, 'utilization_pct', isOriginal)}
                   totalAvailableHours={summary.total_available_hours}
-                  totalLoggedHours={summary.total_logged_hours}
+                  totalLoggedHours={basisValue(summary, 'total_logged_hours', isOriginal)}
                 />
               )}
             />
-            {summary.original_utilization_pct != null && (
-              <SummaryItem
-                label="Original Utilization %"
-                value={(
-                  <span className="tabular-nums">{Number(summary.original_utilization_pct).toFixed(2)}%</span>
-                )}
-              />
-            )}
           </div>
         </div>
       )}

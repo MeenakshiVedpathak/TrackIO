@@ -4,7 +4,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import {
   Clock, DollarSign, TrendingUp, TrendingDown, Users, Building2, Briefcase,
   BarChart2, RefreshCw, X, ChevronLeft, ChevronRight, CalendarDays, AlertCircle,
-  Activity, Zap, Award, Calendar, IndianRupee, CalendarOff, Sparkles, ShieldAlert,
+  Activity, Zap, Award, Calendar, CalendarOff, Sparkles, ShieldAlert,
   Landmark, CalendarRange,
 } from 'lucide-react';
 import { ROUTES } from '@/constants/routes';
@@ -20,8 +20,6 @@ import { useSelectableBusinessUnits } from '@/hooks/useSelectableBusinessUnits';
 import { useSelectableEntities } from '@/hooks/useSelectableEntities';
 import MonthlyHoursTrendChart from '@/components/charts/MonthlyHoursTrendChart';
 import MonthlyUtilizationTrendChart from '@/components/charts/MonthlyUtilizationTrendChart';
-import CostTrendChart from '@/components/charts/CostTrendChart';
-import CostByTypeDonut from '@/components/charts/CostByTypeDonut';
 import LeaveHoursTrendChart from '@/components/charts/LeaveHoursTrendChart';
 import NoWorkTrendChart from '@/components/charts/NoWorkTrendChart';
 import HoursByClientChart from '@/components/charts/HoursByClientChart';
@@ -112,13 +110,6 @@ const KPI_CONFIG = [
     hexOuter: '#fde68a', hexInner: '#d97706',
     bar: 'bg-amber-500', iconBg: 'bg-amber-50 dark:bg-amber-950/40', iconColor: 'text-amber-500',
     fmt: (v) => cNum(v),
-  },
-  {
-    key: 'total_po_value_current_year', title: 'PO Value', icon: TrendingUp,
-    hexOuter: '#bbf7d0', hexInner: '#16a34a',
-    bar: 'bg-green-500', iconBg: 'bg-green-50 dark:bg-green-950/40', iconColor: 'text-green-600',
-    fmt: (v) => formatCurrency(v, 'INR', 0),
-    fmtFull: (v) => formatCurrency(v),
   },
   {
     key: 'total_hours', title: 'Total Hrs', icon: Clock,
@@ -357,8 +348,8 @@ const Dashboard = () => {
   }, [canViewOriginal]);
   const [billablePage, setBillablePage]       = useState(1);
   const [billablePageQ, setBillablePageQ]     = useState(1);
-  const [billableSortBy, setBillableSortBy]   = useState('nonBillable');
-  const [billableSortByQ, setBillableSortByQ] = useState('nonBillable');
+  const [billableSortBy, setBillableSortBy]   = useState('billable');
+  const [billableSortByQ, setBillableSortByQ] = useState('billable');
   const [topPOFilter, setTopPOFilter]         = useState('billable');
   const [filtersOpen, setFiltersOpen]         = useState(false);
   // Filter mode: 'quarter' | 'month' | 'quarter_range' | 'month_range' | 'date_range'
@@ -577,7 +568,6 @@ const Dashboard = () => {
     active_employees: Number(analyticsData?.workforce?.total_employees ?? 0),
     active_clients: Number(analyticsData?.portfolio?.total_clients ?? 0),
     active_service_pos: Number(analyticsData?.portfolio?.active_pos ?? 0),
-    total_po_value_current_year: Number(analyticsData?.financials?.total_po_value_fiscal_year ?? 0),
   }), [tiles, analyticsData]);
 
   // For quarter mode, client-side filter to the selected quarter; for all other modes the backend
@@ -597,10 +587,6 @@ const Dashboard = () => {
     return raw.filter((d) => (QUARTER_MONTHS[q] ?? []).includes(MONTH_ABBR[d.month?.split('-')[0]]));
   };
 
-  const costTrendData = useMemo(
-    () => filterMode === 'quarter' ? filterByQuarterLabel(analytics2Data?.cost_trend_by_type ?? [], quarter) : (analytics2Data?.cost_trend_by_type ?? []),
-    [analytics2Data?.cost_trend_by_type, filterMode, quarter],
-  );
   const costTrendLeaveData = useMemo(
     () => filterMode === 'quarter' ? filterByQuarterLabel(analytics2Data?.leave_hours_trend ?? [], quarter) : (analytics2Data?.leave_hours_trend ?? []),
     [analytics2Data?.leave_hours_trend, filterMode, quarter],
@@ -964,40 +950,23 @@ const Dashboard = () => {
             />
 
             {canViewAIInsights && (
-              <motion.button
+              <button
+                type="button"
                 onClick={() => navigate(ROUTES.AI_INSIGHTS)}
-                whileHover={{ scale: 1.05 }}
-                whileTap={{ scale: 0.96 }}
-                animate={{
-                  boxShadow: [
-                    '0 2px 10px 0 rgba(124,58,237,0.25)',
-                    '0 4px 20px 2px rgba(37,99,235,0.35)',
-                    '0 2px 10px 0 rgba(124,58,237,0.25)',
-                  ],
-                }}
-                transition={{ duration: 2.4, repeat: Infinity, ease: 'easeInOut' }}
-                className="group h-[clamp(1.625rem,1.7vw,1.875rem)] pl-[clamp(0.2rem,0.4vw,0.3rem)] pr-[clamp(0.2rem,0.4vw,0.3rem)] hover:pr-3 rounded-xl inline-flex items-center gap-0 hover:gap-1.5 text-[clamp(0.5rem,0.6vw,0.6875rem)] font-extrabold text-white border border-white/20 transition-all duration-300"
-                style={{ background: 'linear-gradient(135deg, #8b5cf6, #6d28d9 45%, #2563eb)' }}
+                aria-label="Open AI Insights"
+                title="AI Insights"
+                className="group relative inline-flex h-[clamp(1.625rem,1.7vw,1.875rem)] shrink-0 items-center overflow-hidden rounded-xl bg-gradient-to-r from-violet-600 via-indigo-600 to-blue-600 px-[clamp(0.4rem,0.6vw,0.65rem)] text-[clamp(0.625rem,0.7vw,0.75rem)] font-semibold text-white shadow-sm shadow-violet-500/25 ring-1 ring-inset ring-white/20 transition-all duration-200 hover:shadow-md hover:shadow-violet-500/40 hover:brightness-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400 focus-visible:ring-offset-2 active:scale-[0.97] motion-reduce:transition-none"
               >
-                <span className="relative h-[clamp(1rem,1.3vw,1.25rem)] w-[clamp(1rem,1.3vw,1.25rem)] shrink-0">
-                  <motion.span
-                    className="absolute inset-0 rounded-lg"
-                    style={{ background: 'conic-gradient(from 0deg, #fff 0deg, transparent 100deg, transparent 260deg, #fff 360deg)' }}
-                    animate={{ rotate: 360 }}
-                    transition={{ duration: 4, repeat: Infinity, ease: 'linear' }}
-                  />
-                  <span className="absolute inset-[1.5px] rounded-[7px] bg-white flex items-center justify-center">
-                    <motion.span
-                      className="inline-flex"
-                      animate={{ scale: [1, 1.18, 1] }}
-                      transition={{ duration: 2.2, repeat: Infinity, ease: 'easeInOut' }}
-                    >
-                      <Sparkles className="h-[clamp(0.625rem,0.8vw,0.875rem)] w-[clamp(0.625rem,0.8vw,0.875rem)] text-violet-600" />
-                    </motion.span>
-                  </span>
+                {/* one-shot shine sweep on hover — no perpetual animation */}
+                <span
+                  aria-hidden="true"
+                  className="pointer-events-none absolute inset-0 -translate-x-full bg-gradient-to-r from-transparent via-white/30 to-transparent transition-transform duration-700 group-hover:translate-x-full motion-reduce:hidden"
+                />
+                <Sparkles className="relative h-[clamp(0.75rem,0.95vw,1rem)] w-[clamp(0.75rem,0.95vw,1rem)] shrink-0" aria-hidden="true" />
+                <span className="relative max-w-0 overflow-hidden whitespace-nowrap opacity-0 transition-all duration-300 group-hover:ml-[clamp(0.25rem,0.4vw,0.375rem)] group-hover:max-w-[7rem] group-hover:opacity-100 group-focus-visible:ml-[clamp(0.25rem,0.4vw,0.375rem)] group-focus-visible:max-w-[7rem] group-focus-visible:opacity-100 motion-reduce:transition-none">
+                  AI Insights
                 </span>
-                <span className="max-w-0 group-hover:max-w-[90px] overflow-hidden whitespace-nowrap opacity-0 group-hover:opacity-100 transition-all duration-300">AI Insights</span>
-              </motion.button>
+              </button>
             )}
 
             <Button
@@ -1171,7 +1140,7 @@ const Dashboard = () => {
           variants={containerVariants}
           initial="hidden"
           animate="show"
-          className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2"
+          className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2"
         >
           {KPI_CONFIG.map((cfg) => (
             <KpiCard key={cfg.key} cfg={cfg} value={mergedTiles[cfg.key]} isLoading={isAnalyticsPending} />
@@ -1365,7 +1334,7 @@ const Dashboard = () => {
               variants={containerVariants}
               initial="hidden"
               animate="show"
-              className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2"
+              className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2"
             >
               {KPI_CONFIG.map((cfg) => (
                 <KpiCard key={cfg.key} cfg={cfg} value={mergedTiles[cfg.key]} isLoading={isAnalyticsPending} />
@@ -1397,19 +1366,6 @@ const Dashboard = () => {
               </motion.div>
               <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3, delay: 0.15 }}>
                 <MonthlyUtilizationTrendChart data={analytics2Data?.monthly_resource_utilization ?? []} isLoading={isAnalyticsPending} />
-              </motion.div>
-            </div>
-          </section>
-
-          {/* ── Cost Trend by Type ────────────────────────────────────────── */}
-          <section>
-            <SectionLabel icon={IndianRupee} title="Cost Trend by Service Category" />
-            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-              <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3, delay: 0.1 }}>
-                <CostTrendChart data={costTrendData} isLoading={isAnalyticsPending} periodLabel={periodLabel ?? new Date(bottomMonthYear.year, bottomMonthYear.month - 1).toLocaleString('en-IN', { month: 'long', year: 'numeric' })} />
-              </motion.div>
-              <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3, delay: 0.15 }}>
-                <CostByTypeDonut data={costTrendData} isLoading={isAnalyticsPending} periodLabel={periodLabel ?? new Date(bottomMonthYear.year, bottomMonthYear.month - 1).toLocaleString('en-IN', { month: 'long', year: 'numeric' })} />
               </motion.div>
             </div>
           </section>

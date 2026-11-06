@@ -7,12 +7,14 @@ import { useActiveClients } from '@/hooks/useClients';
 import { formatCurrency, formatHours, formatPercentage } from '@/utils/formatters';
 import DataTable from '@/components/common/DataTable';
 import PageHeader from '@/components/common/PageHeader';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import StatusBadge from '@/components/common/StatusBadge';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
 import SearchInput from '@/components/common/SearchInput';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { MultiSelect } from '@/components/ui/multi-select';
@@ -25,10 +27,12 @@ const columnHelper = createColumnHelper();
 // paginated client-side from there.
 const MAX_RECORDS_FETCH = 5000;
 
-const exportToExcel = (rows) => {
+// Rows arrive already mapped to the active hours basis (see `records` below).
+const exportToExcel = (rows, hoursSource) => {
+  const sfx = hoursSource === HOURS_ORIGINAL ? ' (Original)' : '';
   const header = [
     'PO Code', 'PO Name', 'Client', 'Service Type', 'Category', 'Status',
-    'Hours Delivered', 'Original Hrs Delivered', 'Invoiced Amount', 'Delivery Cost', 'Margin', 'Shortfall',
+    `Hours Delivered${sfx}`, 'Invoiced Amount', 'Delivery Cost', 'Margin', 'Shortfall',
   ];
   const dataRows = rows.map((r) => [
     r.service_po_code ?? '',
@@ -38,7 +42,6 @@ const exportToExcel = (rows) => {
     r.service_category_name ?? '',
     r.status ?? '',
     r.hours_delivered != null ? Number(r.hours_delivered) : '',
-    r.original_hours_delivered != null ? Number(r.original_hours_delivered) : '',
     r.invoiced_amount != null ? Number(r.invoiced_amount) : '',
     r.delivery_cost != null ? Number(r.delivery_cost) : '',
     r.margin != null ? Number(r.margin) : '',
@@ -95,14 +98,6 @@ const columns = [
     size: 150,
     cell: (info) => <span className="tabular-nums">{formatHours(info.getValue())}</span>,
   }),
-  columnHelper.accessor('original_hours_delivered', {
-    header: 'Original Hrs Delivered',
-    size: 160,
-    cell: (info) => {
-      const value = info.getValue();
-      return <span className="tabular-nums text-muted-foreground">{value != null ? formatHours(value) : '—'}</span>;
-    },
-  }),
   columnHelper.accessor('invoiced_amount', {
     header: 'Invoiced Amount',
     size: 160,
@@ -149,6 +144,7 @@ const SummaryItem = ({ label, value, negative = false }) => (
 );
 
 const ServicePOProfitability = () => {
+  const confirmExport = useExportConfirm();
   const [monthYear, setMonthYear] = useState({
     month: prevMonth.getMonth() + 1,
     year: prevMonth.getFullYear(),
@@ -161,12 +157,16 @@ const ServicePOProfitability = () => {
   const [entityIds, setEntityIds] = useState([]);
   const [buIds, setBuIds] = useState([]);
   const [page, setPage] = useState(1);
-  const [limit, setLimit] = useState(10);  const scope = useMemo(() => ({ entityIds, businessUnitIds: buIds }), [entityIds, buIds]);
+  const [limit, setLimit] = useState(10);
+  const [hoursSource, setHoursSource] = useState(HOURS_ADJUSTED);
+  const scope = useMemo(() => ({ entityIds, businessUnitIds: buIds }), [entityIds, buIds]);
 
 
   const { data: activeClients = [] } = useActiveClients(scope);
 
   const params = {
+    // Original basis: the server then sorts, ranks and totals on original hours too.
+    ...(hoursSource === HOURS_ORIGINAL && { hoursSource: 'O' }),
     ...(monthYear && { month: monthYear.month, year: monthYear.year }),
     ...(clientId.length > 0 && { clientId: clientId.join(',') }),
     page: 1,
@@ -178,7 +178,18 @@ const ServicePOProfitability = () => {
 
   const { data, isPending } = useServicePOProfitability(params);
 
-  const records = data?.data?.records ?? [];
+  // Hours basis: when 'Original' is selected, hours_delivered is swapped for its original twin
+  // (falling back to the adjusted value when the API didn't send one), so the table, mobile cards,
+  // client-side Totals and export all read the one key whichever basis is active.
+  const rawRecords = data?.data?.records;
+  const records = useMemo(
+    () => (rawRecords ?? []).map((r) => (
+      hoursSource === HOURS_ORIGINAL
+        ? { ...r, hours_delivered: r.original_hours_delivered ?? r.hours_delivered }
+        : r
+    )),
+    [rawRecords, hoursSource]
+  );
 
   // Service Type / Category options come from the fetched rows themselves rather than the
   // service-type & category masters: the records only carry the display names (service_type,
@@ -225,13 +236,11 @@ const ServicePOProfitability = () => {
     const total_delivery_cost = filteredRecords.reduce((sum, r) => sum + (Number(r.delivery_cost) || 0), 0);
     const total_margin = filteredRecords.reduce((sum, r) => sum + (Number(r.margin) || 0), 0);
     const total_hours_delivered = filteredRecords.reduce((sum, r) => sum + (Number(r.hours_delivered) || 0), 0);
-    const original_total_hours_delivered = filteredRecords.reduce((sum, r) => sum + (Number(r.original_hours_delivered) || 0), 0);
     return {
       total_invoiced_amount,
       total_delivery_cost,
       total_margin,
       total_hours_delivered,
-      original_total_hours_delivered,
       // Derived ratio, not a per-row average — recomputed from the summed totals.
       overall_margin_pct: total_invoiced_amount !== 0 ? (total_margin / total_invoiced_amount) * 100 : null,
     };
@@ -243,6 +252,7 @@ const ServicePOProfitability = () => {
     clientId.length > 0,
     serviceType.length > 0,
     serviceCategory.length > 0,
+    hoursSource !== HOURS_ADJUSTED,
   ].filter(Boolean).length;
 
   const clearFilters = () => {
@@ -251,6 +261,7 @@ const ServicePOProfitability = () => {
     setClientId([]);
     setServiceType([]);
     setServiceCategory([]);
+    setHoursSource(HOURS_ADJUSTED);
     setPage(1);
   };
 
@@ -264,7 +275,7 @@ const ServicePOProfitability = () => {
 
   // Already have the full matching set in memory — no need for a second network round-trip.
   // Exports what the filters and search actually leave on screen, not the unfiltered set.
-  const handleExport = () => exportToExcel(filteredRecords);
+  const handleExport = () => exportToExcel(filteredRecords, hoursSource);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -284,7 +295,7 @@ const ServicePOProfitability = () => {
               activeCount={activeFilterCount}
             />
             {filteredRecords.length > 0 && (
-              <Button variant="outline" size="toolbar" onClick={handleExport}>
+              <Button variant="outline" size="toolbar" onClick={() => confirmExport(handleExport)}>
                 <Download className="h-4 w-4" />Export Excel
               </Button>
             )}
@@ -313,6 +324,8 @@ const ServicePOProfitability = () => {
             className="w-full"
           />
         </div>
+
+        <HoursBasisToggle value={hoursSource} onChange={(v) => { setHoursSource(v); setPage(1); }} labelClassName="text-xs" />
 
         <div className="flex flex-col gap-1.5">
           <Label className="text-xs">Client</Label>
@@ -369,7 +382,6 @@ const ServicePOProfitability = () => {
           <p className="mb-2.5 text-xs font-semibold text-muted-foreground uppercase tracking-wide">Totals</p>
           <div className="flex flex-wrap gap-x-6 gap-y-2">
             <SummaryItem label="Total Hours Delivered" value={formatHours(summary.total_hours_delivered)} />
-            <SummaryItem label="Original Total Hrs Delivered" value={formatHours(summary.original_total_hours_delivered)} />
             <SummaryItem label="Total Invoiced" value={formatCurrency(summary.total_invoiced_amount)} />
             <SummaryItem label="Total Delivery Cost" value={formatCurrency(summary.total_delivery_cost)} />
             <SummaryItem

@@ -18,6 +18,7 @@ import { useNotification } from '@/hooks/useNotification';
 import { extractApiError } from '@/services/apiClient';
 import { formatDate, formatHoursMinutes } from '@/utils/formatters';
 import { buildMonthlySummaryRows, buildDayEntries, validateDayEntries } from '@/utils/employeeMonthlySummary';
+import { lockedHoursForDay, isApprovedConflict } from '@/utils/approvedWorkLog';
 import TimesheetCalendar from '@/components/employee/TimesheetCalendar';
 import MonthlyHoursCard from '@/components/employee/MonthlyHoursCard';
 import MonthSelector from '@/components/employee/MonthSelector';
@@ -69,6 +70,10 @@ const EmployeeTimesheet = () => {
   const [isMonthlyDeleting, setIsMonthlyDeleting] = useState(false);
   const [confirmSaveOpen, setConfirmSaveOpen] = useState(false);
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+  // "YYYY-M" keys of months the backend has told us contain approved logs (a 409 on save/delete) —
+  // the monthly GET may not flag them itself, so this keeps "Clear All" off for the rest of the
+  // session instead of inviting the same refused call again.
+  const [approvedMonthKeys, setApprovedMonthKeys] = useState(() => new Set());
 
   const { success, error: showError } = useNotification();
   const qc = useQueryClient();
@@ -185,7 +190,9 @@ const EmployeeTimesheet = () => {
     // untouched row here is resent using its current aggregate hours — see
     // utils/employeeTimeEntry.js for the fuller discussion of this fidelity limit.
     const entries = buildDayEntries(rows, day, edits, descriptions);
-    const validationError = validateDayEntries(entries, selectedKey, DAILY_HOURS_CAP);
+    // `entries` already omits every approved line (buildDayEntries) — a payload naming a PO that
+    // has an approved log that day 409s — but those hours still count towards the daily cap.
+    const validationError = validateDayEntries(entries, selectedKey, DAILY_HOURS_CAP, lockedHoursForDay(rows, day));
     if (validationError) {
       showError(validationError);
       return;
@@ -315,6 +322,11 @@ const EmployeeTimesheet = () => {
     setMonthlyDescriptions({});
   };
 
+  const monthKey = `${monthlyYear}-${selectedMonth}`;
+  const markMonthApproved = () => setApprovedMonthKeys((prev) => new Set(prev).add(monthKey));
+  // Approved logs anywhere in the month block "Clear All" (the backend refuses the whole delete).
+  const monthHasApproved = monthlyRows.some((r) => r.approvedByDay?.[MONTH_DAY_KEY]) || approvedMonthKeys.has(monthKey);
+
   const handleMonthlySaveConfirmed = async () => {
     const entries = buildDayEntries(monthlyRows, MONTH_DAY_KEY, monthlyEdits, monthlyDescriptions);
     setIsMonthlySaving(true);
@@ -330,7 +342,11 @@ const EmployeeTimesheet = () => {
       // GET /monthly-worklog doesn't expose a per-line sync flag yet — a synced line only
       // surfaces here as a 409 after the attempt. Refetch so the table reflects it instead of
       // leaving the user free to just hit Save again against the same stale read.
-      if (err?.response?.status === 409) qc.invalidateQueries({ queryKey: ['employee-worklog'] });
+      if (err?.response?.status === 409) {
+        if (isApprovedConflict(err)) markMonthApproved();
+        setConfirmSaveOpen(false);
+        qc.invalidateQueries({ queryKey: ['employee-worklog'] });
+      }
     } finally {
       setIsMonthlySaving(false);
     }
@@ -347,9 +363,13 @@ const EmployeeTimesheet = () => {
       qc.invalidateQueries({ queryKey: ['employee-worklog'] });
     } catch (err) {
       showError(extractApiError(err));
-      // At least one entry in this month has synced — refetch so the table reflects the current
-      // (now-unclearable) state instead of leaving stale, still-"clearable"-looking rows on screen.
-      if (err?.response?.status === 409) qc.invalidateQueries({ queryKey: ['employee-worklog'] });
+      // At least one entry in this month has synced or is approved — refetch so the table reflects
+      // the current (now-unclearable) state instead of leaving stale, still-"clearable"-looking rows.
+      if (err?.response?.status === 409) {
+        if (isApprovedConflict(err)) markMonthApproved();
+        setConfirmDeleteOpen(false);
+        qc.invalidateQueries({ queryKey: ['employee-worklog'] });
+      }
     } finally {
       setIsMonthlyDeleting(false);
     }
@@ -526,6 +546,15 @@ const EmployeeTimesheet = () => {
                 </h3>
               </div>
 
+              {monthHasApproved && (
+                <Alert variant="warning">
+                  <AlertDescription>
+                    This month has approved work logs. Approved logs are locked and can&apos;t be edited or cleared —
+                    ask your approver to revert them first. &quot;Clear All&quot; is disabled for this month.
+                  </AlertDescription>
+                </Alert>
+              )}
+
               {isMonthlyIneligible && (
                 <Alert variant="warning">
                   <AlertDescription>
@@ -560,7 +589,8 @@ const EmployeeTimesheet = () => {
                   size="sm"
                   className="text-destructive"
                   onClick={() => setConfirmDeleteOpen(true)}
-                  disabled={isMonthlyDeleting || isMonthlySaving}
+                  disabled={isMonthlyDeleting || isMonthlySaving || monthHasApproved}
+                  title={monthHasApproved ? 'This month has approved logs, so it cannot be cleared. Ask your approver to revert them first.' : undefined}
                 >
                   <Trash2 className="mr-1.5 h-4 w-4" />
                   {isMonthlyDeleting ? 'Clearing…' : 'Clear All'}

@@ -12,6 +12,7 @@ import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
 import BusinessUnitFilter, { ALL_BUS } from '@/components/common/BusinessUnitFilter';
 import EntityFilter, { ALL_ENTITIES } from '@/components/common/EntityFilter';
+import HoursBasisToggle, { HOURS_ADJUSTED, HOURS_ORIGINAL } from '@/components/common/HoursBasisToggle';
 import { Button } from '@/components/ui/button';
 import { MultiSelect } from '@/components/ui/multi-select';
 import { MonthYearPicker } from '@/components/ui/month-year-picker';
@@ -20,6 +21,7 @@ import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
 import MobilePagination from '@/components/common/MobilePagination';
+import { useExportConfirm } from '@/components/common/ExportConfirm';
 import {
   Table, TableHeader, TableBody, TableRow, TableHead, TableCell,
 } from '@/components/ui/table';
@@ -60,22 +62,19 @@ const ContributedPercentCell = ({ value }) => {
   return <span className="tabular-nums">{value}%</span>;
 };
 
+// One value per metric, chosen by the Hours basis switch — never Adjusted and Original side by
+// side. In Original mode read the original_* twin, falling back to the plain field (which the
+// API may already have filled with original values for hoursSource=O).
+const pickBasis = (obj, field, isOriginal) => (isOriginal ? (obj?.[`original_${field}`] ?? obj?.[field]) : obj?.[field]);
+const pickTypeHours = (row, serviceTypeId, isOriginal) => (
+  isOriginal ? (row?.original_hours?.[serviceTypeId] ?? row?.hours?.[serviceTypeId]) : row?.hours?.[serviceTypeId]
+);
+
 const exportToExcel = (records, columns, month, year, mode = 'M') => {
   const monthLabel = MONTH_NAMES[(month - 1)] ?? month;
-
-  // In Original mode the API already returns original values in the normal fields,
-  // so no separate "Original ..." columns are needed — they'd duplicate the same numbers.
-  const hasOriginal = mode !== 'O' && records.some(
-    (r) =>
-      r.original_billable_total != null ||
-      r.original_non_billable_total != null ||
-      r.original_total_hours != null ||
-      r.original_leaves_hours != null ||
-      r.original_total_utilization != null ||
-      r.original_utilization_percentage != null ||
-      r.original_contributed_percentage != null ||
-      (r.original_hours && Object.keys(r.original_hours).length > 0)
-  );
+  // Only the active hours basis is exported — one column per metric.
+  const isOriginal = mode === 'O';
+  const suffix = isOriginal ? ' (Original)' : '';
 
   const headerRow1 = [
     '', '', '', '', '', '', '', '', '', // 9 Fixed cols empty
@@ -87,39 +86,23 @@ const exportToExcel = (records, columns, month, year, mode = 'M') => {
 
   columns.forEach(cat => {
     headerRow1.push(cat.category_name);
-    const span = cat.service_types.length * (hasOriginal ? 2 : 1);
+    const span = cat.service_types.length;
     for (let i = 1; i < span; i++) headerRow1.push(''); // span
     cat.service_types.forEach(st => {
-      headerRow2.push(st.name);
-      if (hasOriginal) headerRow2.push(`Original ${st.name}`);
+      headerRow2.push(`${st.name}${suffix}`);
     });
   });
 
-  const summaryLen = hasOriginal ? 10 : 5;
+  const summaryLen = 5;
   headerRow1.push('Summary');
   for (let i = 1; i < summaryLen; i++) headerRow1.push('');
-  if (hasOriginal) {
-    headerRow2.push(
-      'Billable Total (hrs)',
-      'Original Billable Total (hrs)',
-      'Non-Billable Total (hrs)',
-      'Original Non-Billable Total (hrs)',
-      'Total Utilization (hrs)',
-      'Original Total Utilization (hrs)',
-      'Utilization %',
-      'Original Utilization %',
-      'Contributed %',
-      'Original Contributed %'
-    );
-  } else {
-    headerRow2.push(
-      'Billable Total (hrs)',
-      'Non-Billable Total (hrs)',
-      'Total Utilization (hrs)',
-      'Utilization %',
-      'Contributed %'
-    );
-  }
+  headerRow2.push(
+    `Billable Total (hrs)${suffix}`,
+    `Non-Billable Total (hrs)${suffix}`,
+    `Total Utilization (hrs)${suffix}`,
+    `Utilization %${suffix}`,
+    `Contributed %${suffix}`
+  );
 
   const dataRows = records.map((r, i) => {
     const row = [
@@ -136,35 +119,19 @@ const exportToExcel = (records, columns, month, year, mode = 'M') => {
 
     columns.forEach(cat => {
       cat.service_types.forEach(st => {
-        row.push(r.hours?.[st.id] ?? 0);
-        if (hasOriginal) {
-          row.push(r.original_hours?.[st.id] ?? 0);
-        }
+        row.push(pickTypeHours(r, st.id, isOriginal) ?? 0);
       });
     });
 
-    if (hasOriginal) {
-      row.push(
-        r.billable_total ?? 0,
-        r.original_billable_total ?? 0,
-        r.non_billable_total ?? 0,
-        r.original_non_billable_total ?? 0,
-        r.total_utilization ?? 0,
-        r.original_total_utilization ?? 0,
-        r.utilization_percentage != null ? `${r.utilization_percentage}%` : '',
-        r.original_utilization_percentage != null ? `${r.original_utilization_percentage}%` : '',
-        r.contributed_percentage != null ? `${r.contributed_percentage}%` : '',
-        r.original_contributed_percentage != null ? `${r.original_contributed_percentage}%` : ''
-      );
-    } else {
-      row.push(
-        r.billable_total ?? 0,
-        r.non_billable_total ?? 0,
-        r.total_utilization ?? 0,
-        r.utilization_percentage != null ? `${r.utilization_percentage}%` : '',
-        r.contributed_percentage != null ? `${r.contributed_percentage}%` : ''
-      );
-    }
+    const utilization = pickBasis(r, 'utilization_percentage', isOriginal);
+    const contributed = pickBasis(r, 'contributed_percentage', isOriginal);
+    row.push(
+      pickBasis(r, 'billable_total', isOriginal) ?? 0,
+      pickBasis(r, 'non_billable_total', isOriginal) ?? 0,
+      pickBasis(r, 'total_utilization', isOriginal) ?? 0,
+      utilization != null ? `${utilization}%` : '',
+      contributed != null ? `${contributed}%` : ''
+    );
     return row;
   });
 
@@ -174,7 +141,7 @@ const exportToExcel = (records, columns, month, year, mode = 'M') => {
   const merges = [];
   let colIndex = 9;
   columns.forEach(cat => {
-    const len = cat.service_types.length * (hasOriginal ? 2 : 1);
+    const len = cat.service_types.length;
     if (len > 1) {
       merges.push({ s: { r: 0, c: colIndex }, e: { r: 0, c: colIndex + len - 1 } });
     }
@@ -198,6 +165,7 @@ const td = (...cls) => cn(...cls);
 
 // ─── component ───────────────────────────────────────────────────────────────
 const MonthlyResourceUtilization = () => {
+  const confirmExport = useExportConfirm();
   const [monthYear, setMonthYear] = useState(() => {
     const now = new Date();
     const prevMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
@@ -340,7 +308,7 @@ const MonthlyResourceUtilization = () => {
     customerNonBillableServiceTypeIds.reduce((sum, id) => sum + (Number(r.hours?.[id]) || 0), 0);
 
   const sumCustomerNonBillableOriginal = (r) =>
-    customerNonBillableServiceTypeIds.reduce((sum, id) => sum + (Number(r.original_hours?.[id]) || 0), 0);
+    customerNonBillableServiceTypeIds.reduce((sum, id) => sum + (Number(pickTypeHours(r, id, true)) || 0), 0);
 
   const apiSummary = allData?.data?.summary ?? data?.data?.summary ?? {};
 
@@ -411,6 +379,23 @@ const MonthlyResourceUtilization = () => {
   const utilizationPercentage = data?.data?.summary?.utilization_percentage ?? allData?.data?.summary?.utilization_percentage;
   const originalUtilizationPercentage = data?.data?.summary?.original_utilization_percentage ?? allData?.data?.summary?.original_utilization_percentage;
 
+  // The single value per summary metric for the active hours basis.
+  const isOriginal = hoursSource === HOURS_ORIGINAL;
+  const shownBillableTotal = pickBasis(summary, 'billable_total', isOriginal);
+  const shownNonBillableTotal = pickBasis(summary, 'non_billable_total', isOriginal);
+  const shownCustomerNonBillableTotal = pickBasis(summary, 'customer_non_billable_total', isOriginal);
+  const shownTotalUtilization = pickBasis(summary, 'total_utilization', isOriginal);
+  const shownLeavesHours = pickBasis(summary, 'leaves_hours', isOriginal);
+  // total_hours was previously hidden outright in Original mode (the plain field isn't reliably
+  // original there), so Original mode only shows it when the original twin exists.
+  const shownTotalHours = isOriginal ? summary.original_total_hours : summary.total_hours;
+  const shownUtilizationPercentage = isOriginal
+    ? (originalUtilizationPercentage ?? utilizationPercentage ?? summary.original_utilization_percentage ?? summary.utilization_percentage)
+    : (utilizationPercentage ?? summary.utilization_percentage);
+  const shownContributedPercentage = isOriginal
+    ? (originalContributedPercentage ?? contributedPercentage)
+    : contributedPercentage;
+
   const monthLabel = monthYear ? formatMonthYear(monthYear.month, monthYear.year) : '';
 
   const handleSearchChange = (e) => { setSearch(e.target.value); setPage(1); };
@@ -453,11 +438,11 @@ const MonthlyResourceUtilization = () => {
     entityIds.length > 0 ? 1 : 0,
     buIds.length > 0 ? 1 : 0,
     // "Original" is a non-default choice, so the Filters badge counts it too.
-    hoursSource === 'O' ? 1 : 0,
+    hoursSource !== HOURS_ADJUSTED ? 1 : 0,
   ].reduce((a, b) => a + b, 0);
 
   const clearFilters = () => {
-    setHoursSource('M');
+    setHoursSource(HOURS_ADJUSTED);
     setEntityIds([]);
     setBuIds([]);
     setEmployeeIds([]);
@@ -488,7 +473,7 @@ const MonthlyResourceUtilization = () => {
               activeCount={activeFilterCount}
             />
             {records.length > 0 && (
-              <Button variant="outline" size="sm" className="h-[clamp(1.875rem,2vw,2.25rem)]" onClick={handleExport} disabled={exporting}>
+              <Button variant="outline" size="sm" className="h-[clamp(1.875rem,2vw,2.25rem)]" onClick={() => confirmExport(handleExport)} disabled={exporting}>
                 <Download className="mr-1.5 h-4 w-4" />{exporting ? 'Exporting…' : 'Export Excel'}
               </Button>
             )}
@@ -511,29 +496,6 @@ const MonthlyResourceUtilization = () => {
         <EntityFilter multiple value={entityIds} onChange={(v) => { setEntityIds(v); setBuIds([]); setEmployeeIds([]); }} />
 
         <BusinessUnitFilter multiple value={buIds} entityId={entityIds} onChange={(v) => { setBuIds(v); setEmployeeIds([]); }} />
-        <div className="flex flex-col gap-1.5">
-          <Label className="text-xs font-medium">Hours basis</Label>
-          <div className="flex items-center gap-0.5 p-0.5 rounded-lg bg-muted border w-fit">
-            {[
-              { value: 'M', label: 'Adjusted' },
-              { value: 'O', label: 'Original' },
-            ].map(({ value, label }) => (
-              <button
-                key={value}
-                type="button"
-                onClick={() => { setHoursSource(value); setPage(1); }}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-                  hoursSource === value ? 'bg-card shadow-sm text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground hover:text-foreground'
-                }`}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-          <span className="text-[10px] text-muted-foreground">
-            {hoursSource === 'O' ? 'Original (as logged, before the monthly cap)' : 'Adjusted (after sync)'}
-          </span>
-        </div>
           <div className="flex flex-col gap-1.5">
             <Label className="text-xs font-medium">Month &amp; Year <span className="text-destructive">*</span></Label>
             <MonthYearPicker
@@ -543,6 +505,8 @@ const MonthlyResourceUtilization = () => {
               className="w-full"
             />
           </div>
+
+          <HoursBasisToggle value={hoursSource} onChange={(v) => { setHoursSource(v); setPage(1); }} />
 
           <div className="flex flex-col gap-1.5">
             <Label className="text-xs font-medium">Employee</Label>
@@ -603,104 +567,104 @@ const MonthlyResourceUtilization = () => {
               instead of a fixed px-3/py-1.5/text-xs, so this row shrinks with the viewport like
               the rest of the app instead of running out of room and wrapping to a 2nd line. ── */}
           <div className="hidden shrink-0 mb-4 md:flex flex-wrap gap-[clamp(0.4rem,0.7vw,0.75rem)]">
-            {summary.billable_total != null && (
+            {shownBillableTotal != null && (
               <div className="rounded-md border bg-emerald-500/10 px-[clamp(0.5rem,0.7vw,0.75rem)] py-[clamp(0.25rem,0.4vw,0.375rem)] text-[clamp(0.6875rem,0.75vw,0.75rem)] text-emerald-700 dark:text-emerald-400 whitespace-nowrap">
                 Billable Total&nbsp;
-                <span className="font-semibold tabular-nums">{Number(summary.billable_total).toFixed(1)} hrs</span>
+                <span className="font-semibold tabular-nums">{Number(shownBillableTotal).toFixed(1)} hrs</span>
               </div>
             )}
-            {summary.non_billable_total != null && (
+            {shownNonBillableTotal != null && (
               <div className="rounded-md border bg-orange-500/10 px-[clamp(0.5rem,0.7vw,0.75rem)] py-[clamp(0.25rem,0.4vw,0.375rem)] text-[clamp(0.6875rem,0.75vw,0.75rem)] text-orange-700 dark:text-orange-400 whitespace-nowrap">
                 Non-Billable Total&nbsp;
-                <span className="font-semibold tabular-nums">{Number(summary.non_billable_total).toFixed(1)} hrs</span>
+                <span className="font-semibold tabular-nums">{Number(shownNonBillableTotal).toFixed(1)} hrs</span>
               </div>
             )}
-            {summary.customer_non_billable_total != null && (
+            {shownCustomerNonBillableTotal != null && (
               <div className="rounded-md border bg-cyan-500/10 px-[clamp(0.5rem,0.7vw,0.75rem)] py-[clamp(0.25rem,0.4vw,0.375rem)] text-[clamp(0.6875rem,0.75vw,0.75rem)] text-cyan-700 dark:text-cyan-400 whitespace-nowrap">
                 Customer Non-Billable&nbsp;
-                <span className="font-semibold tabular-nums">{Number(summary.customer_non_billable_total).toFixed(1)} hrs</span>
+                <span className="font-semibold tabular-nums">{Number(shownCustomerNonBillableTotal).toFixed(1)} hrs</span>
               </div>
             )}
-            {summary.total_utilization != null && (
+            {shownTotalUtilization != null && (
               <div className="rounded-md border bg-blue-500/10 px-[clamp(0.5rem,0.7vw,0.75rem)] py-[clamp(0.25rem,0.4vw,0.375rem)] text-[clamp(0.6875rem,0.75vw,0.75rem)] text-blue-700 dark:text-blue-400 whitespace-nowrap">
                 Total Utilization&nbsp;
-                <span className="font-semibold tabular-nums">{Number(summary.total_utilization).toFixed(1)} hrs</span>
+                <span className="font-semibold tabular-nums">{Number(shownTotalUtilization).toFixed(1)} hrs</span>
               </div>
             )}
-            {summary.total_hours != null && hoursSource !== 'O' && (
+            {shownTotalHours != null && (
               <div className="rounded-md border bg-slate-500/10 px-[clamp(0.5rem,0.7vw,0.75rem)] py-[clamp(0.25rem,0.4vw,0.375rem)] text-[clamp(0.6875rem,0.75vw,0.75rem)] text-slate-700 dark:text-slate-400 whitespace-nowrap">
                 Total Hours&nbsp;
-                <span className="font-semibold tabular-nums">{Number(summary.total_hours).toFixed(1)} hrs</span>
+                <span className="font-semibold tabular-nums">{Number(shownTotalHours).toFixed(1)} hrs</span>
               </div>
             )}
-            {summary.leaves_hours != null && (
+            {shownLeavesHours != null && (
               <div className="rounded-md border bg-amber-500/10 px-[clamp(0.5rem,0.7vw,0.75rem)] py-[clamp(0.25rem,0.4vw,0.375rem)] text-[clamp(0.6875rem,0.75vw,0.75rem)] text-amber-700 dark:text-amber-400 whitespace-nowrap">
                 Leaves&nbsp;
-                <span className="font-semibold tabular-nums">{Number(summary.leaves_hours).toFixed(1)} hrs</span>
+                <span className="font-semibold tabular-nums">{Number(shownLeavesHours).toFixed(1)} hrs</span>
               </div>
             )}
-            {(utilizationPercentage != null || summary.utilization_percentage != null) && (
+            {shownUtilizationPercentage != null && (
               <div className="rounded-md border bg-indigo-500/10 px-[clamp(0.5rem,0.7vw,0.75rem)] py-[clamp(0.25rem,0.4vw,0.375rem)] text-[clamp(0.6875rem,0.75vw,0.75rem)] text-indigo-700 dark:text-indigo-400 whitespace-nowrap">
                 Utilization %&nbsp;
-                <span className="font-semibold tabular-nums">{utilizationPercentage ?? summary.utilization_percentage}%</span>
+                <span className="font-semibold tabular-nums">{shownUtilizationPercentage}%</span>
               </div>
             )}
-            {contributedPercentage != null && (
+            {shownContributedPercentage != null && (
               <div className="rounded-md border bg-violet-500/10 px-[clamp(0.5rem,0.7vw,0.75rem)] py-[clamp(0.25rem,0.4vw,0.375rem)] text-[clamp(0.6875rem,0.75vw,0.75rem)] text-violet-700 dark:text-violet-400 whitespace-nowrap">
                 Contributed %&nbsp;
-                <span className="font-semibold tabular-nums">{contributedPercentage}%</span>
+                <span className="font-semibold tabular-nums">{shownContributedPercentage}%</span>
               </div>
             )}
           </div>
 
           {/* ── Summary chips (mobile): same `summary` values, as a compact 2-column KPI grid ── */}
           <div className="grid shrink-0 grid-cols-2 gap-2 mb-4 md:hidden">
-            {summary.billable_total != null && (
+            {shownBillableTotal != null && (
               <div className="rounded-lg border bg-emerald-500/10 px-3 py-2 text-emerald-700 dark:text-emerald-400">
                 <p className="text-xs">Billable</p>
-                <p className="text-sm font-semibold tabular-nums">{Number(summary.billable_total).toFixed(1)} hrs</p>
+                <p className="text-sm font-semibold tabular-nums">{Number(shownBillableTotal).toFixed(1)} hrs</p>
               </div>
             )}
-            {summary.non_billable_total != null && (
+            {shownNonBillableTotal != null && (
               <div className="rounded-lg border bg-orange-500/10 px-3 py-2 text-orange-700 dark:text-orange-400">
                 <p className="text-xs">Non-Billable</p>
-                <p className="text-sm font-semibold tabular-nums">{Number(summary.non_billable_total).toFixed(1)} hrs</p>
+                <p className="text-sm font-semibold tabular-nums">{Number(shownNonBillableTotal).toFixed(1)} hrs</p>
               </div>
             )}
-            {summary.customer_non_billable_total != null && (
+            {shownCustomerNonBillableTotal != null && (
               <div className="rounded-lg border bg-cyan-500/10 px-3 py-2 text-cyan-700 dark:text-cyan-400">
                 <p className="text-xs">Customer N-B</p>
-                <p className="text-sm font-semibold tabular-nums">{Number(summary.customer_non_billable_total).toFixed(1)} hrs</p>
+                <p className="text-sm font-semibold tabular-nums">{Number(shownCustomerNonBillableTotal).toFixed(1)} hrs</p>
               </div>
             )}
-            {summary.total_hours != null && hoursSource !== 'O' && (
+            {shownTotalHours != null && (
               <div className="rounded-lg border bg-slate-500/10 px-3 py-2 text-slate-700 dark:text-slate-400">
                 <p className="text-xs">Total Hours</p>
-                <p className="text-sm font-semibold tabular-nums">{Number(summary.total_hours).toFixed(1)} hrs</p>
+                <p className="text-sm font-semibold tabular-nums">{Number(shownTotalHours).toFixed(1)} hrs</p>
               </div>
             )}
-            {summary.leaves_hours != null && (
+            {shownLeavesHours != null && (
               <div className="rounded-lg border bg-amber-500/10 px-3 py-2 text-amber-700 dark:text-amber-400">
                 <p className="text-xs">Leaves</p>
-                <p className="text-sm font-semibold tabular-nums">{Number(summary.leaves_hours).toFixed(1)} hrs</p>
+                <p className="text-sm font-semibold tabular-nums">{Number(shownLeavesHours).toFixed(1)} hrs</p>
               </div>
             )}
-            {summary.total_utilization != null && (
+            {shownTotalUtilization != null && (
               <div className="col-span-2 rounded-lg border bg-blue-500/10 px-3 py-2 text-blue-700 dark:text-blue-400">
                 <p className="text-xs">Total Utilization</p>
-                <p className="text-sm font-semibold tabular-nums">{Number(summary.total_utilization).toFixed(1)} hrs</p>
+                <p className="text-sm font-semibold tabular-nums">{Number(shownTotalUtilization).toFixed(1)} hrs</p>
               </div>
             )}
-            {(utilizationPercentage != null || summary.utilization_percentage != null) && (
+            {shownUtilizationPercentage != null && (
               <div className="col-span-2 rounded-lg border bg-indigo-500/10 px-3 py-2 text-indigo-700 dark:text-indigo-400">
                 <p className="text-xs">Utilization %</p>
-                <p className="text-sm font-semibold tabular-nums">{utilizationPercentage ?? summary.utilization_percentage}%</p>
+                <p className="text-sm font-semibold tabular-nums">{shownUtilizationPercentage}%</p>
               </div>
             )}
-            {contributedPercentage != null && (
+            {shownContributedPercentage != null && (
               <div className="col-span-2 rounded-lg border bg-violet-500/10 px-3 py-2 text-violet-700 dark:text-violet-400">
                 <p className="text-xs">Contributed %</p>
-                <p className="text-sm font-semibold tabular-nums">{contributedPercentage}%</p>
+                <p className="text-sm font-semibold tabular-nums">{shownContributedPercentage}%</p>
               </div>
             )}
           </div>
@@ -783,25 +747,25 @@ const MonthlyResourceUtilization = () => {
                   {filteredColumns.map(cat =>
                     cat.service_types.map(st => (
                       <TableCell key={st.id} className={td('text-right', getCellColorClass(cat.colorRank))}>
-                        <HoursCell value={row.hours?.[st.id]} />
+                        <HoursCell value={pickTypeHours(row, st.id, isOriginal)} />
                       </TableCell>
                     ))
                   )}
 
                   <TableCell className={td('text-right font-semibold bg-primary/[0.02]')}>
-                    <HoursCell value={row.billable_total} />
+                    <HoursCell value={pickBasis(row, 'billable_total', isOriginal)} />
                   </TableCell>
                   <TableCell className={td('text-right font-semibold bg-primary/[0.02]')}>
-                    <HoursCell value={row.non_billable_total} />
+                    <HoursCell value={pickBasis(row, 'non_billable_total', isOriginal)} />
                   </TableCell>
                   <TableCell className={td('text-right font-semibold bg-primary/[0.02]')}>
-                    <HoursCell value={row.total_utilization} />
+                    <HoursCell value={pickBasis(row, 'total_utilization', isOriginal)} />
                   </TableCell>
                   <TableCell className={td('text-right font-semibold bg-primary/[0.02]')}>
-                    <UtilizationPercentCell value={row.utilization_percentage} />
+                    <UtilizationPercentCell value={pickBasis(row, 'utilization_percentage', isOriginal)} />
                   </TableCell>
                   <TableCell className={td('text-right font-semibold bg-primary/[0.02]')}>
-                    <ContributedPercentCell value={row.contributed_percentage} />
+                    <ContributedPercentCell value={pickBasis(row, 'contributed_percentage', isOriginal)} />
                   </TableCell>
                 </TableRow>
               ))}
@@ -833,7 +797,7 @@ const MonthlyResourceUtilization = () => {
                       <span className="min-w-0 truncate font-semibold">{row.full_name ?? '—'}</span>
                     </span>
                     <span className="shrink-0 text-sm font-semibold tabular-nums">
-                      {isExpanded ? 'Total ' : ''}<HoursCell value={row.total_utilization} />h
+                      {isExpanded ? 'Total ' : ''}<HoursCell value={pickBasis(row, 'total_utilization', isOriginal)} />h
                     </span>
                   </button>
 
@@ -873,7 +837,7 @@ const MonthlyResourceUtilization = () => {
                             {cat.service_types.map((st) => (
                               <div key={st.id} className="flex items-center justify-between px-1">
                                 <span className="text-muted-foreground">{st.name}</span>
-                                <HoursCell value={row.hours?.[st.id]} />
+                                <HoursCell value={pickTypeHours(row, st.id, isOriginal)} />
                               </div>
                             ))}
                           </div>
@@ -883,23 +847,23 @@ const MonthlyResourceUtilization = () => {
                       <div className="grid grid-cols-2 gap-2 border-t pt-3">
                         <div className="rounded-md border bg-primary/[0.04] px-2.5 py-1.5">
                           <p className="text-muted-foreground">Billable (hrs)</p>
-                          <p className="font-semibold"><HoursCell value={row.billable_total} /></p>
+                          <p className="font-semibold"><HoursCell value={pickBasis(row, 'billable_total', isOriginal)} /></p>
                         </div>
                         <div className="rounded-md border bg-primary/[0.04] px-2.5 py-1.5">
                           <p className="text-muted-foreground">Non-Bill. (hrs)</p>
-                          <p className="font-semibold"><HoursCell value={row.non_billable_total} /></p>
+                          <p className="font-semibold"><HoursCell value={pickBasis(row, 'non_billable_total', isOriginal)} /></p>
                         </div>
                         <div className="rounded-md border bg-primary/[0.04] px-2.5 py-1.5">
                           <p className="text-muted-foreground">Total Utilization</p>
-                          <p className="font-semibold"><HoursCell value={row.total_utilization} /></p>
+                          <p className="font-semibold"><HoursCell value={pickBasis(row, 'total_utilization', isOriginal)} /></p>
                         </div>
                         <div className="rounded-md border bg-primary/[0.04] px-2.5 py-1.5">
                           <p className="text-muted-foreground">Utilization %</p>
-                          <p className="font-semibold"><UtilizationPercentCell value={row.utilization_percentage} /></p>
+                          <p className="font-semibold"><UtilizationPercentCell value={pickBasis(row, 'utilization_percentage', isOriginal)} /></p>
                         </div>
                         <div className="col-span-2 rounded-md border bg-primary/[0.04] px-2.5 py-1.5">
                           <p className="text-muted-foreground">Contributed %</p>
-                          <p className="font-semibold"><ContributedPercentCell value={row.contributed_percentage} /></p>
+                          <p className="font-semibold"><ContributedPercentCell value={pickBasis(row, 'contributed_percentage', isOriginal)} /></p>
                         </div>
                       </div>
                     </div>
