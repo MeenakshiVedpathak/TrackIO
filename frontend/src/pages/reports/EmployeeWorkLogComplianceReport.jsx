@@ -23,7 +23,7 @@ import EntityFilter from '@/components/common/EntityFilter';
 import BulkReminderProgressModal from '@/components/common/BulkReminderProgressModal';
 import EmptyState from '@/components/common/EmptyState';
 import MobilePagination from '@/components/common/MobilePagination';
-import { useExportConfirm } from '@/components/common/ExportConfirm';
+import { useActionConfirm, useExportConfirm } from '@/components/common/ExportConfirm';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -223,6 +223,7 @@ const columns = buildColumns();
 
 const EmployeeWorkLogComplianceReport = () => {
   const confirmExport = useExportConfirm();
+  const confirmAction = useActionConfirm();
   const { success: toastSuccess, error: toastError } = useNotification();
 
   // ── Filter state ──
@@ -400,6 +401,16 @@ const EmployeeWorkLogComplianceReport = () => {
     sendReminder({ employeeId: empId, ...buildPeriodBody(mode, date, monthYear) });
   }, [remindingIds, sendReminder, mode, date, monthYear]);
 
+  const requestRemind = useCallback((row) => {
+    confirmAction(() => handleRemind(row), {
+      title: 'Send reminder?',
+      description: `${row.employee_name || 'This employee'} will get an email`,
+      confirmLabel: 'Send',
+      icon: Bell,
+      tone: 'amber',
+    });
+  }, [confirmAction, handleRemind]);
+
   const handleRemindSelected = () => {
     if (isBulkSending || selectedCount === 0) return;
     setIsBulkSending(true);
@@ -464,7 +475,7 @@ const EmployeeWorkLogComplianceReport = () => {
           className={cn('h-10 w-10 shrink-0', isSending && 'text-muted-foreground')}
           disabled={isSending || isBulkSending}
           title={isSending ? 'Sending…' : 'Send reminder'}
-          onClick={() => handleRemind(emp)}
+          onClick={() => requestRemind(emp)}
         >
           {isSending ? <Loader2 className="h-5 w-5 animate-spin" /> : <Bell className="h-5 w-5" />}
         </Button>
@@ -526,7 +537,13 @@ const EmployeeWorkLogComplianceReport = () => {
                 variant="outline"
                 size="toolbar"
                 disabled={isBulkSending}
-                onClick={handleRemindSelected}
+                onClick={() => confirmAction(handleRemindSelected, {
+                  title: `Send ${selectedCount} reminder${selectedCount === 1 ? '' : 's'}?`,
+                  description: 'Selected employees will get an email',
+                  confirmLabel: 'Send',
+                  icon: Bell,
+                  tone: 'amber',
+                })}
               >
                 {isBulkSending
                   ? <Loader2 className="h-4 w-4 animate-spin" />
@@ -543,7 +560,15 @@ const EmployeeWorkLogComplianceReport = () => {
                 size="toolbar"
                 className="relative bg-amber-500 text-white shadow-md shadow-amber-500/30 hover:bg-amber-600"
                 disabled={isBulkSending || selectedCount > 0}
-                onClick={handleRemindAll}
+                onClick={() => confirmAction(handleRemindAll, {
+                  title: `Remind all ${records.length} employee${records.length === 1 ? '' : 's'}?`,
+                  description: buIds.length > 0
+                    ? 'Everyone below the threshold in this BU gets an email'
+                    : 'Everyone below the threshold gets an email',
+                  confirmLabel: 'Send all',
+                  icon: Bell,
+                  tone: 'amber',
+                })}
               >
                 {isBulkSending ? (
                   <Loader2 className="h-4 w-4 animate-spin" />
@@ -636,7 +661,7 @@ const EmployeeWorkLogComplianceReport = () => {
         onPageChange={setPage}
         onPageSizeChange={(s) => { setLimit(s); setPage(1); }}
         emptyState={<EmptyState title="No records found" description={emptyMessage} />}
-        meta={{ remindingIds, isBulkSending, handleRemind, selectedIds, toggleRow, togglePageSelection, pagedIds, allFilteredIds: filteredRecords.map((r) => r.employee_id) }}
+        meta={{ remindingIds, isBulkSending, handleRemind: requestRemind, selectedIds, toggleRow, togglePageSelection, pagedIds, allFilteredIds: filteredRecords.map((r) => r.employee_id) }}
       />
 
       {/* Mobile — Master-style card list built directly in this page (not DataTable's generic

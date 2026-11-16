@@ -67,8 +67,9 @@ const YearGrid = ({ rangeStart, currentYear, maxYear, onPrevRange, onNextRange, 
   );
 };
 
-const PILL_BASE = 'flex-1 rounded-full px-3 py-1.5 text-xs font-semibold text-center transition-colors whitespace-nowrap';
-const STEP_BUTTON = 'flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-input bg-background text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-50';
+const PILL_BASE = 'flex-1 rounded-full px-3 py-1 text-[11px] font-semibold text-center leading-tight transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring';
+// Same fluid height as the week box between them (and every other filter input), so the row lines up.
+const STEP_BUTTON = 'flex h-[clamp(1.875rem,2vw,2.25rem)] w-[clamp(1.875rem,2vw,2.25rem)] shrink-0 items-center justify-center rounded-md border border-input bg-background text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50';
 
 // Compact "stepper" week picker for the Reports suite's Weekly mode: a ◀ [range] ▶ row (click
 // either arrow to walk one real week at a time — see weekUtils.js's shiftWeekRange — or the
@@ -152,13 +153,13 @@ export function WeekPicker({ value, onChange, placeholder = 'Select week', class
   const atOrPastThisWeek = (startDate ?? thisWeek.startDate) >= thisWeek.startDate;
 
   return (
-    <div className={cn('flex flex-col gap-2', className)}>
-      <div className="flex items-center gap-2">
+    <div className={cn('flex flex-col gap-1.5', className)}>
+      <div className="flex items-center gap-1.5">
         <button type="button" onClick={() => stepBy(-1)} aria-label="Previous week" className={STEP_BUTTON}>
           <ChevronLeft className="h-4 w-4" />
         </button>
 
-        <div className="flex h-[clamp(1.875rem,2vw,2.25rem)] flex-1 items-center justify-center rounded-md border border-input bg-background px-2 text-[clamp(0.75rem,0.85vw,0.875rem)] font-semibold truncate">
+        <div className="flex h-[clamp(1.875rem,2vw,2.25rem)] min-w-0 flex-1 items-center justify-center truncate rounded-md border border-input bg-background px-2 text-[clamp(0.75rem,0.85vw,0.875rem)] font-semibold">
           {triggerLabel || <span className="font-normal text-muted-foreground">{placeholder}</span>}
         </div>
 
@@ -275,7 +276,7 @@ export function WeekPicker({ value, onChange, placeholder = 'Select week', class
         </Popover>
       </div>
 
-      <div className="flex gap-2">
+      <div className="flex gap-1.5">
         <button
           type="button"
           onClick={() => onChange(thisWeek)}

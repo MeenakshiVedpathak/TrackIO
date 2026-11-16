@@ -7,6 +7,7 @@
 // /employee-timesheets/daily) and resend them untouched, or saving here would wipe out whatever
 // the Work Log form already saved for that date (and vice versa).
 import { buildMonthlySummaryRows } from './employeeMonthlySummary';
+import { lineKeyOf } from './approvedWorkLog';
 
 const dayNumberOf = (dateStr) => Number(dateStr.slice(-2));
 
@@ -39,14 +40,14 @@ export const findExistingLine = (dailyData, date, servicePOId, hierarchyNodeId) 
 // segment-for-segment. Total hours are always preserved exactly; only the segment-level detail
 // of *other* lines can't be recovered this way without the backend also returning it.
 //
-// Lines under a Service PO that already has an approved log that day are never resent (`row.lockedByDay`
-// from the tree, plus `lockedPoIds` from the flat entries list as a second source): the backend 409s a
-// payload naming such a PO, and approved rows are left untouched by a save anyway.
-export const buildOtherDayEntries = (dailyData, date, excludeServicePOId, excludeHierarchyNodeId, lockedPoIds = new Set()) => {
+// Approved lines are never resent (`row.lockedByDay` from the tree, plus `lockedLineKeys` from the
+// flat entries list as a second source): the backend keeps them untouched on a save and 409s a
+// payload that tries to change one.
+export const buildOtherDayEntries = (dailyData, date, excludeServicePOId, excludeHierarchyNodeId, lockedLineKeys = new Set()) => {
   const day = dayNumberOf(dailyData?.date ?? date);
   return rowsForDate(dailyData, date)
     .filter((row) => !sameLine(row, excludeServicePOId, excludeHierarchyNodeId))
-    .filter((row) => !row.lockedByDay?.[day] && !lockedPoIds.has(String(row.servicePOId)))
+    .filter((row) => !row.lockedByDay?.[day] && !lockedLineKeys.has(lineKeyOf(row.servicePOId, row.hierarchyId)))
     .map((row) => ({ row, hours: Number(row.hoursByDay?.[day] ?? 0) }))
     .filter(({ hours }) => hours > 0)
     .map(({ row, hours }) => ({

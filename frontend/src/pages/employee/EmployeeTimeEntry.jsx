@@ -21,7 +21,9 @@ import { Badge } from '@/components/ui/badge';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import ConfirmDialog from '@/components/common/ConfirmDialog';
 import ProjectSelect from '@/components/employee/ProjectSelect';
-import { APPROVED_LOCK_TOOLTIP, approvedPoIdsOf, isApprovedLog } from '@/utils/approvedWorkLog';
+import {
+  APPROVED_LOCK_TOOLTIP, approvedLineKeysOf, entryHierarchyIdOf, isApprovedLog, lineKeyOf,
+} from '@/utils/approvedWorkLog';
 import OffDayRequestPanel from '@/components/employee/OffDayRequestPanel';
 import TimeSegmentsInput, { BLANK_SEGMENT, AddTimeBlockButton } from '@/components/employee/TimeSegmentsInput';
 import { employeeWorkLogApi } from '@/api/employeeWorkLog.api';
@@ -197,10 +199,11 @@ const EmployeeTimeEntry = () => {
     [savedEntriesData, selectedDate]
   );
 
-  // Service POs that already have an approved log on this date. Per PO per date: those POs can't be
-  // picked or saved against (an approved log is read-only), but other POs on the same date still can.
-  const approvedPoIds = useMemo(() => approvedPoIdsOf(savedRowsForDate), [savedRowsForDate]);
-  const isSelectedPoApproved = !!selectedServicePOId && approvedPoIds.has(String(selectedServicePOId));
+  // Lines (Service PO + Module/Task) already approved on this date. Per line per date: only that exact
+  // line is read-only — other Modules/Tasks of the same Service PO can still be logged.
+  const approvedLineKeys = useMemo(() => approvedLineKeysOf(savedRowsForDate), [savedRowsForDate]);
+  const isSelectedPoApproved = !!selectedServicePOId
+    && approvedLineKeys.has(lineKeyOf(selectedServicePOId, selectedTaskId || selectedModuleId || null));
   // Declared after isSelectedPoApproved on purpose: it is read while rendering, so it must come second.
   const blocksDisabled = isSaving || !hasProject || isGated || isSelectedPoApproved;
 
@@ -374,17 +377,17 @@ const EmployeeTimeEntry = () => {
       const freshRows = (freshEntries?.data ?? []).filter(
         (row) => String(row.timesheet_date ?? row.work_date ?? '').slice(0, 10) === values.timesheet_date
       );
-      const freshApprovedPoIds = approvedPoIdsOf(freshRows);
-      if (freshApprovedPoIds.has(String(values.service_po_id))) {
-        setFormError('This project already has an approved log for this date. Ask your approver to revert it to edit.');
+      const freshApprovedLineKeys = approvedLineKeysOf(freshRows);
+      if (freshApprovedLineKeys.has(lineKeyOf(values.service_po_id, hierarchyNodeId))) {
+        setFormError('This line already has an approved log for this date. Ask your approver to revert it to edit.');
         qc.invalidateQueries({ queryKey: ['employee-worklog'] });
         return;
       }
       // Approved lines are never resent (see buildOtherDayEntries), but their hours still count
       // towards the daily cap.
-      const otherEntries = buildOtherDayEntries(dailyData, values.timesheet_date, values.service_po_id, hierarchyNodeId, freshApprovedPoIds);
+      const otherEntries = buildOtherDayEntries(dailyData, values.timesheet_date, values.service_po_id, hierarchyNodeId, freshApprovedLineKeys);
       const approvedHours = freshRows
-        .filter((row) => freshApprovedPoIds.has(String(row.service_po_id)))
+        .filter((row) => freshApprovedLineKeys.has(lineKeyOf(row.service_po_id, entryHierarchyIdOf(row))))
         .reduce((sum, row) => sum + Number(row.hours ?? 0), 0);
       const otherHours = otherEntries.reduce((sum, e) => sum + Number(e.hours || 0), 0) + approvedHours;
 
@@ -504,15 +507,10 @@ const EmployeeTimeEntry = () => {
         </p>
       </div>
 
-      {/* Below `md`: the Entries panel stacks under the form, both full width — a phone has no
-          room for a 660px+360px side-by-side row to begin with, so there's nothing to usefully
-          scroll horizontally to. At `md` and up: unchanged — form + Entries panel stay side by
-          side, each column keeping its own sensible minimum width (660px form, 360px panel); once
-          the two can't both fit the viewport, this row overflows and the wrapper scrolls
-          horizontally instead of either column shrinking below its minimum or the panel dropping
-          underneath the form. */}
-      <div className="md:-mx-1 md:overflow-x-auto md:px-1 md:pb-1">
-        <div className="flex flex-col gap-6 md:min-w-fit md:flex-row md:items-start">
+      {/* Form and Entries panel stack (both full width) until `xl`, and only sit side by side once
+          there's room for both — no fixed minimum widths, so the page never scrolls sideways. */}
+      <div>
+        <div className="flex flex-col gap-6 xl:flex-row xl:items-start">
           {/* No viewport-height cap here — TimeSegmentsInput's own row list already caps itself
               at a fixed 300px (see ROWS_MAX_HEIGHT) so many blocks can't grow the page unbounded.
               Pinning this card's height to `100dvh - <fixed offset>` on top of that used to work,
@@ -520,7 +518,7 @@ const EmployeeTimeEntry = () => {
               budget can be smaller than the Module/Task fields + heading + even one row need,
               squeezing the row list into an unusably short scroll box. Sizing naturally and
               letting the page itself scroll vertically avoids that regardless of viewport height. */}
-          <div className="min-w-0 flex-1 space-y-2.5 md:min-w-[660px]">
+          <div className="min-w-0 flex-1 space-y-2.5">
           <Card className="overflow-hidden">
             <Form {...form}>
               <form onSubmit={form.handleSubmit(submit)} className="flex min-h-0 flex-col">
@@ -571,7 +569,6 @@ const EmployeeTimeEntry = () => {
                                 field.onChange(v);
                               }}
                               disabled={isSaving}
-                              lockedIds={approvedPoIds}
                             />
                           </FormControl>
                           <FormMessage />
@@ -584,7 +581,7 @@ const EmployeeTimeEntry = () => {
                     <Alert className="shrink-0 border-emerald-200 bg-emerald-50 text-emerald-900">
                       <Lock className="h-4 w-4 text-emerald-600" />
                       <AlertDescription className="text-xs text-emerald-800">
-                        This project already has an approved log for this date. {APPROVED_LOCK_TOOLTIP} You can still log other projects on this date.
+                        This line already has an approved log for this date. {APPROVED_LOCK_TOOLTIP} You can still log other modules / tasks of this project.
                       </AlertDescription>
                     </Alert>
                   )}
@@ -736,7 +733,7 @@ const EmployeeTimeEntry = () => {
           </Card>
         </div>
 
-          <div className="w-full shrink-0 space-y-4 md:w-[360px]">
+          <div className="w-full shrink-0 space-y-4 xl:sticky xl:top-0 xl:w-[320px] 2xl:w-[360px]">
           <Card>
             <CardHeader className="pb-3">
               <CardTitle className="flex items-center gap-2 text-sm">

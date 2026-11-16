@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState } f
 import { Download } from 'lucide-react';
 import { Popover, PopoverAnchor, PopoverContent } from '@/components/ui/popover';
 import { Button } from '@/components/ui/button';
+import { cn } from '@/utils/cn';
 
 // App-wide "Export data?" confirmation, shown as a small popover right next to the button that
 // was clicked (not a centred modal). Every Export / Download button calls
@@ -16,6 +17,13 @@ const DEFAULT_OPTIONS = {
   title: 'Export data?',
   description: 'Current filters will be downloaded',
   confirmLabel: 'Export',
+  icon: Download,
+  tone: 'primary',
+};
+
+const TONES = {
+  primary: { badge: 'bg-primary/10 text-primary', button: '' },
+  amber: { badge: 'bg-amber-500/15 text-amber-600', button: 'bg-amber-500 text-white hover:bg-amber-600' },
 };
 
 // What counts as "the control that was clicked" when locating the popover.
@@ -79,6 +87,8 @@ export const ExportConfirmProvider = ({ children }) => {
   const anchorStyle = anchorRect
     ? { top: anchorRect.top, left: anchorRect.left, width: anchorRect.width, height: anchorRect.height }
     : { top: 72, right: 24, width: 1, height: 1 };
+  const Icon = options?.icon ?? Download;
+  const tone = TONES[options?.tone] ?? TONES.primary;
 
   return (
     <ExportConfirmContext.Provider value={confirmExport}>
@@ -101,16 +111,16 @@ export const ExportConfirmProvider = ({ children }) => {
           // button without pushing a tall card over the content below.
           className="flex w-auto max-w-[calc(100vw-2rem)] items-center gap-2.5 rounded-lg px-2.5 py-2"
         >
-          <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-primary/10">
-            <Download className="h-3.5 w-3.5 text-primary" />
+          <div className={cn('flex h-7 w-7 shrink-0 items-center justify-center rounded-full', tone.badge)}>
+            <Icon className="h-3.5 w-3.5" />
           </div>
           <div className="min-w-0">
-            <p className="whitespace-nowrap text-[clamp(0.75rem,0.85vw,0.8125rem)] font-semibold leading-tight">{options?.title}</p>
-            <p className="whitespace-nowrap text-[clamp(0.625rem,0.7vw,0.6875rem)] leading-tight text-muted-foreground">{options?.description}</p>
+            <p className="truncate whitespace-nowrap text-[clamp(0.75rem,0.85vw,0.8125rem)] font-semibold leading-tight">{options?.title}</p>
+            <p className="max-w-[18rem] truncate whitespace-nowrap text-[clamp(0.625rem,0.7vw,0.6875rem)] leading-tight text-muted-foreground">{options?.description}</p>
           </div>
           <div className="ml-1 flex shrink-0 items-center gap-1.5">
             <Button variant="outline" size="sm" className="h-7 px-2.5" onClick={close}>Cancel</Button>
-            <Button ref={confirmButtonRef} size="sm" className="h-7 px-2.5" onClick={handleConfirm}>
+            <Button ref={confirmButtonRef} size="sm" className={cn('h-7 px-2.5', tone.button)} onClick={handleConfirm}>
               {options?.confirmLabel}
             </Button>
           </div>
@@ -121,8 +131,12 @@ export const ExportConfirmProvider = ({ children }) => {
 };
 
 // Returns `confirmExport(action, options?)`. `options` may override title / description /
-// confirmLabel. Outside the provider (e.g. an isolated test render) it just runs the action.
+// confirmLabel / icon (a lucide component) / tone ('primary' | 'amber'). Outside the provider
+// (e.g. an isolated test render) it just runs the action.
 export const useExportConfirm = () => {
   const confirmExport = useContext(ExportConfirmContext);
   return confirmExport ?? ((action) => action?.());
 };
+
+// Same popover for non-export actions (e.g. sending a reminder) — pass your own title/icon/tone.
+export const useActionConfirm = useExportConfirm;

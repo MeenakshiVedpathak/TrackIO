@@ -72,6 +72,32 @@ export const useEmployeeEntries = (params, enabled = true) =>
     enabled,
   });
 
+// Every entry of a month (all statuses), for the calendar's per-day approval badges. The entries
+// endpoint caps `limit` at 100, so pages are walked until `hasNext` is false (bounded, in case a
+// response never says so). Under the 'employee-worklog' key prefix, so every save/delete that
+// already invalidates that prefix refreshes the badges too.
+const MONTH_ENTRIES_PAGE_LIMIT = 100;
+const MONTH_ENTRIES_MAX_PAGES = 20;
+export const useEmployeeMonthEntries = (month, year, enabled = true) =>
+  useQuery({
+    queryKey: ['employee-worklog', 'month-entries', month, year],
+    queryFn: async () => {
+      const start = `${year}-${String(month).padStart(2, '0')}-01`;
+      const end = new Date(year, month, 0);
+      const endDate = `${year}-${String(month).padStart(2, '0')}-${String(end.getDate()).padStart(2, '0')}`;
+      const all = [];
+      for (let page = 1; page <= MONTH_ENTRIES_MAX_PAGES; page += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        const res = await employeeWorkLogApi.getEntries({ startDate: start, endDate, page, limit: MONTH_ENTRIES_PAGE_LIMIT });
+        all.push(...(res?.data ?? []));
+        if (!res?.meta?.hasNext) break;
+      }
+      return all;
+    },
+    enabled: enabled && !!month && !!year,
+    placeholderData: (prev) => prev,
+  });
+
 // The only way a 'rejected' entry goes back to 'pending' — a distinct, deliberate action from
 // editing (see useUpdateWorkLogEntry above, which leaves status as 'rejected').
 export const useResubmitWorkLogEntry = () => {

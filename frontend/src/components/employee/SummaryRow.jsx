@@ -1,5 +1,5 @@
 import { memo, useState, useEffect } from 'react';
-import { ChevronRight, ChevronDown } from 'lucide-react';
+import { ChevronRight, ChevronDown, Folder } from 'lucide-react';
 import { TableRow, TableCell } from '@/components/ui/table';
 import { parseHourMinuteInput, formatHourMinuteValue } from '@/utils/formatters';
 import { cn } from '@/utils/cn';
@@ -40,10 +40,13 @@ const DayCellInput = ({ value, onCommit, disabled, cap, isDirty }) => {
         if (e.key === 'Enter') e.currentTarget.blur();
       }}
       disabled={disabled}
+      // Spreadsheet-style cell: a light fill marks it editable without the heavy box that made
+      // these rows taller than the read-only ones; the border only shows on hover / focus.
       className={cn(
-        'h-7 w-full rounded border bg-transparent text-center text-xs tabular-nums transition-colors',
+        'h-6 w-full rounded-md border border-transparent bg-primary/[0.06] text-center text-xs font-medium tabular-nums text-foreground transition-colors',
         '[appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none',
-        'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring',
+        'hover:border-input focus-visible:border-primary focus-visible:bg-background focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary/40',
+        'disabled:cursor-not-allowed disabled:opacity-50',
         isDirty && 'border-amber-400 bg-amber-50 dark:bg-amber-950/30'
       )}
     />
@@ -74,9 +77,12 @@ const SummaryRow = ({
   <TableRow className={cn('transition-colors hover:bg-muted/30', depth > 0 && 'bg-muted/10')}>
     <TableCell
       className={cn(
-        'summary-col-pinned sticky left-0 truncate pr-2 text-xs',
+        'summary-col-pinned sticky left-0 pr-2 text-xs',
         depth > 0 ? 'font-normal text-muted-foreground' : 'font-medium',
-        hasChildren && depth === 0 && 'border-l-2 border-l-primary/40'
+        // Every top-level row keeps the same 2px left edge (coloured only when expandable) so a
+        // Service PO without a hierarchy lines up with the ones that have one.
+        depth === 0 && 'border-l-2',
+        depth === 0 && (hasChildren ? 'border-l-primary/40' : 'border-l-transparent')
       )}
       style={{
         width: FIRST_COL_WIDTH, minWidth: FIRST_COL_WIDTH, maxWidth: FIRST_COL_WIDTH,
@@ -84,17 +90,29 @@ const SummaryRow = ({
       }}
       title={label}
     >
-      {depth > 0 && <span className="mr-1 text-muted-foreground">{'└'}</span>}
-      {hasChildren ? (
-        <button
-          type="button"
-          onClick={onToggleExpand}
-          className="mr-1 inline-flex align-middle text-muted-foreground transition-colors hover:text-foreground"
-        >
-          {isExpanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
-        </button>
-      ) : null}
-      {label}
+      <span className="flex min-w-0 items-center gap-1">
+        {depth > 0 && <span className="shrink-0 text-muted-foreground">{'└'}</span>}
+        {/* Fixed-width slot whether or not there's a chevron, so labels stay in one column. */}
+        <span className="flex h-3.5 w-3.5 shrink-0 items-center justify-center">
+          {hasChildren && (
+            <button
+              type="button"
+              onClick={onToggleExpand}
+              aria-expanded={isExpanded}
+              aria-label={`${isExpanded ? 'Collapse' : 'Expand'} ${label}`}
+              className="inline-flex text-muted-foreground transition-colors hover:text-foreground"
+            >
+              {isExpanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+            </button>
+          )}
+        </span>
+        {depth === 0 && (
+          <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-md bg-sky-50 text-sky-600 dark:bg-sky-950/40 dark:text-sky-400">
+            <Folder className="h-3 w-3" aria-hidden="true" />
+          </span>
+        )}
+        <span className="min-w-0 truncate">{label}</span>
+      </span>
     </TableCell>
 
     {days.map((day) => {
@@ -110,7 +128,11 @@ const SummaryRow = ({
               'px-1 text-center text-xs tabular-nums',
               // Muted so an aggregate never reads as a value you could have typed there.
               isRolledUp && 'italic text-muted-foreground',
-              isOffDayBlocked && 'text-muted-foreground/60'
+              // Read-only cells of an editable row (future days, locked days) shouldn't look bolder
+              // than its editable ones — muted, and a zero fainter still.
+              !isRolledUp && 'text-muted-foreground',
+              !isRolledUp && !Number(hoursByDay?.[day]) && 'text-muted-foreground/50',
+              isOffDayBlocked && 'text-muted-foreground/40'
             )}
             style={{ width: DAY_COL_WIDTH, minWidth: DAY_COL_WIDTH, maxWidth: DAY_COL_WIDTH }}
             title={

@@ -1,14 +1,15 @@
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import dayjs from 'dayjs';
 import { createColumnHelper } from '@tanstack/react-table';
-import { Download } from 'lucide-react';
+import { CalendarDays, Download, FileText, FolderKanban } from 'lucide-react';
 import { employeeReportsApi } from '@/api/employeeReports.api';
 import { useEmployeeDailyReport, useEmployeeMonthlyReport, useEmployeeRangeReport } from '@/hooks/useEmployeeReports';
 import { useNotification } from '@/hooks/useNotification';
 import { extractApiError } from '@/services/apiClient';
 import { downloadBlob } from '@/utils/download';
-import { formatDate } from '@/utils/formatters';
+import { formatDate, formatHours, formatMonthYear } from '@/utils/formatters';
 import { cn } from '@/utils/cn';
+import { StatPill } from '@/pages/auditLogs/auditLogsShared';
 import { DatePicker } from '@/components/ui/date-picker';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
@@ -20,6 +21,7 @@ import PageHeader from '@/components/common/PageHeader';
 import EmptyState from '@/components/common/EmptyState';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
+import ReportTypeToggle from '@/components/common/ReportTypeToggle';
 import { useExportConfirm } from '@/components/common/ExportConfirm';
 
 // 'weekly' reuses useEmployeeRangeReport exactly like 'range' does — WeekPicker just snaps
@@ -35,33 +37,70 @@ const REPORT_TYPES = [
 
 // Row shape is the same regardless of report type: { date, project, servicePO, hours, description, status }.
 const columnHelper = createColumnHelper();
+
+const DateCell = ({ value }) => (
+  <span className="inline-flex items-center gap-1.5 whitespace-nowrap text-sm text-foreground">
+    <CalendarDays className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+    {formatDate(value)}
+  </span>
+);
+
+const IconText = ({ icon: Icon, tone, children }) => (
+  <span className="flex min-w-0 items-center gap-2">
+    <span className={cn('flex h-6 w-6 shrink-0 items-center justify-center rounded-md', tone)}>
+      <Icon className="h-3.5 w-3.5" aria-hidden="true" />
+    </span>
+    <span className="truncate text-sm text-foreground" title={typeof children === 'string' ? children : undefined}>{children}</span>
+  </span>
+);
+
+const HoursChip = ({ value }) => (
+  <span className="inline-flex items-center justify-end rounded-md bg-primary/10 px-2 py-0.5 text-sm font-semibold tabular-nums text-primary">
+    {formatHours(Number(value) || 0)}
+  </span>
+);
+
 const REPORT_COLUMNS = [
   columnHelper.accessor('date', {
     header: 'Date',
-    size: 110,
-    cell: (info) => <span className="whitespace-nowrap text-sm">{formatDate(info.getValue())}</span>,
+    size: 130,
+    cell: (info) => <DateCell value={info.getValue()} />,
   }),
   columnHelper.accessor('project', {
     header: 'Project',
-    size: 200,
-    cell: (info) => <span className="text-sm">{info.getValue() ?? '—'}</span>,
+    size: 220,
+    meta: { sticky: true },
+    cell: (info) => <IconText icon={FolderKanban} tone="bg-primary/10 text-primary">{info.getValue() ?? '—'}</IconText>,
   }),
   columnHelper.accessor('servicePO', {
     header: 'Service PO',
-    size: 200,
-    cell: (info) => <span className="text-sm">{info.getValue() ?? '—'}</span>,
+    size: 220,
+    cell: (info) => <IconText icon={FileText} tone="bg-sky-500/10 text-sky-600">{info.getValue() ?? '—'}</IconText>,
   }),
   columnHelper.accessor('hours', {
     header: 'Hours',
-    size: 90,
-    cell: (info) => <span className="text-sm font-medium tabular-nums">{info.getValue()}</span>,
+    size: 100,
+    meta: { align: 'right' },
+    cell: (info) => <span className="flex justify-end"><HoursChip value={info.getValue()} /></span>,
   }),
 ];
 
-const TotalHoursBar = ({ totalHours }) => (
-  <div className="flex items-center justify-between rounded-lg border bg-muted/30 px-3 py-2">
-    <span className="text-sm font-medium">Total Hours</span>
-    <span className="text-sm font-semibold tabular-nums">{totalHours ?? 0} hrs</span>
+const MobileEntryCard = (row) => (
+  <div className="rounded-xl border bg-card p-3 shadow-sm">
+    <div className="flex items-start justify-between gap-3">
+      <div className="min-w-0 space-y-1">
+        <p className="truncate text-sm font-semibold text-foreground">{row.project ?? '—'}</p>
+        <p className="flex items-center gap-1 truncate text-xs text-muted-foreground">
+          <FileText className="h-3 w-3 shrink-0" aria-hidden="true" />
+          {row.servicePO ?? '—'}
+        </p>
+      </div>
+      <HoursChip value={row.hours} />
+    </div>
+    <p className="mt-2 flex items-center gap-1 border-t pt-2 text-xs text-muted-foreground">
+      <CalendarDays className="h-3 w-3" aria-hidden="true" />
+      {formatDate(row.date)}
+    </p>
   </div>
 );
 
@@ -71,29 +110,66 @@ const EmployeeReports = () => {
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
 
-  const [reportType, setReportType] = useState('daily');
+  const [reportType, setReportType] = useState('monthly');
   const [date, setDate] = useState(dayjs().format('YYYY-MM-DD'));
-  const prevMonth = dayjs().subtract(1, 'month');
-  const [monthYear, setMonthYear] = useState({ month: prevMonth.month() + 1, year: prevMonth.year() });
+  const [monthYear, setMonthYear] = useState({ month: dayjs().month() + 1, year: dayjs().year() });
   const [range, setRange] = useState(null);
+
+  const [page, setPage] = useState(1);
+  const [limit, setLimit] = useState(10);
+  useEffect(() => {
+    setPage(1);
+  }, [reportType, date, monthYear, range]);
+  const paging = useMemo(() => ({ page, limit }), [page, limit]);
 
   // Only the active report type's params are passed for real — the other two hooks stay
   // disabled (their `enabled` flags require truthy params), so only one query fetches at a time.
-  const daily = useEmployeeDailyReport(reportType === 'daily' ? date : undefined);
+  const daily = useEmployeeDailyReport(reportType === 'daily' ? date : undefined, paging);
   const monthly = useEmployeeMonthlyReport(
     reportType === 'monthly' ? monthYear?.month : undefined,
-    reportType === 'monthly' ? monthYear?.year : undefined
+    reportType === 'monthly' ? monthYear?.year : undefined,
+    paging
   );
   const rangeQuery = useEmployeeRangeReport(
     reportType === 'range' || reportType === 'weekly' ? range?.startDate : undefined,
-    reportType === 'range' || reportType === 'weekly' ? range?.endDate : undefined
+    reportType === 'range' || reportType === 'weekly' ? range?.endDate : undefined,
+    paging
   );
 
   const { data, isLoading, isError } =
     reportType === 'daily' ? daily : reportType === 'monthly' ? monthly : rangeQuery;
 
   const hasSelection = (reportType !== 'range' && reportType !== 'weekly') || !!range;
-  const rows = hasSelection ? (data?.rows ?? []) : [];
+  const rows = useMemo(() => (hasSelection ? (data?.rows ?? []) : []), [hasSelection, data]);
+
+  // Server-paginated once the backend returns `pagination`; until then it still sends every row
+  // and the page is sliced here, so both backends render the same.
+  const serverPaging = data?.pagination;
+  const totalCount = hasSelection ? (serverPaging?.total ?? rows.length) : 0;
+  const pagedRows = useMemo(
+    () => (serverPaging ? rows : rows.slice((page - 1) * limit, page * limit)),
+    [serverPaging, rows, page, limit]
+  );
+
+  // A paginated response only carries one page of rows, so period-wide counts must come from
+  // the backend's `summary`; the row-based counts are the fallback for the unpaginated API.
+  const stats = useMemo(() => {
+    const summary = data?.summary;
+    return {
+      entries: summary?.totalEntries ?? totalCount,
+      projects: summary?.projectCount ?? new Set(rows.map((r) => r.project).filter(Boolean)).size,
+      servicePOs: summary?.servicePoCount ?? new Set(rows.map((r) => r.servicePO).filter(Boolean)).size,
+    };
+  }, [data, rows, totalCount]);
+
+  const periodText =
+    reportType === 'daily'
+      ? formatDate(date)
+      : reportType === 'monthly'
+        ? formatMonthYear(monthYear?.month, monthYear?.year)
+        : range?.startDate && range?.endDate
+          ? `${formatDate(range.startDate)} – ${formatDate(range.endDate)}`
+          : '—';
 
   const handleExport = async () => {
     setIsExporting(true);
@@ -125,47 +201,26 @@ const EmployeeReports = () => {
               isOpen={filtersOpen}
               onToggle={() => setFiltersOpen((prev) => !prev)}
             />
-            {rows.length > 0 && (
-              <Button variant="outline" size="toolbar" disabled={isExporting} onClick={() => confirmExport(handleExport)}>
+            {/* Always visible so it's discoverable; disabled (with the reason on hover) until the
+                selected period actually has rows to export. */}
+            <span title={totalCount === 0 ? 'No entries to export for the selected period' : undefined}>
+              <Button
+                variant="outline"
+                size="toolbar"
+                disabled={isExporting || totalCount === 0 || isLoading}
+                onClick={() => confirmExport(handleExport)}
+              >
                 <Download className="h-4 w-4" />
                 {isExporting ? 'Exporting…' : 'Export Excel'}
               </Button>
-            )}
+            </span>
           </div>
         }
       />
 
       {/* Collapsible filter panel */}
       <FilterPanel isOpen={filtersOpen} maxHeightClass="max-h-[160px]">
-          {/* A fixed 2x2 button grid, not a single row of 4 — a single row (even with min-w-0/
-              truncate/extra column-span) still depends on the FILTER PANEL happening to give this
-              control enough width at whatever breakpoint the viewport lands on, and that assumption
-              kept breaking in practice ("Range" clipped even on screens that should have had room).
-              2x2 sidesteps the whole question: each button only ever competes for HALF its
-              container's width against one sibling, which is enough room for "Monthly" (the longest
-              label) at any realistic filter-column width, on any screen size, with no breakpoint
-              dependency at all. */}
-          <div className="flex flex-col gap-1.5">
-            <Label className="text-xs">Report Type</Label>
-            <div className="grid grid-cols-2 rounded-md border overflow-hidden text-[clamp(0.75rem,0.85vw,0.875rem)] bg-white">
-              {REPORT_TYPES.map(({ label, value }, i) => (
-                <button
-                  key={value}
-                  onClick={() => setReportType(value)}
-                  className={cn(
-                    'flex h-[clamp(1.375rem,1.6vw,1.625rem)] items-center justify-center px-[clamp(0.375rem,0.5vw,0.5rem)] min-w-0 font-medium text-center truncate transition-colors leading-none',
-                    i % 2 === 0 && 'border-r',
-                    i < 2 && 'border-b',
-                    reportType === value
-                      ? 'bg-primary text-primary-foreground'
-                      : 'bg-background text-muted-foreground hover:bg-muted'
-                  )}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-          </div>
+          <ReportTypeToggle options={REPORT_TYPES} value={reportType} onChange={setReportType} />
 
           {reportType === 'daily' && (
             <div className="flex flex-col gap-1.5">
@@ -206,18 +261,34 @@ const EmployeeReports = () => {
           Unable to load report data. Please try again.
         </div>
       )}
+
+      {hasSelection && !isLoading && totalCount > 0 && (
+        <div className="flex shrink-0 flex-wrap gap-[clamp(0.4rem,0.7vw,0.75rem)]">
+          <StatPill tone="blue" label="Total Hours" value={formatHours(Number(data?.totalHours) || 0)} />
+          <StatPill tone="violet" label="Entries" value={stats.entries} />
+          <StatPill tone="emerald" label="Projects" value={stats.projects} />
+          <StatPill tone="rose" label="Service POs" value={stats.servicePOs} />
+          <StatPill tone="slate" label="Period" value={periodText} />
+        </div>
+      )}
+
       <DataTable
         columns={REPORT_COLUMNS}
-        data={rows}
+        data={pagedRows}
         isLoading={hasSelection && isLoading}
         toolbar={null}
+        tableContainerClassName="rounded-xl shadow-sm"
+        mobileCards
+        mobileCardRenderer={MobileEntryCard}
+        pagination={totalCount > 0 ? { page, limit, total: totalCount } : undefined}
+        onPageChange={setPage}
+        onPageSizeChange={(size) => { setLimit(size); setPage(1); }}
         emptyState={
           <EmptyState
             title={hasSelection ? 'No work log entries for this period.' : 'Select a date range to view your work log report.'}
           />
         }
       />
-      {hasSelection && rows.length > 0 && <TotalHoursBar totalHours={data?.totalHours} />}
     </div>
   );
 };

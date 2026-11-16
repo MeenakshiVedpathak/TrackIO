@@ -9,6 +9,8 @@ import { isOffDay } from '@/utils/weekOffPolicy';
 import {
   useEmployeeCalendar,
   useEmployeeDailyWorkLog,
+  useEmployeeEntries,
+  useEmployeeMonthEntries,
   useSaveWorkLogDay,
   useEmployeeMonthlyYearOverview,
   useSaveWorkLogMonth,
@@ -19,6 +21,7 @@ import { extractApiError } from '@/services/apiClient';
 import { formatDate, formatHoursMinutes } from '@/utils/formatters';
 import { buildMonthlySummaryRows, buildDayEntries, validateDayEntries } from '@/utils/employeeMonthlySummary';
 import { lockedHoursForDay, isApprovedConflict } from '@/utils/approvedWorkLog';
+import { countsByDate as buildCountsByDate, statusByServicePo, statusByRow } from '@/utils/workLogDayStatus';
 import TimesheetCalendar from '@/components/employee/TimesheetCalendar';
 import MonthlyHoursCard from '@/components/employee/MonthlyHoursCard';
 import MonthSelector from '@/components/employee/MonthSelector';
@@ -27,7 +30,12 @@ import WorkLogEntryTable from '@/components/employee/WorkLogEntryTable';
 import OffDayRequestPanel from '@/components/employee/OffDayRequestPanel';
 import { DAILY_HOURS_CAP, getMonthlyHourCap } from '@/components/employee/WorkLogEntryModal';
 import { Button } from '@/components/ui/button';
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import ReportTypeToggle from '@/components/common/ReportTypeToggle';
+
+const LOG_MODES = [
+  { label: 'Daily', value: 'daily' },
+  { label: 'Monthly', value: 'monthly' },
+];
 import { SearchableSelect } from '@/components/ui/searchable-select';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import ConfirmDialog from '@/components/common/ConfirmDialog';
@@ -90,10 +98,33 @@ const EmployeeTimesheet = () => {
     [calendarDays]
   );
 
+  // Calendar approval badges. Only fetched when the calendar endpoint doesn't already send its own
+  // per-day `statusCounts` (it's the one source for "deleted"; the entries list can't show those).
+  const calendarHasStatusCounts = calendarDays.some((d) => d.statusCounts || d.status_counts);
+  const { data: monthEntries } = useEmployeeMonthEntries(
+    month, year, mode === 'daily' && !isCalendarLoading && !calendarHasStatusCounts
+  );
+  const approvalCountsByDate = useMemo(() => buildCountsByDate(monthEntries ?? []), [monthEntries]);
+
   const selectedKey = selectedDate.format('YYYY-MM-DD');
   const {
     data: dailyData, isLoading: isDailyLoading, isError: isDailyError,
   } = useEmployeeDailyWorkLog(selectedKey);
+
+  // Rejected / reverted flags per Service PO for the selected day (entry list folder badges).
+  const { data: selectedDayEntries } = useEmployeeEntries(
+    { startDate: selectedKey, endDate: selectedKey, limit: 100, includeDeleted: true },
+    mode === 'daily'
+  );
+  const selectedDayEntryList = useMemo(
+    () => (selectedDayEntries?.data ?? []).filter(
+      (e) => String(e.timesheet_date ?? e.work_date ?? '').slice(0, 10) === selectedKey
+    ),
+    [selectedDayEntries, selectedKey]
+  );
+  const poStatusById = useMemo(() => statusByServicePo(selectedDayEntryList), [selectedDayEntryList]);
+  // Same flags per row (Parent/Child line), so the exact reverted / rejected line is marked.
+  const rowStatusByKey = useMemo(() => statusByRow(selectedDayEntryList), [selectedDayEntryList]);
 
   const day = dailyData?.date ? Number(dailyData.date.slice(-2)) : selectedDate.date();
 
@@ -391,12 +422,13 @@ const EmployeeTimesheet = () => {
         </div>
 
         <div className="flex flex-wrap items-center gap-3">
-          <Tabs value={mode} onValueChange={setMode}>
-            <TabsList>
-              <TabsTrigger value="daily">Daily</TabsTrigger>
-              <TabsTrigger value="monthly">Monthly</TabsTrigger>
-            </TabsList>
-          </Tabs>
+          <ReportTypeToggle
+            inline
+            label="Log mode"
+            options={LOG_MODES}
+            value={mode}
+            onChange={setMode}
+          />
         </div>
       </div>
 
@@ -415,6 +447,7 @@ const EmployeeTimesheet = () => {
                 year={year}
                 onMonthChange={handleMonthChange}
                 calendarByDate={calendarByDate}
+                countsByDate={approvalCountsByDate}
                 selectedDate={selectedDate}
                 onSelectDate={handleSelectDate}
                 isLoading={isCalendarLoading}
@@ -466,6 +499,8 @@ const EmployeeTimesheet = () => {
                     onCellChange={handleCellChange}
                     descriptions={descriptions}
                     onDescriptionChange={handleDescriptionChange}
+                    poStatusById={poStatusById}
+                    rowStatusByKey={rowStatusByKey}
                   />
                 </>
               )}

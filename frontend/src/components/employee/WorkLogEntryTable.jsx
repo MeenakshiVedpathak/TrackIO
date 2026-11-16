@@ -10,6 +10,7 @@ import { Textarea } from '@/components/ui/textarea';
 import EmptyState from '@/components/common/EmptyState';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { APPROVED_LOCK_TOOLTIP } from '@/utils/approvedWorkLog';
+import { APPROVAL_META } from '@/utils/workLogDayStatus';
 import { cn } from '@/utils/cn';
 import { formatHoursMinutes, parseHourMinuteInput, formatHourMinuteValue, sumHours } from '@/utils/formatters';
 import { DAILY_HOURS_CAP } from './WorkLogEntryModal';
@@ -152,6 +153,60 @@ const ApprovedLockBadge = ({ label = 'Approved' }) => (
   </Tooltip>
 );
 
+// Rejected / Reverted flag on a Service PO folder or line for the selected day. Rejected shows the
+// approver's remark on hover; Reverted shows a one-line explanation (no reason). `span` trigger for the same nesting reason as above.
+const REVIEW_TONES = {
+  rejected: 'bg-rose-50 text-rose-700 ring-rose-200 dark:bg-rose-950/40 dark:text-rose-400 dark:ring-rose-900',
+  reverted: 'bg-orange-50 text-orange-700 ring-orange-200 dark:bg-orange-950/40 dark:text-orange-400 dark:ring-orange-900',
+  deleted: 'bg-slate-100 text-slate-600 ring-slate-200 dark:bg-slate-800/60 dark:text-slate-300 dark:ring-slate-700',
+};
+
+const PoReviewBadge = ({ review }) => {
+  if (!review) return null;
+  const { counts, rejectionRemark } = review;
+  const state = counts.rejected > 0 ? 'rejected'
+    : counts.reverted > 0 ? 'reverted'
+      : counts.deleted > 0 ? 'deleted'
+        : null;
+  if (!state) return null;
+  const meta = APPROVAL_META[state];
+  const Icon = meta.icon;
+  const tone = REVIEW_TONES[state];
+  const badge = (
+    <span className={cn('inline-flex shrink-0 items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-semibold ring-1 ring-inset', tone)}>
+      <Icon className="h-3 w-3" aria-hidden="true" />
+      {state === 'deleted' ? 'Deleted' : meta.label}
+    </span>
+  );
+  if (state === 'deleted') {
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>{badge}</TooltipTrigger>
+        <TooltipContent className="text-xs">An entry for this day was removed</TooltipContent>
+      </Tooltip>
+    );
+  }
+  // Reverted: hover explains the state only — the revert reason is deliberately not shown.
+  if (state === 'reverted') {
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>{badge}</TooltipTrigger>
+        <TooltipContent className="text-xs">Approval withdrawn — back to pending</TooltipContent>
+      </Tooltip>
+    );
+  }
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{badge}</TooltipTrigger>
+      <TooltipContent className="max-w-[260px] text-xs">
+        <p className="font-semibold">Sent back by your approver</p>
+        <p className="text-muted-foreground">{rejectionRemark || 'No reason given.'}</p>
+        <p className="mt-1 text-muted-foreground">Fix it from Rejected Entries and resubmit.</p>
+      </TooltipContent>
+    </Tooltip>
+  );
+};
+
 // One Service PO folder — its own row plus every hierarchy node beneath it (Parent/Child,
 // indented, "Task / Feature" being the node's name since our data has no separate module
 // concept). Open/closed is controlled by the parent (see collapsedGroupKeys) so Expand All /
@@ -159,7 +214,7 @@ const ApprovedLockBadge = ({ label = 'Approved' }) => (
 // total hrs is visible in one glance as a single line, expand only the one(s) you want to edit.
 const ProjectGroup = ({
   poRow, childrenByParent, day, edits, onCellChange, isPastOrToday, hoursCap, isOpen, onToggleOpen,
-  descriptions, onDescriptionChange, collapsedKeys, onToggleRowCollapse,
+  descriptions, onDescriptionChange, collapsedKeys, onToggleRowCollapse, review, rowStatusByKey,
 }) => {
   const nodeRows = useMemo(() => flattenSubtree(poRow, 0, childrenByParent), [poRow, childrenByParent]);
   const visibleRows = useMemo(
@@ -200,7 +255,8 @@ const ProjectGroup = ({
           <Folder className="h-3 w-3" />
         </span>
         <span className="flex-1 truncate text-xs font-semibold" title={poRow.label}>{poRow.label}</span>
-        {poRow.lockedByDay?.[day] && <ApprovedLockBadge />}
+        <PoReviewBadge review={review} />
+        {poRow.anyApprovedByDay?.[day] && <ApprovedLockBadge />}
         <span className="text-xs font-semibold text-primary">{formatHoursMinutes(groupTotal)}</span>
         {isOpen ? <ChevronUp className="h-3.5 w-3.5 text-muted-foreground" /> : <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />}
       </button>
@@ -213,8 +269,10 @@ const ProjectGroup = ({
           <div className="hidden gap-3 border-b bg-muted/50 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground sm:grid sm:grid-cols-[1.75rem_1.3fr_7rem_1.1fr]">
             <span>#</span>
             <span>Task / Activity</span>
-            <span className="text-right">Hours</span>
-            <span>Description</span>
+            {/* Centred over the stepper / value below, which is centred in the same 7rem column. */}
+            <span className="text-center">Hours</span>
+            {/* Inset to the description box's own text padding (px-2.5), not its border. */}
+            <span className="pl-2.5">Description</span>
           </div>
           {visibleRows.map((row, i) => {
             const isDirty = edits?.[row.rowKey]?.[day] !== undefined || descriptions?.[row.rowKey]?.[day] !== undefined;
@@ -225,7 +283,7 @@ const ProjectGroup = ({
             // parent's own hours on top of the children already carrying them. Expand to edit.
             const isRolledUp = hasChildren && isRowCollapsed;
             const value = isRolledUp ? subtreeValueOf(row) : cellValueOf(row);
-            // Per PO per date: any approved line locks every row of that PO for this date.
+            // Per line per date: only an approved line itself is read-only.
             const isLocked = !!row.lockedByDay?.[day];
             const canEditRow = row.editable && isPastOrToday && !isRolledUp && !isLocked;
             const descriptionValue = descriptionValueOf(row);
@@ -271,11 +329,12 @@ const ProjectGroup = ({
                         </button>
                       )}
                       <span className="truncate" title={row.label}>{row.label}</span>
-                      {row.approvedByDay?.[day] && row.depth !== 0 && <ApprovedLockBadge />}
+                      <PoReviewBadge review={rowStatusByKey?.[row.rowKey]} />
+                      {row.approvedByDay?.[day] && <ApprovedLockBadge />}
                       {isDirty && <span className="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-amber-400" title="Unsaved change" />}
                     </span>
                   </div>
-                  <div className="shrink-0 sm:flex sm:justify-end sm:pt-1">
+                  <div className="shrink-0 sm:flex sm:justify-center sm:pt-1">
                     {canEditRow ? (
                       <HourStepper value={value} onChange={(v) => onCellChange(row.rowKey, day, String(v))} hoursCap={hoursCap} />
                     ) : (
@@ -305,7 +364,7 @@ const ProjectGroup = ({
                     </div>
                   ) : (
                     <span
-                      className={cn('block text-xs sm:pt-1.5', descriptionValue ? 'text-muted-foreground' : 'italic text-muted-foreground/40')}
+                      className={cn('block text-xs sm:pl-2.5 sm:pt-1.5', descriptionValue ? 'text-muted-foreground' : 'italic text-muted-foreground/40')}
                       title={descriptionValue || undefined}
                     >
                       {descriptionValue || 'No description'}
@@ -332,6 +391,11 @@ const ProjectGroup = ({
 const WorkLogEntryTable = ({
   rows, day, isLoading, isPastOrToday, edits, onCellChange, hoursCap = DAILY_HOURS_CAP,
   emptyMessage = 'No Service POs mapped.', descriptions, onDescriptionChange,
+  // Optional { [service_po_id]: { counts, rejectionRemark, revertReason } } for the shown day —
+  // flags a folder as Rejected / Reverted (see utils/workLogDayStatus statusByServicePo).
+  poStatusById,
+  // Optional { [rowKey]: { counts, rejectionRemark, revertReason } } — flags the exact line.
+  rowStatusByKey,
 }) => {
   const childrenByParent = useMemo(() => buildChildrenByParent(rows), [rows]);
   const topLevelRows = useMemo(() => rows.filter((r) => (r.depth ?? 0) === 0), [rows]);
@@ -479,6 +543,8 @@ const WorkLogEntryTable = ({
             onDescriptionChange={onDescriptionChange}
             collapsedKeys={collapsedKeys}
             onToggleRowCollapse={toggleRowCollapse}
+            review={poStatusById?.[String(row.servicePOId)]}
+            rowStatusByKey={rowStatusByKey}
           />
         ))}
       </div>

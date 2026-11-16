@@ -1,13 +1,14 @@
 import { useMemo, useState } from 'react';
 import dayjs from 'dayjs';
 import { AnimatePresence, motion } from 'framer-motion';
-import { AlertCircle, BellRing, ChevronDown, ChevronRight, Loader2 } from 'lucide-react';
+import { AlertCircle, BellRing, CalendarDays, ChevronRight, FileText, Loader2 } from 'lucide-react';
 import { useTimesheetApprovalStatusReport } from '@/hooks/useTimesheetApprovalStatusReport';
 import { useMyTeamEmployees } from '@/hooks/useMyTeam';
 import { useNotification } from '@/hooks/useNotification';
 import { employeeWorkLogApi } from '@/api/employeeWorkLog.api';
 import { extractApiError } from '@/services/apiClient';
-import { formatHours, formatDate, formatMonthYear } from '@/utils/formatters';
+import { formatHours, formatDate, formatMonthYear, getInitials, getStatusColor } from '@/utils/formatters';
+import { Skeleton } from '@/components/ui/skeleton';
 import { cn } from '@/utils/cn';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
@@ -21,6 +22,8 @@ import PageHeader from '@/components/common/PageHeader';
 import EmptyState from '@/components/common/EmptyState';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
+import ReportTypeToggle from '@/components/common/ReportTypeToggle';
+import { useActionConfirm } from '@/components/common/ExportConfirm';
 import StatusBadge from '@/components/common/StatusBadge';
 
 // 'weekly' shares the same `range` state as 'range' below — WeekPicker just snaps selection to a
@@ -69,44 +72,60 @@ const normalizeProjects = (projects = []) =>
     (project.service_pos ?? []).map((po) => normalizeServicePO(po, project.project_name))
   );
 
+// Status -> accent colour for the card's top strip; same buckets StatusBadge's own colours use.
+const STATUS_ACCENT = {
+  success: 'bg-emerald-500',
+  warning: 'bg-amber-400',
+  destructive: 'bg-rose-500',
+  info: 'bg-sky-500',
+  secondary: 'bg-slate-300',
+};
+
 const TreeRow = ({ node, depth, expandedKeys, onToggle }) => {
   const hasChildren = node.children.length > 0;
   const isExpanded = expandedKeys.has(node.key);
+  const isTop = depth === 0;
 
   return (
-    <div className="border-t first:border-t-0">
+    <div className={cn(isTop && 'border-t first:border-t-0')}>
       <button
         type="button"
         onClick={() => hasChildren && onToggle(node.key)}
         disabled={!hasChildren}
+        aria-expanded={hasChildren ? isExpanded : undefined}
         className={cn(
-          'w-full grid gap-2 items-center px-4 py-2 text-left hover:bg-muted/30 transition-colors disabled:cursor-default disabled:hover:bg-transparent',
-          GRID_COLS,
-          depth === 0 && 'font-semibold'
+          'grid w-full items-center gap-2 px-4 text-left transition-colors',
+          'hover:bg-muted/40 focus-visible:bg-muted/40 focus-visible:outline-none disabled:cursor-default disabled:hover:bg-transparent',
+          isTop ? 'py-3' : 'py-2',
+          GRID_COLS
         )}
       >
-        <span
-          className="flex items-center gap-1.5 truncate"
-          style={{ paddingLeft: depth * INDENT_PER_DEPTH_PX }}
-        >
-          {hasChildren ? (
-            isExpanded ? (
-              <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-            ) : (
-              <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-            )
+        <span className="flex min-w-0 items-center gap-2" style={{ paddingLeft: depth * INDENT_PER_DEPTH_PX }}>
+          <ChevronRight
+            className={cn(
+              'h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200',
+              isExpanded && 'rotate-90',
+              !hasChildren && 'invisible'
+            )}
+            aria-hidden="true"
+          />
+          {isTop ? (
+            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+              <FileText className="h-4 w-4" aria-hidden="true" />
+            </span>
           ) : (
-            <span className="w-3.5 shrink-0" />
+            <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-muted-foreground/40" aria-hidden="true" />
           )}
-          {depth > 0 && <span className="text-muted-foreground">└</span>}
-          <span className="flex flex-col min-w-0">
-            <span className={cn('truncate', depth > 0 && 'text-sm')}>{node.name}</span>
-            {depth === 0 && node.projectName && (
-              <span className="text-xs font-normal text-muted-foreground truncate">{node.projectName}</span>
+          <span className="flex min-w-0 flex-col">
+            <span className={cn('truncate', isTop ? 'text-sm font-semibold text-foreground' : 'text-sm text-foreground/90')}>
+              {node.name}
+            </span>
+            {isTop && node.projectName && (
+              <span className="truncate text-xs text-muted-foreground">{node.projectName}</span>
             )}
           </span>
         </span>
-        <span className={cn('text-right tabular-nums', depth === 0 ? 'font-semibold' : 'text-sm')}>
+        <span className={cn('text-right tabular-nums', isTop ? 'text-sm font-semibold' : 'text-sm text-muted-foreground')}>
           {node.hours !== undefined ? formatHours(node.hours) : '—'}
         </span>
         <span className="flex justify-end">
@@ -121,9 +140,15 @@ const TreeRow = ({ node, depth, expandedKeys, onToggle }) => {
               initial={{ height: 0, opacity: 0 }}
               animate={{ height: 'auto', opacity: 1 }}
               exit={{ height: 0, opacity: 0 }}
-              transition={{ duration: 0.15 }}
-              className="overflow-hidden bg-muted/10"
+              transition={{ duration: 0.18, ease: 'easeOut' }}
+              className="relative overflow-hidden bg-muted/20"
             >
+              {/* Guide line linking the children to their parent row. */}
+              <span
+                aria-hidden="true"
+                className="absolute bottom-2 top-0 w-px bg-border"
+                style={{ left: 16 + depth * INDENT_PER_DEPTH_PX + 7 }}
+              />
               {node.children.map((child) => (
                 <TreeRow key={child.key} node={child} depth={depth + 1} expandedKeys={expandedKeys} onToggle={onToggle} />
               ))}
@@ -143,28 +168,59 @@ const periodLabel = (bucket) =>
 // Deliberately carries no "Remind Team Lead" control of its own: the reminder endpoint takes no
 // date or bucket, so every per-bucket button would have fired the exact same tenant-wide "all my
 // pending logs" request. One button in the page header says that honestly — see handleRemind.
-const BucketCard = ({ bucket, showEmployeeName, expandedKeys, onToggle }) => {
+const BucketCard = ({ bucket, showEmployeeName, expandedKeys, onToggle, index = 0 }) => {
   const projects = useMemo(() => normalizeProjects(bucket.projects), [bucket.projects]);
+  const accent = STATUS_ACCENT[getStatusColor(bucket.approval_status)] ?? STATUS_ACCENT.secondary;
 
   return (
-    <div className="rounded-lg border overflow-hidden">
-      <div className="flex flex-wrap items-center justify-between gap-2 bg-muted/50 px-4 py-2.5">
-        <div className="flex items-baseline gap-2">
-          {showEmployeeName && <span className="text-sm font-semibold">{bucket.employee_name}</span>}
-          <span className="text-sm text-muted-foreground">{periodLabel(bucket)}</span>
+    <motion.div
+      initial={{ opacity: 0, y: 6 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.2, delay: Math.min(index * 0.04, 0.24), ease: 'easeOut' }}
+      className="overflow-hidden rounded-xl border bg-card shadow-sm transition-shadow hover:shadow-md"
+    >
+      <div className={cn('h-1 w-full', accent)} aria-hidden="true" />
+
+      <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
+        <div className="flex min-w-0 items-center gap-3">
+          {showEmployeeName ? (
+            <>
+              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary/10 text-xs font-semibold text-primary">
+                {getInitials(bucket.employee_name)}
+              </span>
+              <span className="flex min-w-0 flex-col gap-0.5">
+                <span className="truncate text-sm font-semibold text-foreground">{bucket.employee_name || '—'}</span>
+                <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+                  <CalendarDays className="h-3 w-3" aria-hidden="true" />
+                  {periodLabel(bucket)}
+                </span>
+              </span>
+            </>
+          ) : (
+            <span className="inline-flex items-center gap-2 text-sm font-semibold text-foreground">
+              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
+                <CalendarDays className="h-4 w-4" aria-hidden="true" />
+              </span>
+              {periodLabel(bucket)}
+            </span>
+          )}
         </div>
-        <div className="flex items-center gap-3">
-          <span className="text-sm font-semibold tabular-nums">{formatHours(bucket.total_hours)}</span>
+
+        <div className="flex items-center gap-4">
+          <div className="text-right">
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Total</p>
+            <p className="text-lg font-bold leading-tight tabular-nums text-foreground">{formatHours(bucket.total_hours)}</p>
+          </div>
           <StatusCell status={bucket.approval_status} />
         </div>
       </div>
 
       {projects.length === 0 ? (
-        <div className="px-4 py-6 text-center text-sm text-muted-foreground">No activity for this period.</div>
+        <div className="border-t px-4 py-6 text-center text-sm text-muted-foreground">No activity for this period.</div>
       ) : (
         <>
-          <div className={cn('grid gap-2 bg-muted/20 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground', GRID_COLS)}>
-            <span>Service PO / Hierarchy</span>
+          <div className={cn('grid gap-2 border-y bg-muted/30 px-4 py-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground', GRID_COLS)}>
+            <span className="pl-6">Service PO / Hierarchy</span>
             <span className="text-right">Hours</span>
             <span className="text-right">Status</span>
           </div>
@@ -173,12 +229,33 @@ const BucketCard = ({ bucket, showEmployeeName, expandedKeys, onToggle }) => {
           ))}
         </>
       )}
-    </div>
+    </motion.div>
   );
 };
 
+const BucketCardSkeleton = () => (
+  <div className="overflow-hidden rounded-xl border bg-card shadow-sm">
+    <Skeleton className="h-1 w-full rounded-none" />
+    <div className="flex items-center justify-between px-4 py-3">
+      <div className="flex items-center gap-3">
+        <Skeleton className="h-9 w-9 rounded-full" />
+        <div className="space-y-1.5">
+          <Skeleton className="h-3.5 w-32" />
+          <Skeleton className="h-3 w-20" />
+        </div>
+      </div>
+      <Skeleton className="h-6 w-24 rounded-full" />
+    </div>
+    <div className="space-y-3 border-t px-4 py-3">
+      <Skeleton className="h-8 w-full" />
+      <Skeleton className="h-8 w-4/5" />
+    </div>
+  </div>
+);
+
 const TimesheetApprovalStatusReport = () => {
   const { success, error: showError } = useNotification();
+  const confirmAction = useActionConfirm();
   const [filtersOpen, setFiltersOpen] = useState(false);
   // Default to Monthly mode showing the current month — an employee arriving here to check
   // approval status or send a reminder sees the whole month's buckets immediately.
@@ -226,7 +303,10 @@ const TimesheetApprovalStatusReport = () => {
   const { data, isLoading, isError, error } = useTimesheetApprovalStatusReport(params, hasSelection);
 
   const buckets = data ?? [];
-  const showEmployeeName = isTeamLead && (employeeIds.length === 0 || buckets.length > 1);
+  // Several employees in one response (e.g. a manager's view) always need the name — otherwise two
+  // buckets for the same month render as identical, indistinguishable cards.
+  const distinctEmployeeCount = new Set(buckets.map((b) => b.employee_id)).size;
+  const showEmployeeName = distinctEmployeeCount > 1 || (isTeamLead && employeeIds.length === 0);
   const errorMessage = isError ? extractApiError(error) : null;
   const showLoading = hasSelection && isLoading;
 
@@ -283,14 +363,19 @@ const TimesheetApprovalStatusReport = () => {
     <div className="flex h-full min-h-0 flex-col space-y-4">
       <PageHeader
         title="Timesheet Approval Status Report"
-        description="Hours logged and their approval status, broken down by Project → Service PO → Parent → Child. Read-only — use My Team to approve."
         actions={
           <div className="flex items-center gap-2">
             {showRemindButton && (
               <Button
                 size="toolbar"
                 className="relative bg-amber-500 text-white shadow-md shadow-amber-500/30 hover:bg-amber-600"
-                onClick={handleRemind}
+                onClick={() => confirmAction(handleRemind, {
+                  title: 'Send reminder?',
+                  description: 'Your manager will get an email about pending logs',
+                  confirmLabel: 'Send',
+                  icon: BellRing,
+                  tone: 'amber',
+                })}
                 disabled={isReminding}
                 title="Email your primary Team Lead about your work logs awaiting approval"
               >
@@ -316,31 +401,7 @@ const TimesheetApprovalStatusReport = () => {
       />
 
       <FilterPanel isOpen={filtersOpen} maxHeightClass="max-h-[300px]" onClear={clearFilters} showClear={activeFilterCount > 0}>
-        {/* A fixed 2x2 button grid, not a single row of 4 — see EmployeeReports.jsx's identical
-            control for why a single row (even with extra column-span/min-w-0/truncate) still
-            wasn't reliably enough room at every screen size. Each button here only ever competes
-            for half its container's width against one sibling, with no breakpoint dependency. */}
-        <div className="flex flex-col gap-1.5">
-          <Label className="text-xs">Report Type</Label>
-          <div className="grid grid-cols-2 rounded-md border overflow-hidden text-[clamp(0.75rem,0.85vw,0.875rem)] bg-white">
-            {REPORT_TYPES.map(({ label, value }, i) => (
-              <button
-                key={value}
-                onClick={() => setReportType(value)}
-                className={cn(
-                  'flex h-[clamp(1.375rem,1.6vw,1.625rem)] items-center justify-center px-[clamp(0.375rem,0.5vw,0.5rem)] min-w-0 font-medium text-center truncate transition-colors leading-none',
-                  i % 2 === 0 && 'border-r',
-                  i < 2 && 'border-b',
-                  reportType === value
-                    ? 'bg-primary text-primary-foreground'
-                    : 'bg-background text-muted-foreground hover:bg-muted'
-                )}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-        </div>
+        <ReportTypeToggle options={REPORT_TYPES} value={reportType} onChange={setReportType} />
 
         {reportType === 'daily' && (
           <div className="flex flex-col gap-1.5">
@@ -374,11 +435,18 @@ const TimesheetApprovalStatusReport = () => {
               <Label className="text-xs">Date Range</Label>
               <DateRangePicker value={range} onChange={setRange} placeholder="Select a date range" className="h-[clamp(1.875rem,2vw,2.25rem)] w-full text-[clamp(0.75rem,0.85vw,0.875rem)] bg-white" clearable />
             </div>
-            <div className="flex items-center gap-2 pt-5">
-              <Checkbox id="aggregate-monthly" checked={aggregateMonthly} onCheckedChange={(v) => setAggregateMonthly(!!v)} />
-              <Label htmlFor="aggregate-monthly" className="text-xs font-normal cursor-pointer">
-                Aggregate into monthly buckets
-              </Label>
+            <div className="flex flex-col gap-1.5">
+              <Label className="text-xs">Grouping</Label>
+              <label
+                htmlFor="aggregate-monthly"
+                className={cn(
+                  'flex h-[clamp(1.875rem,2vw,2.25rem)] cursor-pointer items-center gap-2 rounded-md border bg-white px-3 text-[clamp(0.75rem,0.85vw,0.875rem)] transition-colors hover:bg-muted/50',
+                  aggregateMonthly && 'border-primary/50 bg-primary/5'
+                )}
+              >
+                <Checkbox id="aggregate-monthly" checked={aggregateMonthly} onCheckedChange={(v) => setAggregateMonthly(!!v)} />
+                <span className="truncate">Aggregate into monthly buckets</span>
+              </label>
             </div>
           </>
         )}
@@ -410,7 +478,10 @@ const TimesheetApprovalStatusReport = () => {
       )}
 
       {showLoading && (
-        <div className="rounded-lg border px-4 py-8 text-center text-sm text-muted-foreground">Loading…</div>
+        <div className="space-y-3" aria-busy="true" aria-label="Loading report">
+          <BucketCardSkeleton />
+          <BucketCardSkeleton />
+        </div>
       )}
 
       {hasSelection && !showLoading && !errorMessage && (
@@ -418,9 +489,10 @@ const TimesheetApprovalStatusReport = () => {
           <EmptyState title="No timesheet activity for this period." />
         ) : (
           <div className="space-y-3">
-            {buckets.map((bucket) => (
+            {buckets.map((bucket, index) => (
               <BucketCard
                 key={bucketKey(bucket)}
+                index={index}
                 bucket={bucket}
                 showEmployeeName={showEmployeeName}
                 expandedKeys={expandedKeys}

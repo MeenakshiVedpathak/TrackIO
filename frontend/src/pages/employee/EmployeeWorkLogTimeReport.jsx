@@ -12,7 +12,6 @@ import { useNotification } from '@/hooks/useNotification';
 import { extractApiError } from '@/services/apiClient';
 import { downloadBlob } from '@/utils/download';
 import { formatDate } from '@/utils/formatters';
-import { cn } from '@/utils/cn';
 import { DatePicker } from '@/components/ui/date-picker';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
@@ -26,6 +25,7 @@ import PageHeader from '@/components/common/PageHeader';
 import EmptyState from '@/components/common/EmptyState';
 import FilterToggleButton from '@/components/common/FilterToggleButton';
 import FilterPanel from '@/components/common/FilterPanel';
+import ReportTypeToggle from '@/components/common/ReportTypeToggle';
 import { useExportConfirm } from '@/components/common/ExportConfirm';
 
 // 'weekly' shares the same `range` state as 'range' below — WeekPicker just snaps selection to a
@@ -273,31 +273,7 @@ const EmployeeWorkLogTimeReport = () => {
           </div>
         )}
 
-        {/* A fixed 2x2 button grid, not a single row of 4 — see EmployeeReports.jsx's identical
-            control for why a single row (even with extra column-span/min-w-0/truncate) still
-            wasn't reliably enough room at every screen size. Each button here only ever competes
-            for half its container's width against one sibling, with no breakpoint dependency. */}
-        <div className="flex flex-col gap-1.5">
-          <Label className="text-xs">Period</Label>
-          <div className="grid grid-cols-2 rounded-md border overflow-hidden text-[clamp(0.75rem,0.85vw,0.875rem)] bg-white">
-            {PERIOD_TYPES.map(({ label, value }, i) => (
-              <button
-                key={value}
-                onClick={() => setPeriodType(value)}
-                className={cn(
-                  'flex h-[clamp(1.375rem,1.6vw,1.625rem)] items-center justify-center px-[clamp(0.375rem,0.5vw,0.5rem)] min-w-0 font-medium text-center truncate transition-colors leading-none',
-                  i % 2 === 0 && 'border-r',
-                  i < 2 && 'border-b',
-                  periodType === value
-                    ? 'bg-primary text-primary-foreground'
-                    : 'bg-background text-muted-foreground hover:bg-muted'
-                )}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-        </div>
+        <ReportTypeToggle label="Period" options={PERIOD_TYPES} value={periodType} onChange={setPeriodType} />
 
         {periodType === 'daily' && (
           <div className="flex flex-col gap-1.5">

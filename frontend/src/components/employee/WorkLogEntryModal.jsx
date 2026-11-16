@@ -6,8 +6,12 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import dayjs from 'dayjs';
 import {
-  Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
+  AlignLeft, CalendarDays, Clock3, FolderKanban, ListTree, Loader2, Pencil, Plus, RotateCcw, Save, Send, XCircle,
+} from 'lucide-react';
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
 } from '@/components/ui/dialog';
+import { cn } from '@/utils/cn';
 import { Form, FormField, FormItem, FormLabel, FormControl, FormMessage } from '@/components/ui/form';
 import { Input } from '@/components/ui/input';
 import { DatePicker } from '@/components/ui/date-picker';
@@ -26,6 +30,15 @@ import { validateSegments, sumSegmentHours } from '@/utils/employeeTimeEntry';
 import { ROUTES } from '@/constants/routes';
 
 export const DAILY_HOURS_CAP = 24;
+
+// Shared bits of the modal's look: labels carry a small leading icon, the footer is a full-bleed
+// muted bar under a divider.
+const LABEL = 'flex items-center gap-1.5';
+const LABEL_ICON = 'h-3.5 w-3.5 text-muted-foreground';
+const FOOTER = 'mt-0 shrink-0 gap-2 border-t bg-muted/30 px-6 py-3 sm:space-x-0';
+
+const initialsOf = (name = '') =>
+  name.split(/\s+/).filter(Boolean).slice(0, 2).map((p) => p[0]?.toUpperCase()).join('') || '?';
 // A standard workday, used only client-side to color the calendar heatmap and the daily
 // progress bar (Completed / Partial / No Entry) — the backend has no such target field.
 export const EXPECTED_DAILY_HOURS = 8;
@@ -225,23 +238,57 @@ const WorkLogEntryModal = ({ open, onOpenChange, date, task }) => {
     }
   };
 
+  const isRejected = task?.status === 'rejected';
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="flex max-h-[calc(100dvh-2rem)] max-w-md flex-col overflow-y-hidden overflow-x-hidden">
-        <DialogHeader>
-          <DialogTitle>{isEdit ? 'Edit Work Log Entry' : 'Add Work Log Entry'}</DialogTitle>
+      <DialogContent className="flex max-h-[calc(100dvh-2rem)] max-w-lg flex-col gap-0 overflow-hidden p-0">
+        <DialogHeader className="mb-0 shrink-0 border-b px-6 pb-4 pt-5">
+          <div className="flex items-start gap-3 pr-6">
+            <span
+              className={cn(
+                'flex h-9 w-9 shrink-0 items-center justify-center rounded-lg',
+                isRejected
+                  ? 'bg-rose-50 text-rose-600 dark:bg-rose-950/40 dark:text-rose-400'
+                  : 'bg-primary/10 text-primary',
+              )}
+            >
+              {isRejected ? <RotateCcw className="h-4 w-4" /> : isEdit ? <Pencil className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
+            </span>
+            <div className="min-w-0 space-y-1 text-left">
+              <DialogTitle>{isEdit ? 'Edit Work Log Entry' : 'Add Work Log Entry'}</DialogTitle>
+              <DialogDescription className="text-xs">
+                {isRejected
+                  ? 'Fix what your approver flagged, then resubmit it for approval.'
+                  : isEdit ? 'Update the hours or details of this entry.' : 'Log time against one of your projects.'}
+              </DialogDescription>
+            </div>
+          </div>
         </DialogHeader>
 
         {/* Only this middle band scrolls — the title above and the buttons below stay in place
             however short the viewport is. */}
-        <div className="-mr-3 min-h-0 flex-1 space-y-4 overflow-y-auto pr-3">
-        {task?.status === 'rejected' && (
-          <div className="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
-            <p className="font-medium">
-              Rejected{task.rejected_by_name ? ` by ${task.rejected_by_name}` : ''}
-              {task.rejected_at ? ` on ${formatDateTime(task.rejected_at)}` : ''}
+        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 py-4">
+        {isRejected && (
+          <div className="rounded-lg border border-rose-200/80 bg-rose-50/60 p-3 dark:border-rose-900/60 dark:bg-rose-950/20">
+            <div className="flex items-center gap-2">
+              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-rose-100 text-[10px] font-semibold text-rose-700 dark:bg-rose-900/50 dark:text-rose-300">
+                {task.rejected_by_name ? initialsOf(task.rejected_by_name) : <XCircle className="h-3 w-3" />}
+              </span>
+              <p
+                className="min-w-0 flex-1 truncate text-xs text-rose-900 dark:text-rose-200"
+                title={`${task.rejected_by_name || 'Your approver'} sent this back`}
+              >
+                <span className="font-semibold">{task.rejected_by_name || 'Your approver'}</span>
+                <span className="text-rose-700/80 dark:text-rose-300/80"> sent this back</span>
+              </p>
+              {task.rejected_at && (
+                <span className="shrink-0 text-[11px] text-rose-700/70 dark:text-rose-300/70">{formatDateTime(task.rejected_at)}</span>
+              )}
+            </div>
+            <p className="mt-2 border-l-2 border-rose-300 pl-2.5 text-sm text-rose-800 dark:border-rose-800 dark:text-rose-200">
+              {task.rejection_remark || <span className="italic opacity-70">No remark given.</span>}
             </p>
-            {task.rejection_remark && <p className="mt-1">{task.rejection_remark}</p>}
           </div>
         )}
 
@@ -265,7 +312,7 @@ const WorkLogEntryModal = ({ open, onOpenChange, date, task }) => {
               name="timesheet_date"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>Date</FormLabel>
+                  <FormLabel className={LABEL}><CalendarDays className={LABEL_ICON} />Date</FormLabel>
                   <FormControl>
                     <DatePicker
                       value={field.value || ''}
@@ -284,7 +331,7 @@ const WorkLogEntryModal = ({ open, onOpenChange, date, task }) => {
               name="service_po_id"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>Project</FormLabel>
+                  <FormLabel className={LABEL}><FolderKanban className={LABEL_ICON} />Project</FormLabel>
                   <FormControl>
                     <ProjectSelect
                       value={field.value}
@@ -306,7 +353,10 @@ const WorkLogEntryModal = ({ open, onOpenChange, date, task }) => {
                 name="hierarchy_node_id"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Hierarchy Node (optional)</FormLabel>
+                    <FormLabel className={LABEL}>
+                      <ListTree className={LABEL_ICON} />Module / Task
+                      <span className="font-normal text-muted-foreground">(optional)</span>
+                    </FormLabel>
                     <FormControl>
                       <SearchableSelect
                         options={[
@@ -352,20 +402,24 @@ const WorkLogEntryModal = ({ open, onOpenChange, date, task }) => {
                 name="hours"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Hours</FormLabel>
+                    <FormLabel className={LABEL}><Clock3 className={LABEL_ICON} />Hours</FormLabel>
                     <FormControl>
-                      <Input
-                        type="number"
-                        step="0.5"
-                        min="0"
-                        max={DAILY_HOURS_CAP}
-                        placeholder="e.g. 4.5"
-                        disabled={isSaving}
-                        // Same fix as WorkLogEntryTable's HourStepper — a focused number input
-                        // otherwise treats page-scroll wheel events as +/- clicks.
-                        onWheel={(e) => e.currentTarget.blur()}
-                        {...field}
-                      />
+                      <div className="relative">
+                        <Input
+                          type="number"
+                          step="0.5"
+                          min="0"
+                          max={DAILY_HOURS_CAP}
+                          placeholder="e.g. 4.5"
+                          disabled={isSaving}
+                          className="pr-12 tabular-nums"
+                          // Same fix as WorkLogEntryTable's HourStepper — a focused number input
+                          // otherwise treats page-scroll wheel events as +/- clicks.
+                          onWheel={(e) => e.currentTarget.blur()}
+                          {...field}
+                        />
+                        <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-xs text-muted-foreground">hrs</span>
+                      </div>
                     </FormControl>
                     <FormMessage />
                   </FormItem>
@@ -378,11 +432,14 @@ const WorkLogEntryModal = ({ open, onOpenChange, date, task }) => {
               name="description"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>Description</FormLabel>
+                  <FormLabel className={LABEL}><AlignLeft className={LABEL_ICON} />Description</FormLabel>
                   <FormControl>
-                    <Textarea placeholder="What did you work on?" disabled={isSaving} maxLength={500} {...field} />
+                    <Textarea placeholder="What did you work on?" disabled={isSaving} maxLength={500} className="min-h-[88px] resize-none" {...field} />
                   </FormControl>
-                  <FormMessage />
+                  <div className="flex items-start justify-between gap-2">
+                    <FormMessage />
+                    <span className="ml-auto text-[11px] tabular-nums text-muted-foreground">{(field.value ?? '').length} / 500</span>
+                  </div>
                 </FormItem>
               )}
             />
@@ -392,11 +449,11 @@ const WorkLogEntryModal = ({ open, onOpenChange, date, task }) => {
         </div>
 
         {isMonthly ? (
-          <DialogFooter className="shrink-0">
+          <DialogFooter className={FOOTER}>
             <Button variant="outline" size="sm" onClick={() => onOpenChange(false)}>Close</Button>
           </DialogFooter>
         ) : (
-        <DialogFooter className="shrink-0 gap-2">
+        <DialogFooter className={FOOTER}>
           <Button variant="outline" size="sm" onClick={() => onOpenChange(false)} disabled={isSaving}>
             Cancel
           </Button>
@@ -416,8 +473,11 @@ const WorkLogEntryModal = ({ open, onOpenChange, date, task }) => {
             disabled={isSaving}
           >
             {isSaving
+              ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+              : isRejected ? <Send className="mr-1.5 h-3.5 w-3.5" /> : <Save className="mr-1.5 h-3.5 w-3.5" />}
+            {isSaving
               ? (resubmitMutation.isPending ? 'Resubmitting…' : 'Saving…')
-              : (isEdit && task?.status === 'rejected' ? 'Save & Resubmit' : 'Save & Close')}
+              : (isRejected ? 'Save & Resubmit' : 'Save & Close')}
           </Button>
         </DialogFooter>
         )}

@@ -11,6 +11,7 @@ import SummaryRow from './SummaryRow';
 import SummaryFooter from './SummaryFooter';
 import { FIRST_COL_WIDTH, DAY_COL_WIDTH, TOTAL_COL_WIDTH } from './summaryTableLayout';
 import { sumHours } from '@/utils/formatters';
+import { cn } from '@/utils/cn';
 
 // Responsive freeze-pane table for the Monthly Summary tab: sticky header, sticky first
 // column (Service/Project), sticky last column (Total), sticky bottom TOTAL row. A single
@@ -173,13 +174,14 @@ const SummaryTable = ({
       {/* A month's worth of day columns is always wider than a phone screen no matter how this
           table is styled, so the scroll container below is genuinely swipeable rather than
           broken — this just makes that discoverable instead of reading as a hard cutoff. */}
-      <p className="mb-1.5 flex items-center gap-1 text-[11px] text-muted-foreground sm:hidden">
+      <p className="mb-1.5 flex shrink-0 items-center gap-1 text-[11px] text-muted-foreground sm:hidden">
         <MoveHorizontal className="h-3 w-3 shrink-0" />
         Swipe to see more days
       </p>
       <Table
         className="table-fixed border-collapse"
-        containerClassName="max-h-[min(605px,70vh)] overflow-auto rounded-xl border bg-card"
+        // No fixed max-height: the page sizes this box to whatever is left above the Save bar.
+        containerClassName="min-h-0 overflow-auto rounded-xl border bg-card shadow-sm"
       >
       <TableHeader>
         <TableRow className="hover:bg-transparent">
@@ -190,18 +192,32 @@ const SummaryTable = ({
             Service / Project
           </TableHead>
 
-          {days.map((day) => (
-            <TableHead
-              key={day}
-              className="summary-table-head px-1 text-center"
-              style={{ width: DAY_COL_WIDTH, minWidth: DAY_COL_WIDTH, maxWidth: DAY_COL_WIDTH }}
-            >
-              <div className="flex flex-col items-center leading-tight">
-                <span className="text-xs font-bold text-foreground">{day}</span>
-                <span className="text-[9px] font-normal text-muted-foreground">{weekdayShort(day)}</span>
-              </div>
-            </TableHead>
-          ))}
+          {days.map((day) => {
+            const isToday = monthStart.date(day).isSame(today, 'day');
+            const isWeekend = [0, 6].includes(monthStart.date(day).day());
+            return (
+              <TableHead
+                key={day}
+                className={cn('summary-table-head px-1 text-center', isWeekend && 'bg-slate-100 dark:bg-slate-800')}
+                style={{ width: DAY_COL_WIDTH, minWidth: DAY_COL_WIDTH, maxWidth: DAY_COL_WIDTH }}
+                aria-current={isToday ? 'date' : undefined}
+              >
+                <div className="flex flex-col items-center gap-0.5 leading-tight">
+                  <span
+                    className={cn(
+                      'flex h-5 w-5 items-center justify-center rounded-full text-xs font-bold',
+                      isToday ? 'bg-primary text-primary-foreground' : 'text-foreground'
+                    )}
+                  >
+                    {day}
+                  </span>
+                  <span className={cn('text-[9px] font-normal', isToday ? 'font-semibold text-primary' : 'text-muted-foreground')}>
+                    {weekdayShort(day)}
+                  </span>
+                </div>
+              </TableHead>
+            );
+          })}
 
           <TableHead
             className="summary-table-head summary-col-pinned sticky right-0 top-0 text-center"

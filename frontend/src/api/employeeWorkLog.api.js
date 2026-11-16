@@ -66,9 +66,13 @@ export const employeeWorkLogApi = {
     apiClient.post('/employee-timesheets/entries', { timesheet_date, entries }).then((r) => r.data),
   update: (id, payload) => apiClient.put(`/employee-timesheets/entries/${id}`, payload).then((r) => r.data),
   delete: (id) => apiClient.delete(`/employee-timesheets/entries/${id}`).then((r) => r.data),
-  getEntries: ({ status, page, limit, startDate, endDate, poId } = {}) =>
+  // `includeDeleted` asks for soft-deleted lines too (flagged status 'deleted' / deleted_at) — only
+  // the Work Log "Deleted" badges use it; until the backend supports it, it's simply ignored.
+  getEntries: ({ status, page, limit, startDate, endDate, poId, includeDeleted } = {}) =>
     apiClient
-      .get('/employee-timesheets/entries', { params: { status, page, limit, startDate, endDate, poId } })
+      .get('/employee-timesheets/entries', {
+        params: { status, page, limit, startDate, endDate, poId, include_deleted: includeDeleted || undefined },
+      })
       .then((r) => r.data),
   resubmit: (id) => apiClient.put(`/employee-timesheets/entries/${id}/resubmit`).then((r) => r.data),
   getMonthly: ({ month, year }) =>

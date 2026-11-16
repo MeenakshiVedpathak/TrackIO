@@ -19,11 +19,17 @@ import SummaryTable from '@/components/employee/SummaryTable';
 import WorkLogEntryTable from '@/components/employee/WorkLogEntryTable';
 import { DAILY_HOURS_CAP, getMonthlyHourCap } from '@/components/employee/WorkLogEntryModal';
 import { Button } from '@/components/ui/button';
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import ConfirmDialog from '@/components/common/ConfirmDialog';
 import PageHeader from '@/components/common/PageHeader';
 import { useExportConfirm } from '@/components/common/ExportConfirm';
+import { cn } from '@/utils/cn';
+import ReportTypeToggle from '@/components/common/ReportTypeToggle';
+
+const VIEW_MODES = [
+  { label: 'Day View', value: 'day' },
+  { label: 'Month View', value: 'month' },
+];
 
 // Month View has no real per-day date, so every row is bucketed under this one pseudo-day key —
 // same trick My Work Log's Monthly tab uses — letting it reuse the exact same row-building
@@ -313,8 +319,18 @@ const MonthlySummaryPage = () => {
     }
   };
 
+  // Highlighted once there's something to save. Always on screen because the page fills the
+  // content area and only the table / card list in the middle scrolls — not `sticky`, which sat
+  // on top of the table's own sticky TOTAL row.
+  const saveBarClass = (dirty) => cn(
+    'flex shrink-0 flex-wrap items-center justify-end gap-3 rounded-xl border px-4 py-3 shadow-sm transition-colors',
+    dirty ? 'border-primary/40 bg-primary/5' : 'bg-card'
+  );
+
   return (
-    <div className="space-y-6">
+    // `h-full min-h-0` (see MainLayout.jsx) — the page owns its scroll region, so the header and
+    // the Save bar stay put while the table in between scrolls.
+    <div className="flex h-full min-h-0 flex-col gap-4">
       <PageHeader
         title="Monthly Summary"
         description={
@@ -323,54 +339,57 @@ const MonthlySummaryPage = () => {
             : 'Log your total hours per Service/Project for the whole month.'
         }
         actions={(
-          <>
-            <Tabs value={viewMode} onValueChange={setViewMode}>
-              <TabsList>
-                <TabsTrigger value="day" className="px-2 text-xs sm:px-3 sm:text-sm">Day View</TabsTrigger>
-                <TabsTrigger value="month" className="px-2 text-xs sm:px-3 sm:text-sm">Month View</TabsTrigger>
-              </TabsList>
-            </Tabs>
+          <div className="flex flex-wrap items-center gap-2">
+            <MonthNavigator month={month} year={year} onChange={handleMonthChange} />
+            <ReportTypeToggle
+              inline
+              label="View"
+              options={VIEW_MODES}
+              value={viewMode}
+              onChange={setViewMode}
+            />
             <Button
               variant="outline"
-              size="sm"
+              size="toolbar"
               onClick={() => confirmExport(() => (viewMode === 'day'
                 ? exportSummaryToExcel(rows, edits, month, year)
                 : exportMonthlyWorkLogToExcel(monthlyRows, monthlyEdits, month, year)))}
               disabled={viewMode === 'day' ? (isLoading || rows.length === 0) : (isMonthlyLoading || monthlyRows.length === 0)}
             >
-              <Download className="mr-1.5 h-4 w-4" />
+              <Download className="h-4 w-4" />
               Export Excel
             </Button>
-          </>
+          </div>
         )}
       />
 
       {viewMode === 'day' && isError && (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-4 text-sm text-destructive">
+        <div className="shrink-0 rounded-lg border border-destructive/30 bg-destructive/5 p-4 text-sm text-destructive">
           Unable to load your monthly summary. Please try again.
         </div>
       )}
       {viewMode === 'month' && isMonthlyError && (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-4 text-sm text-destructive">
+        <div className="shrink-0 rounded-lg border border-destructive/30 bg-destructive/5 p-4 text-sm text-destructive">
           Unable to load monthly work log. Please try again.
         </div>
       )}
 
-      <MonthNavigator month={month} year={year} onChange={handleMonthChange} />
-
       {viewMode === 'day' ? (
-        <SummaryTable
-          month={month}
-          year={year}
-          rows={rows}
-          isLoading={isLoading}
-          edits={edits}
-          onCellChange={handleCellChange}
-          saturdayOffRule={saturdayOffRule}
-          approvedOffDayDates={approvedOffDayDates}
-        />
+        // Shrinks to the space left above the Save bar; the table scrolls inside it.
+        <div className="flex min-h-0 flex-col">
+          <SummaryTable
+            month={month}
+            year={year}
+            rows={rows}
+            isLoading={isLoading}
+            edits={edits}
+            onCellChange={handleCellChange}
+            saturdayOffRule={saturdayOffRule}
+            approvedOffDayDates={approvedOffDayDates}
+          />
+        </div>
       ) : (
-        <div className="space-y-3">
+        <div className="min-h-0 space-y-3 overflow-y-auto pr-1">
           {monthHasApproved && (
             <Alert variant="warning">
               <AlertDescription>
@@ -403,8 +422,9 @@ const MonthlySummaryPage = () => {
 
       {/* Save sits last — after the table, only relevant once something's actually changed. */}
       {viewMode === 'day' && (
-        <div className="flex items-center justify-end gap-3 rounded-xl border bg-card px-4 py-3">
-          <span className="mr-auto text-xs text-muted-foreground">
+        <div className={saveBarClass(editedCount > 0)}>
+          <span className={cn('mr-auto inline-flex items-center gap-1.5 text-xs', editedCount > 0 ? 'font-medium text-primary' : 'text-muted-foreground')}>
+            {editedCount > 0 && <span className="h-1.5 w-1.5 rounded-full bg-primary" aria-hidden="true" />}
             {editedCount > 0 ? `${editedCount} unsaved change${editedCount === 1 ? '' : 's'}` : 'No changes to save'}
           </span>
           <Button variant="outline" size="sm" onClick={handleDiscard} disabled={editedCount === 0 || isSaving}>
@@ -418,8 +438,9 @@ const MonthlySummaryPage = () => {
       )}
 
       {viewMode === 'month' && monthlyRows.length > 0 && (
-        <div className="flex items-center justify-end gap-3 rounded-xl border bg-card px-4 py-3">
-          <span className="mr-auto text-xs text-muted-foreground">
+        <div className={saveBarClass(monthlyEditedCount > 0)}>
+          <span className={cn('mr-auto inline-flex items-center gap-1.5 text-xs', monthlyEditedCount > 0 ? 'font-medium text-primary' : 'text-muted-foreground')}>
+            {monthlyEditedCount > 0 && <span className="h-1.5 w-1.5 rounded-full bg-primary" aria-hidden="true" />}
             {monthlyEditedCount > 0 ? `${monthlyEditedCount} unsaved change${monthlyEditedCount === 1 ? '' : 's'}` : 'No changes to save'}
           </span>
           {hasExistingMonthlyEntries && !isMonthlyIneligible && (

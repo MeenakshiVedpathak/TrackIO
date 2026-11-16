@@ -42,12 +42,13 @@ const walkChildren = (children = [], parentChildMap, day) => {
   });
 };
 
-// True when `node` or anything beneath it is approved on `day` — the backend locks per Service PO
-// per date, so a single approved line anywhere in a PO's subtree locks the whole PO that day.
+// True when `node` or anything beneath it is approved on `day`. Only used for the PO folder's
+// "Approved" badge (`anyApprovedByDay`) — the lock itself is per line (`lockedByDay` = the row's own
+// approvedByDay), so other lines of the same PO stay editable.
 const subtreeApproved = (node, day) =>
   !!node.approvedByDay[day] || [...node.childMap.values()].some((c) => subtreeApproved(c, day));
 
-const flattenChildren = (childMap, depth, days, servicePOId, ancestorKeys, poLockedByDay) => {
+const flattenChildren = (childMap, depth, days, servicePOId, ancestorKeys) => {
   const rows = [];
   childMap.forEach((node, hierarchyId) => {
     const hasChildren = node.childMap.size > 0;
@@ -61,9 +62,9 @@ const flattenChildren = (childMap, depth, days, servicePOId, ancestorKeys, poLoc
     });
     const rowKey = `h:${hierarchyId}`;
     rows.push({
-      servicePOId, hierarchyId, label: node.name, depth, hasChildren, editable: true, hoursByDay, descriptionByDay, approvedByDay, lockedByDay: poLockedByDay, rowKey, ancestorKeys, id: node.id,
+      servicePOId, hierarchyId, label: node.name, depth, hasChildren, editable: true, hoursByDay, descriptionByDay, approvedByDay, lockedByDay: approvedByDay, rowKey, ancestorKeys, id: node.id,
     });
-    rows.push(...flattenChildren(node.childMap, depth + 1, days, servicePOId, [...ancestorKeys, rowKey], poLockedByDay));
+    rows.push(...flattenChildren(node.childMap, depth + 1, days, servicePOId, [...ancestorKeys, rowKey]));
   });
   return rows;
 };
@@ -92,18 +93,19 @@ export const buildMonthlySummaryRows = (dayEntries = []) => {
     const hoursByDay = {};
     const descriptionByDay = {};
     const approvedByDay = {};
-    const lockedByDay = {};
+    const anyApprovedByDay = {};
     dayList.forEach((day) => {
       hoursByDay[day] = node.hoursByDay[day] || 0;
       descriptionByDay[day] = node.descriptionByDay[day] || '';
       approvedByDay[day] = !!node.approvedByDay[day];
-      lockedByDay[day] = subtreeApproved(node, day);
+      anyApprovedByDay[day] = subtreeApproved(node, day);
     });
     const rowKey = `po:${servicePOId}`;
     rows.push({
-      servicePOId, label: node.name, depth: 0, hasChildren, editable: true, hoursByDay, descriptionByDay, approvedByDay, lockedByDay, rowKey, ancestorKeys: [], id: node.id,
+      servicePOId, label: node.name, depth: 0, hasChildren, editable: true, hoursByDay, descriptionByDay, approvedByDay,
+      lockedByDay: approvedByDay, anyApprovedByDay, rowKey, ancestorKeys: [], id: node.id,
     });
-    rows.push(...flattenChildren(node.childMap, 1, dayList, servicePOId, [rowKey], lockedByDay));
+    rows.push(...flattenChildren(node.childMap, 1, dayList, servicePOId, [rowKey]));
   });
   return rows;
 };
@@ -129,8 +131,8 @@ export const buildMonthlySummaryRows = (dayEntries = []) => {
 // returning that day's `description` per node; buildMonthlySummaryRows already reads it
 // defensively (`po.description` / `child.description`) and will pick it up the moment it's there.
 //
-// Approved lines are never sent: a row whose Service PO has an approved log that day is locked
-// (see utils/approvedWorkLog.js) and the backend 409s a payload that names it. Approved rows are
+// Approved lines are never sent: an approved line is locked (per line, see utils/approvedWorkLog.js)
+// and the backend 409s a payload that tries to change it. Approved rows are
 // not deleted or changed by a save, so omitting them here is exactly right — but their hours still
 // count towards the daily cap, which validateDayEntries takes as `lockedHours`.
 export const buildDayEntries = (rows, day, edits, descriptions) =>
