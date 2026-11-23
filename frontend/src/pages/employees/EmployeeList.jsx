@@ -9,7 +9,7 @@ import { Plus, Pencil, UserCog, Eye, Search, Download, Upload, CheckCircle2, Ale
 import * as XLSX from 'xlsx';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
-import { useEmployees, useImportEmployees, useToggleEmployeeStatus, useUpdateEmployee, useEmployeeMappings } from '@/hooks/useEmployees';
+import { useActiveEmployees, useEmployees, useImportEmployees, useToggleEmployeeStatus, useUpdateEmployee, useEmployeeMappings } from '@/hooks/useEmployees';
 import { useEmployeeServicePOMappingOptions, useSaveEmployeeServicePOMapping } from '@/hooks/useEmployeeServicePOMapping';
 import { useActiveServicePOs } from '@/hooks/useServicePOs';
 import { useRoles } from '@/hooks/useRoles';
@@ -56,6 +56,7 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
 import { SearchableSelect } from '@/components/ui/searchable-select';
+import { MultiSelect } from '@/components/ui/multi-select';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -337,7 +338,15 @@ const RoleBuMappingDialog = ({ employee, actorRoleName, allRoles, rolesLoading, 
   // `eligible_service_pos` is not tied to the BU currently active in the navbar, whereas
   // /service-pos/active/list is — which left POs of this employee's OTHER BUs (including ones
   // already mapped to them) out of the panel. The active list is only a fallback while this loads.
-  const { data: existingMapping, isLoading: optionsLoading } = useEmployeeServicePOMappingOptions(showServicePoSection ? employee?.id : null);
+  // Once the ticked BUs differ from the saved ones, send them so a newly ticked BU's POs load
+  // before Save (eligibility otherwise comes from the saved BU mapping only).
+  const savedBuKey = [...(mappings?.business_unit_ids ?? [])].sort((a, b) => a - b).join(',');
+  const selectedBuKey = [...selectedBuIds].sort((a, b) => a - b).join(',');
+  const unsavedBuIds = mappings && selectedBuKey !== savedBuKey ? selectedBuIds : undefined;
+  const { data: existingMapping, isLoading: optionsLoading } = useEmployeeServicePOMappingOptions(
+    showServicePoSection ? employee?.id : null,
+    unsavedBuIds
+  );
   const allEligiblePOs = existingMapping?.eligible_service_pos ?? fallbackActivePOs;
   // Only the Service POs of the Business Units / Sub-BUs ticked in the BU panel (a Centralised PO
   // belongs to no single BU, so it stays). Unticking a BU therefore also drops its POs from the
@@ -350,12 +359,19 @@ const RoleBuMappingDialog = ({ employee, actorRoleName, allRoles, rolesLoading, 
   );
   const activePOsLoading = optionsLoading || (!existingMapping && fallbackPOsLoading);
 
+  // Seed the checked POs once per employee — later refetches (a BU tick) must not wipe ticks the
+  // user has already changed.
+  const seededPoEmployeeId = useRef(null);
   useEffect(() => {
-    if (existingMapping) {
-      setSelectedPoIds(existingMapping.mapped_service_po_ids ?? []);
-      setSelectedPmPoIds(existingMapping.project_manager_service_po_ids ?? []);
-    }
-  }, [existingMapping]);
+    seededPoEmployeeId.current = null;
+  }, [employee?.id]);
+  useEffect(() => {
+    if (!existingMapping || existingMapping.employee_id !== employee?.id) return;
+    if (seededPoEmployeeId.current === employee?.id) return;
+    seededPoEmployeeId.current = employee?.id;
+    setSelectedPoIds(existingMapping.mapped_service_po_ids ?? []);
+    setSelectedPmPoIds(existingMapping.project_manager_service_po_ids ?? []);
+  }, [existingMapping, employee?.id]);
 
   const filteredPOs = useMemo(() => {
     const q = poSearch.trim().toLowerCase();
@@ -1100,6 +1116,8 @@ const EmployeeList = () => {
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
   const [roleFilter, setRoleFilter] = useState('all');
+  // Employee multi-select — sent as `employeeIds` (comma-joined); narrows within the caller's scope.
+  const [employeeFilterIds, setEmployeeFilterIds] = useState([]);
   // Multi-select — backend support for entityIds/businessUnitIds has landed on GET /employees
   // (see BACKEND_MULTI_SELECT_ENTITY_BU_PROMPT.md), via a bespoke fix: this endpoint's BU scoping
   // was never actually driven by the X-Company-Id header (a pre-existing, already-documented
@@ -1181,6 +1199,7 @@ const EmployeeList = () => {
     limit,
     status: statusFilter,
     ...(roleFilter !== 'all' && { role_id: roleFilter }),
+    ...(employeeFilterIds.length > 0 && { employeeIds: employeeFilterIds.join(',') }),
     ...(isBuFiltered
       ? { businessUnitIds: buIds.join(',') }
       : (!isCrossBu && ownBuIds.length > 0 ? { businessUnitIds: ownBuIds.join(',') } : {})),
@@ -1190,6 +1209,18 @@ const EmployeeList = () => {
   };
 
   const { data, isPending, isFetching } = useEmployees(params);
+  // Employee filter options — the active list, narrowed by whatever Entity/BU is picked above it.
+  const { data: activeEmployeeOptions = [], isLoading: activeEmployeesLoading } = useActiveEmployees(undefined, {
+    entityIds: isEntityFiltered ? entityIds : [],
+    businessUnitIds: isBuFiltered ? buIds : [],
+  });
+  const employeeFilterOptions = useMemo(
+    () => activeEmployeeOptions.map((e) => ({
+      label: e.employee_code ? `${e.full_name} (${e.employee_code})` : (e.full_name ?? `#${e.id}`),
+      value: String(e.id),
+    })),
+    [activeEmployeeOptions],
+  );
   const { data: rolesData, isLoading: rolesLoading } = useRoles({ limit: 100 });
   // Sourced for the "Map Roles & Business Units" dialog's Business Units table — same
   // cross-BU-vs-own-mapping split as the list scoping above, so a BU-scoped actor (HR, BU Admin,
@@ -1261,12 +1292,14 @@ const EmployeeList = () => {
   const activeFilterCount =
     (statusFilter !== 'all' ? 1 : 0)
     + (roleFilter !== 'all' ? 1 : 0)
+    + (employeeFilterIds.length > 0 ? 1 : 0)
     + (isEntityFiltered ? 1 : 0)
     + (isBuFiltered ? 1 : 0);
 
   const clearFilters = () => {
     setStatusFilter('all');
     setRoleFilter('all');
+    setEmployeeFilterIds([]);
     resetEntityId();
     resetBuId();
     setPage(1);
@@ -1598,6 +1631,7 @@ const EmployeeList = () => {
   const getExportParams = () => ({
     status: statusFilter,
     ...(roleFilter !== 'all' && { role_id: roleFilter }),
+    ...(employeeFilterIds.length > 0 && { employeeIds: employeeFilterIds.join(',') }),
     ...(isBuFiltered && { businessUnitIds: buIds.join(',') }),
     ...(isEntityFiltered && { entityIds: entityIds.join(',') }),
     ...(debouncedSearch && debouncedSearch.length >= 3 && { search: debouncedSearch }),
@@ -2078,6 +2112,17 @@ const EmployeeList = () => {
             onChange={(v) => { setBuIds(v); setPage(1); }}
           />
         )}
+        <div className="flex flex-col gap-1.5">
+          <Label className="text-xs">Employee</Label>
+          <MultiSelect
+            options={employeeFilterOptions}
+            value={employeeFilterIds}
+            onValueChange={(v) => { setEmployeeFilterIds(v); setPage(1); }}
+            placeholder={activeEmployeesLoading ? 'Loading employees…' : 'All Employees'}
+            searchPlaceholder="Search employee..."
+            className="h-[clamp(1.875rem,2vw,2.25rem)] w-full text-[clamp(0.75rem,0.85vw,0.875rem)] bg-white"
+          />
+        </div>
       </FilterPanel>
 
       {importResult ? (

@@ -27,6 +27,8 @@ import { extractApiError, extractFieldErrors } from '@/services/apiClient';
 import { formatDateTime } from '@/utils/formatters';
 import { flattenHierarchyTree } from '@/utils/servicePOHierarchy';
 import { validateSegments, sumSegmentHours } from '@/utils/employeeTimeEntry';
+import { isBlankDescription, LOG_DESC_REQUIRED_MESSAGE } from '@/utils/employeeMonthlySummary';
+import { useLogDescRequiredFor } from '@/hooks/useLogDescMandatory';
 import { ROUTES } from '@/constants/routes';
 
 export const DAILY_HOURS_CAP = 24;
@@ -115,6 +117,7 @@ const WorkLogEntryModal = ({ open, onOpenChange, date, task }) => {
   const saveDayMutation = useSaveWorkLogDay();
   const updateMutation = useUpdateWorkLogEntry();
   const resubmitMutation = useResubmitWorkLogEntry();
+  const isDescRequiredFor = useLogDescRequiredFor();
   const isEdit = !!task;
   const isMonthly = isEdit && task?.log_type === 'monthly';
   const rawTimeEntries = task?.timeEntries ?? task?.time_entries ?? [];
@@ -153,6 +156,11 @@ const WorkLogEntryModal = ({ open, onOpenChange, date, task }) => {
   };
 
   const submit = async (values, { keepOpen }) => {
+    // Entity rule: a whitespace-only description passes the schema's min(1) but not this rule.
+    if (isDescRequiredFor(values.service_po_id) && isBlankDescription(values.description)) {
+      form.setError('description', { message: LOG_DESC_REQUIRED_MESSAGE });
+      return;
+    }
     if (isTimeBased) {
       const segErr = validateSegments(filledSegments);
       if (segErr) {
@@ -432,7 +440,7 @@ const WorkLogEntryModal = ({ open, onOpenChange, date, task }) => {
               name="description"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel className={LABEL}><AlignLeft className={LABEL_ICON} />Description</FormLabel>
+                  <FormLabel className={LABEL}><AlignLeft className={LABEL_ICON} />Description<span className="text-destructive" aria-hidden="true">*</span></FormLabel>
                   <FormControl>
                     <Textarea placeholder="What did you work on?" disabled={isSaving} maxLength={500} className="min-h-[88px] resize-none" {...field} />
                   </FormControl>

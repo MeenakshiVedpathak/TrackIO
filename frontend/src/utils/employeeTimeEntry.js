@@ -54,7 +54,8 @@ export const buildOtherDayEntries = (dailyData, date, excludeServicePOId, exclud
       service_po_id: row.servicePOId,
       hierarchy_node_id: row.hierarchyId ?? null,
       hours,
-      description: row.label ?? 'Logged via Work Log',
+      // Resend the line's real description for this day so the save doesn't overwrite it with the node name.
+      description: row.descriptionByDay?.[day]?.trim() || row.label || 'Logged via Work Log',
     }));
 };
 

@@ -17,9 +17,13 @@ import {
   useDeleteWorkLogMonth,
 } from '@/hooks/useEmployeeWorkLog';
 import { useNotification } from '@/hooks/useNotification';
+import { useLogDescRequiredFor } from '@/hooks/useLogDescMandatory';
 import { extractApiError } from '@/services/apiClient';
 import { formatDate, formatHoursMinutes } from '@/utils/formatters';
-import { buildMonthlySummaryRows, buildDayEntries, validateDayEntries } from '@/utils/employeeMonthlySummary';
+import {
+  buildMonthlySummaryRows, buildDayEntries, validateDayEntries,
+  isBlankDescription, LOG_DESC_REQUIRED_MESSAGE,
+} from '@/utils/employeeMonthlySummary';
 import { lockedHoursForDay, isApprovedConflict } from '@/utils/approvedWorkLog';
 import { countsByDate as buildCountsByDate, statusByServicePo, statusByRow } from '@/utils/workLogDayStatus';
 import TimesheetCalendar from '@/components/employee/TimesheetCalendar';
@@ -84,6 +88,7 @@ const EmployeeTimesheet = () => {
   const [approvedMonthKeys, setApprovedMonthKeys] = useState(() => new Set());
 
   const { success, error: showError } = useNotification();
+  const isDescRequiredFor = useLogDescRequiredFor();
   const qc = useQueryClient();
   const saveDayMutation = useSaveWorkLogDay();
   const saveMonthMutation = useSaveWorkLogMonth();
@@ -223,7 +228,9 @@ const EmployeeTimesheet = () => {
     const entries = buildDayEntries(rows, day, edits, descriptions);
     // `entries` already omits every approved line (buildDayEntries) — a payload naming a PO that
     // has an approved log that day 409s — but those hours still count towards the daily cap.
-    const validationError = validateDayEntries(entries, selectedKey, DAILY_HOURS_CAP, lockedHoursForDay(rows, day));
+    const validationError = validateDayEntries(
+      entries, selectedKey, DAILY_HOURS_CAP, lockedHoursForDay(rows, day), { requireDescription: isDescRequiredFor },
+    );
     if (validationError) {
       showError(validationError);
       return;
@@ -358,6 +365,15 @@ const EmployeeTimesheet = () => {
   // Approved logs anywhere in the month block "Clear All" (the backend refuses the whole delete).
   const monthHasApproved = monthlyRows.some((r) => r.approvedByDay?.[MONTH_DAY_KEY]) || approvedMonthKeys.has(monthKey);
 
+  const handleMonthlySaveClick = () => {
+    const entries = buildDayEntries(monthlyRows, MONTH_DAY_KEY, monthlyEdits, monthlyDescriptions);
+    if (entries.some((entry) => isDescRequiredFor(entry.service_po_id) && isBlankDescription(entry.description))) {
+      showError(LOG_DESC_REQUIRED_MESSAGE);
+      return;
+    }
+    setConfirmSaveOpen(true);
+  };
+
   const handleMonthlySaveConfirmed = async () => {
     const entries = buildDayEntries(monthlyRows, MONTH_DAY_KEY, monthlyEdits, monthlyDescriptions);
     setIsMonthlySaving(true);
@@ -491,6 +507,7 @@ const EmployeeTimesheet = () => {
                   <WorkLogDaySummary totalHours={totalHoursToday} projectsCount={mappedProjectsCount} />
 
                   <WorkLogEntryTable
+                    descriptionRequired={isDescRequiredFor}
                     rows={rows}
                     day={day}
                     isLoading={isDailyLoading}
@@ -599,6 +616,7 @@ const EmployeeTimesheet = () => {
               )}
 
               <WorkLogEntryTable
+                descriptionRequired={isDescRequiredFor}
                 rows={monthlyRows}
                 day={MONTH_DAY_KEY}
                 isLoading={isMonthlyLoading}
@@ -636,7 +654,7 @@ const EmployeeTimesheet = () => {
               </Button>
               <Button
                 size="sm"
-                onClick={() => setConfirmSaveOpen(true)}
+                onClick={handleMonthlySaveClick}
                 disabled={monthlyEditedCount === 0 || isMonthlySaving || isMonthlyIneligible}
               >
                 <Save className="mr-1.5 h-4 w-4" />

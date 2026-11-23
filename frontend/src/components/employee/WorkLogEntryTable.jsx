@@ -215,6 +215,7 @@ const PoReviewBadge = ({ review }) => {
 const ProjectGroup = ({
   poRow, childrenByParent, day, edits, onCellChange, isPastOrToday, hoursCap, isOpen, onToggleOpen,
   descriptions, onDescriptionChange, collapsedKeys, onToggleRowCollapse, review, rowStatusByKey,
+  descriptionRequired = false,
 }) => {
   const nodeRows = useMemo(() => flattenSubtree(poRow, 0, childrenByParent), [poRow, childrenByParent]);
   const visibleRows = useMemo(
@@ -272,7 +273,10 @@ const ProjectGroup = ({
             {/* Centred over the stepper / value below, which is centred in the same 7rem column. */}
             <span className="text-center">Hours</span>
             {/* Inset to the description box's own text padding (px-2.5), not its border. */}
-            <span className="pl-2.5">Description</span>
+            <span className="pl-2.5">
+              Description
+              {descriptionRequired && <span className="ml-0.5 text-destructive" aria-hidden="true">*</span>}
+            </span>
           </div>
           {visibleRows.map((row, i) => {
             const isDirty = edits?.[row.rowKey]?.[day] !== undefined || descriptions?.[row.rowKey]?.[day] !== undefined;
@@ -287,6 +291,7 @@ const ProjectGroup = ({
             const isLocked = !!row.lockedByDay?.[day];
             const canEditRow = row.editable && isPastOrToday && !isRolledUp && !isLocked;
             const descriptionValue = descriptionValueOf(row);
+            const isDescriptionMissing = descriptionRequired && !isRolledUp && cellValueOf(row) > 0 && !descriptionValue.trim();
 
             return (
               <div
@@ -354,13 +359,23 @@ const ProjectGroup = ({
                         value={descriptionValue}
                         onChange={(e) => onDescriptionChange(row.rowKey, day, e.target.value.slice(0, DESCRIPTION_MAX_LENGTH))}
                         maxLength={DESCRIPTION_MAX_LENGTH}
-                        placeholder="Add description…"
+                        placeholder={descriptionRequired ? 'Add description (required)…' : 'Add description…'}
+                        aria-required={descriptionRequired || undefined}
+                        aria-invalid={isDescriptionMissing || undefined}
                         rows={1}
-                        className="min-h-0 w-full resize-none rounded-md px-2.5 py-1.5 text-xs shadow-sm"
+                        className={cn(
+                          'min-h-0 w-full resize-none rounded-md px-2.5 py-1.5 text-xs shadow-sm',
+                          isDescriptionMissing && 'border-destructive/70 focus-visible:ring-destructive/40',
+                        )}
                       />
-                      <span className="self-end text-[10px] tabular-nums text-muted-foreground">
-                        {descriptionValue.length} / {DESCRIPTION_MAX_LENGTH}
-                      </span>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[10px] font-medium text-destructive">
+                          {isDescriptionMissing ? 'Description is required' : ''}
+                        </span>
+                        <span className="text-[10px] tabular-nums text-muted-foreground">
+                          {descriptionValue.length} / {DESCRIPTION_MAX_LENGTH}
+                        </span>
+                      </div>
                     </div>
                   ) : (
                     <span
@@ -396,6 +411,9 @@ const WorkLogEntryTable = ({
   poStatusById,
   // Optional { [rowKey]: { counts, rejectionRemark, revertReason } } — flags the exact line.
   rowStatusByKey,
+  // Entity rule "description mandatory for every work-log line" — marks the column and flags
+  // editable lines that carry hours but no description.
+  descriptionRequired = false,
 }) => {
   const childrenByParent = useMemo(() => buildChildrenByParent(rows), [rows]);
   const topLevelRows = useMemo(() => rows.filter((r) => (r.depth ?? 0) === 0), [rows]);
@@ -545,6 +563,7 @@ const WorkLogEntryTable = ({
             onToggleRowCollapse={toggleRowCollapse}
             review={poStatusById?.[String(row.servicePOId)]}
             rowStatusByKey={rowStatusByKey}
+            descriptionRequired={typeof descriptionRequired === 'function' ? descriptionRequired(row.servicePOId) : descriptionRequired}
           />
         ))}
       </div>

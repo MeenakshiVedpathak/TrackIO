@@ -9,9 +9,11 @@ import {
 import { useMyOffDayRequests } from '@/hooks/useOffDayRequests';
 import { useSaturdayOffRule } from '@/hooks/useSaturdayOffRule';
 import { useNotification } from '@/hooks/useNotification';
+import { useLogDescRequiredFor } from '@/hooks/useLogDescMandatory';
 import { extractApiError } from '@/services/apiClient';
 import {
   buildMonthlySummaryRows, buildDayEntries, validateDayEntries,
+  isBlankDescription, LOG_DESC_REQUIRED_MESSAGE,
 } from '@/utils/employeeMonthlySummary';
 import { lockedHoursForDay, isApprovedConflict } from '@/utils/approvedWorkLog';
 import MonthNavigator from '@/components/employee/MonthNavigator';
@@ -129,6 +131,7 @@ const MonthlySummaryPage = () => {
   const [approvedMonthKeys, setApprovedMonthKeys] = useState(() => new Set());
 
   const { success, error: showError } = useNotification();
+  const isDescRequiredFor = useLogDescRequiredFor();
   const qc = useQueryClient();
 
   const {
@@ -222,7 +225,9 @@ const MonthlySummaryPage = () => {
     for (const { date, entries } of dayPayloads) {
       const day = Number(date.slice(-2));
       // `entries` omits approved lines, but their hours still count towards the daily cap.
-      const validationError = validateDayEntries(entries, date, DAILY_HOURS_CAP, lockedHoursForDay(rows, day));
+      const validationError = validateDayEntries(
+        entries, date, DAILY_HOURS_CAP, lockedHoursForDay(rows, day), { requireDescription: isDescRequiredFor },
+      );
       if (validationError) {
         showError(validationError);
         return;
@@ -269,6 +274,15 @@ const MonthlySummaryPage = () => {
   const handleMonthlyDiscard = () => {
     setMonthlyEdits({});
     setMonthlyDescriptions({});
+  };
+
+  const handleMonthlySaveClick = () => {
+    const entries = buildDayEntries(monthlyRows, MONTH_DAY_KEY, monthlyEdits, monthlyDescriptions);
+    if (entries.some((entry) => isDescRequiredFor(entry.service_po_id) && isBlankDescription(entry.description))) {
+      showError(LOG_DESC_REQUIRED_MESSAGE);
+      return;
+    }
+    setConfirmSaveOpen(true);
   };
 
   const handleMonthlySaveConfirmed = async () => {
@@ -406,6 +420,7 @@ const MonthlySummaryPage = () => {
             </Alert>
           )}
           <WorkLogEntryTable
+            descriptionRequired={isDescRequiredFor}
             rows={monthlyRows}
             day={MONTH_DAY_KEY}
             isLoading={isMonthlyLoading}
@@ -461,7 +476,7 @@ const MonthlySummaryPage = () => {
           </Button>
           <Button
             size="sm"
-            onClick={() => setConfirmSaveOpen(true)}
+            onClick={handleMonthlySaveClick}
             disabled={monthlyEditedCount === 0 || isMonthlySaving || isMonthlyIneligible}
           >
             <Save className="mr-1.5 h-4 w-4" />

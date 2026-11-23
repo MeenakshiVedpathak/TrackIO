@@ -151,12 +151,16 @@ export const useSetEmployeeServicePOMappingStatus = () => {
 };
 
 // Employee Master's "Manage Service PO Mapping" dialog.
-export const useEmployeeServicePOMappingOptions = (employeeId) =>
-  useQuery({
-    queryKey: QUERY_KEYS.EMPLOYEE_SERVICEPO_MAPPING_OPTIONS(employeeId),
-    queryFn: () => employeeServicePOMappingApi.getOptions(employeeId),
+export const useEmployeeServicePOMappingOptions = (employeeId, businessUnitIds) => {
+  const buKey = businessUnitIds ? [...businessUnitIds].sort((a, b) => a - b).join(',') : null;
+  return useQuery({
+    queryKey: [...QUERY_KEYS.EMPLOYEE_SERVICEPO_MAPPING_OPTIONS(employeeId), buKey],
+    queryFn: () => employeeServicePOMappingApi.getOptions(employeeId, businessUnitIds),
     enabled: !!employeeId,
+    // Keep the current list on screen while a BU tick refetches — but never another employee's.
+    placeholderData: (prev) => (prev?.employee_id === employeeId ? prev : undefined),
   });
+};
 
 export const useSaveEmployeeServicePOMapping = (employeeId) => {
   const qc = useQueryClient();

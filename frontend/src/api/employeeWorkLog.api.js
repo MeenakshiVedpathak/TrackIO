@@ -1,4 +1,16 @@
 import apiClient from '@/services/apiClient';
+import { store } from '@/store';
+import { setLogDescMandatory, setLogDescMandatoryPOIds } from '@/store/slices/authSlice';
+
+// Keeps the entity rule is_log_desc_mandatory fresh from timesheet reads — a no-op when the
+// response doesn't carry a real boolean.
+// `source` is the object carrying is_log_desc_mandatory + log_desc_mandatory_service_po_ids.
+const syncLogDescMandatory = (source) => {
+  const value = source?.is_log_desc_mandatory;
+  if (typeof value === 'boolean') store.dispatch(setLogDescMandatory(value));
+  const ids = source?.log_desc_mandatory_service_po_ids;
+  if (Array.isArray(ids)) store.dispatch(setLogDescMandatoryPOIds(ids));
+};
 
 // Employee self-service Work Log — drafts (status: 'pending') until an Admin runs "Sync
 // Employee Work Logs" on the Admin Timesheet page, which promotes them to official Timesheet
@@ -54,7 +66,11 @@ export const employeeWorkLogApi = {
   getCalendar: ({ month, year }) =>
     apiClient.get('/employee-timesheets/calendar', { params: { month, year } }).then((r) => r.data?.data ?? []),
   getDaily: (date) =>
-    apiClient.get('/employee-timesheets/daily', { params: { date } }).then((r) => r.data?.data ?? null),
+    apiClient.get('/employee-timesheets/daily', { params: { date } }).then((r) => {
+      const data = r.data?.data ?? null;
+      syncLogDescMandatory(data?.is_log_desc_mandatory !== undefined ? data : r.data);
+      return data;
+    }),
   getMonthlySummary: ({ month, year, viewType, signal }) =>
     apiClient
       .get('/employee-timesheets/monthly-summary', {
@@ -73,10 +89,17 @@ export const employeeWorkLogApi = {
       .get('/employee-timesheets/entries', {
         params: { status, page, limit, startDate, endDate, poId, include_deleted: includeDeleted || undefined },
       })
-      .then((r) => r.data),
+      .then((r) => {
+        syncLogDescMandatory(r.data?.meta);
+        return r.data;
+      }),
   resubmit: (id) => apiClient.put(`/employee-timesheets/entries/${id}/resubmit`).then((r) => r.data),
   getMonthly: ({ month, year }) =>
-    apiClient.get('/employee-timesheets/monthly', { params: { month, year } }).then((r) => r.data?.data ?? null),
+    apiClient.get('/employee-timesheets/monthly', { params: { month, year } }).then((r) => {
+      const data = r.data?.data ?? null;
+      syncLogDescMandatory(data?.is_log_desc_mandatory !== undefined ? data : r.data);
+      return data;
+    }),
   saveMonthly: ({ month, year, entries }) =>
     apiClient.post('/employee-timesheets/monthly', { month, year, entries }).then((r) => r.data),
   deleteMonthly: ({ month, year }) =>

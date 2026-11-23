@@ -5,6 +5,8 @@ import {
   getStoredEmployee, saveEmployee,
   getStoredBusinessUnits, saveBusinessUnits,
   getStoredActiveBuId, saveActiveBuId,
+  getStoredLogDescMandatory, saveLogDescMandatory,
+  getStoredLogDescMandatoryPOIds, saveLogDescMandatoryPOIds,
 } from '@/services/apiClient';
 
 const initialState = {
@@ -32,6 +34,12 @@ const initialState = {
   // The currently-active BU, global across the app — drives the X-Company-Id header. Required
   // once an employee has more than one BU; auto-selected to the first on login otherwise.
   activeBuId: getStoredActiveBuId(),
+  // Entity rule is_log_desc_mandatory — every work-log description is required when true. Set at
+  // login, then kept fresh from the /employee-timesheets daily | monthly | entries responses.
+  isLogDescMandatory: getStoredLogDescMandatory(),
+  // Which Service POs the rule applies to (their Entity has it on); null = unknown, use the
+  // boolean above for every PO.
+  logDescMandatoryPOIds: getStoredLogDescMandatoryPOIds(),
 };
 
 const authSlice = createSlice({
@@ -39,7 +47,9 @@ const authSlice = createSlice({
   initialState,
   reducers: {
     setCredentials: (state, action) => {
-      const { employee, accessToken, refreshToken, roles } = action.payload;
+      const {
+        employee, accessToken, refreshToken, roles, isLogDescMandatory, logDescMandatoryPOIds,
+      } = action.payload;
       state.accessToken = accessToken;
       state.refreshToken = refreshToken;
       state.isAuthenticated = true;
@@ -53,6 +63,11 @@ const authSlice = createSlice({
       const nextRoles = roles ?? [];
       state.roles = nextRoles;
       saveRoles(nextRoles);
+
+      state.isLogDescMandatory = !!isLogDescMandatory;
+      saveLogDescMandatory(state.isLogDescMandatory);
+      state.logDescMandatoryPOIds = Array.isArray(logDescMandatoryPOIds) ? logDescMandatoryPOIds.map(Number) : null;
+      saveLogDescMandatoryPOIds(state.logDescMandatoryPOIds);
 
       // Role-Based Login: the login/refresh-token response no longer carries `businessUnits` —
       // reset to empty here and let the caller populate it via setBusinessUnits right after,
@@ -111,6 +126,22 @@ const authSlice = createSlice({
       state.roles = nextRoles;
       saveRoles(nextRoles);
     },
+    // Refreshed from the /employee-timesheets reads — ignores anything that isn't a real boolean
+    // (field absent from a response) and skips no-op writes.
+    setLogDescMandatory: (state, action) => {
+      if (typeof action.payload !== 'boolean' || action.payload === state.isLogDescMandatory) return;
+      state.isLogDescMandatory = action.payload;
+      saveLogDescMandatory(action.payload);
+    },
+    // Per-Service-PO list from the same reads — ignored when the response didn't carry one.
+    setLogDescMandatoryPOIds: (state, action) => {
+      if (!Array.isArray(action.payload)) return;
+      const next = action.payload.map(Number);
+      const prev = state.logDescMandatoryPOIds;
+      if (Array.isArray(prev) && prev.length === next.length && prev.every((id, i) => id === next[i])) return;
+      state.logDescMandatoryPOIds = next;
+      saveLogDescMandatoryPOIds(next);
+    },
     setAccessibleForms: (state, action) => {
       const forms = action.payload ?? {};
       state.accessibleForms = forms;
@@ -123,7 +154,10 @@ const authSlice = createSlice({
     // the BU switcher keeps working across the switch. Only ever dispatched AFTER the backend
     // has confirmed the switch; the frontend never flips the active role on its own.
     switchRole: (state, action) => {
-      const { accessToken, refreshToken, roles, employee } = action.payload ?? {};
+      const {
+        accessToken, refreshToken, roles, employee, is_log_desc_mandatory: isLogDescMandatory,
+        log_desc_mandatory_service_po_ids: logDescMandatoryPOIds,
+      } = action.payload ?? {};
 
       // The session is re-scoped to the new role, so the backend normally re-issues the access
       // token. Only replace what it actually sent — a response that rotates the access token
@@ -147,6 +181,15 @@ const authSlice = createSlice({
       if (employee) {
         state.employee = employee;
         saveEmployee(employee);
+      }
+
+      if (typeof isLogDescMandatory === 'boolean') {
+        state.isLogDescMandatory = isLogDescMandatory;
+        saveLogDescMandatory(isLogDescMandatory);
+      }
+      if (Array.isArray(logDescMandatoryPOIds)) {
+        state.logDescMandatoryPOIds = logDescMandatoryPOIds.map(Number);
+        saveLogDescMandatoryPOIds(state.logDescMandatoryPOIds);
       }
 
       // Accessible forms are role-derived: drop the previous role's map so no menu entry from
@@ -177,6 +220,8 @@ const authSlice = createSlice({
       state.accessibleFormsLoaded = true;
       state.businessUnits = [];
       state.activeBuId = null;
+      state.isLogDescMandatory = false;
+      state.logDescMandatoryPOIds = null;
       clearAuth();
     },
   },
@@ -184,7 +229,7 @@ const authSlice = createSlice({
 
 export const {
   setCredentials, setTokens, setRoles, setAccessibleForms, setBusinessUnits, setActiveBu,
-  switchRole, logout,
+  switchRole, logout, setLogDescMandatory, setLogDescMandatoryPOIds,
 } = authSlice.actions;
 
 const EMPTY_PERMISSIONS = [];
@@ -208,6 +253,10 @@ export const selectAccessibleFormsLoaded = (state) => state.auth.accessibleForms
 // Employee Identity Migration: [] for an account with no BU (Platform Admin/Entity Admin; Admin can be mapped now).
 export const selectBusinessUnits = (state) => state.auth.businessUnits ?? EMPTY_BUS;
 export const selectActiveBuId = (state) => state.auth.activeBuId ?? null;
+
+// Entity rule: true when every work-log description is mandatory.
+export const selectIsLogDescMandatory = (state) => !!state.auth.isLogDescMandatory;
+export const selectLogDescMandatoryPOIds = (state) => state.auth.logDescMandatoryPOIds ?? null;
 
 // `is_original_data_visible` now lives on the BU, not the role (see companies.api.js's create
 // payload) — gates the Modified/Original hours-source toggle in Reports & Dashboard. Derived

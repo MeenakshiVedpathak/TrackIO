@@ -16,6 +16,7 @@ import {
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { SearchableSelect } from '@/components/ui/searchable-select';
+import { Switch } from '@/components/ui/switch';
 import { cn } from '@/utils/cn';
 import {
   Sheet,
@@ -32,6 +33,7 @@ const entitySchema = z.object({
     .max(200, 'Entity name cannot exceed 200 characters'),
   entity_admin_user_id: z.coerce.number().positive().optional().nullable(),
   status: z.enum(['active', 'inactive']).default('active'),
+  is_log_desc_mandatory: z.boolean().default(false),
 });
 
 const FormSkeleton = () => (
@@ -73,6 +75,7 @@ const EntityForm = () => {
       entity_name: '',
       entity_admin_user_id: null,
       status: 'active',
+      is_log_desc_mandatory: false,
     },
   });
 
@@ -82,6 +85,7 @@ const EntityForm = () => {
         entity_name: entity.entity_name ?? '',
         entity_admin_user_id: entity.entity_admin_user_id ?? entity.entity_admin?.id ?? null,
         status: entity.status ?? 'active',
+        is_log_desc_mandatory: entity.is_log_desc_mandatory === true,
       });
     }
   }, [entity, isEdit, form]);
@@ -198,6 +202,32 @@ const EntityForm = () => {
                       )}
                     />
                   </div>
+                </div>
+
+                <div className="space-y-2">
+                  <h3 className="text-xs font-semibold text-foreground border-b pb-1">Work Log Rules</h3>
+                  <FormField
+                    control={form.control}
+                    name="is_log_desc_mandatory"
+                    render={({ field }) => (
+                      <FormItem className="flex items-start justify-between gap-4 space-y-0 rounded-md border border-gray-200 bg-white p-3">
+                        <div className="space-y-0.5">
+                          <FormLabel htmlFor="is_log_desc_mandatory" className="text-xs font-medium">Log description mandatory</FormLabel>
+                          <p className="text-[11px] text-muted-foreground">
+                            Employees of this entity&apos;s Business Units must add a description to every work log entry.
+                          </p>
+                        </div>
+                        <FormControl>
+                          <Switch
+                            id="is_log_desc_mandatory"
+                            checked={!!field.value}
+                            onCheckedChange={field.onChange}
+                            aria-label="Log description mandatory"
+                          />
+                        </FormControl>
+                      </FormItem>
+                    )}
+                  />
                 </div>
 
               </form>

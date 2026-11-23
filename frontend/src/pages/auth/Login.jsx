@@ -82,7 +82,12 @@ const Login = () => {
     // dashboard, so this checks the full `roles[]` array rather than a singular role.
     const isEmployeeOnly = (roles ?? []).length > 0 && (roles ?? []).every((r) => r.name === 'Employee');
 
-    setCredentials({ employee, accessToken, refreshToken, roles });
+    // Entity rule — may ride on the top-level response or on the employee object.
+    const isLogDescMandatory = data.is_log_desc_mandatory ?? employee?.is_log_desc_mandatory ?? false;
+
+    const logDescMandatoryPOIds = data.log_desc_mandatory_service_po_ids ?? employee?.log_desc_mandatory_service_po_ids ?? null;
+
+    setCredentials({ employee, accessToken, refreshToken, roles, isLogDescMandatory, logDescMandatoryPOIds });
 
     // Role-Based Login: businessUnits no longer rides along on the login/select-role response —
     // fetch it separately now that we have `employee.id`. Backgrounded (not awaited) same as the

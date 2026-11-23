@@ -31,6 +31,8 @@ import { useEmployeeMappedProjects } from '@/hooks/useEmployeeProjects';
 import { useEmployeeEntries, useSaveWorkLogDay, useDeleteWorkLogEntry } from '@/hooks/useEmployeeWorkLog';
 import { useMyOffDayRequests } from '@/hooks/useOffDayRequests';
 import { useSaturdayOffRule } from '@/hooks/useSaturdayOffRule';
+import { useLogDescRequiredFor } from '@/hooks/useLogDescMandatory';
+import { LOG_DESC_REQUIRED_MESSAGE } from '@/utils/employeeMonthlySummary';
 import { isOffDay } from '@/utils/weekOffPolicy';
 import { useNotification } from '@/hooks/useNotification';
 import { ROUTES } from '@/constants/routes';
@@ -115,6 +117,7 @@ const EmployeeTimeEntry = () => {
   const navigate = useNavigate();
   const today = dayjs().format('YYYY-MM-DD');
   const { success, error: showError } = useNotification();
+  const isDescRequiredFor = useLogDescRequiredFor();
   const qc = useQueryClient();
   const { data: projects = [] } = useEmployeeMappedProjects();
   const saveDayMutation = useSaveWorkLogDay();
@@ -363,6 +366,11 @@ const EmployeeTimeEntry = () => {
       setFormError(segmentError);
       return;
     }
+    // Entity rule: this form has no line-level description, so every filled block needs its own.
+    if (isDescRequiredFor(selectedServicePOId) && filledSegments.some((s) => !String(s.description ?? '').trim())) {
+      setFormError(LOG_DESC_REQUIRED_MESSAGE);
+      return;
+    }
 
     setIsSaving(true);
     try {
@@ -409,8 +417,9 @@ const EmployeeTimeEntry = () => {
           ...filledSegments.map((seg) => ({
             service_po_id: values.service_po_id,
             hierarchy_node_id: hierarchyNodeId,
-            // Optional — an untouched box saves as an empty description rather than blocking the
-            // save, and `seg.description` is undefined on a freshly added block.
+            // Optional unless the entity's "description mandatory" rule is on (checked at the top of
+            // submit) — otherwise an untouched box saves as an empty description rather than blocking
+            // the save, and `seg.description` is undefined on a freshly added block.
             description: String(seg.description ?? '').trim(),
             time_entries: [{ start_time: seg.start_time, end_time: seg.end_time }],
           })),
@@ -713,6 +722,7 @@ const EmployeeTimeEntry = () => {
                         showAddButton={false}
                         scrollRows
                         minTime={WORKDAY_START_TIME}
+                        descriptionRequired={isDescRequiredFor(selectedServicePOId)}
                       />
                     </section>
                     </>

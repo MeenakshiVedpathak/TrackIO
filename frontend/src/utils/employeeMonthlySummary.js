@@ -153,9 +153,19 @@ export const buildDayEntries = (rows, day, edits, descriptions) =>
       description,
     }));
 
+// Entity rule "description mandatory for every work-log line" (see hooks/useLogDescMandatory).
+export const LOG_DESC_REQUIRED_MESSAGE = 'Description is mandatory for every log entry';
+export const isBlankDescription = (value) => !String(value ?? '').trim();
+
 // Mirrors the 400s the server enforces on a whole-day save, so the user sees the same wording
 // without a round trip. Returns the error string, or null if the day is valid.
-export const validateDayEntries = (entries, dateLabel, dailyHoursCap, lockedHours = 0) => {
+export const validateDayEntries = (entries, dateLabel, dailyHoursCap, lockedHours = 0, { requireDescription = false } = {}) => {
+  // `requireDescription`: boolean (every line) or (service_po_id) => boolean (per-PO Entity rule).
+  const isRequired = typeof requireDescription === 'function' ? requireDescription : () => !!requireDescription;
+  if (entries.some((entry) => isRequired(entry.service_po_id) && isBlankDescription(entry.description))) {
+    return LOG_DESC_REQUIRED_MESSAGE;
+  }
+
   const seen = new Set();
   for (const entry of entries) {
     const key = `${entry.service_po_id}:${entry.hierarchy_node_id ?? 'null'}`;

@@ -81,9 +81,14 @@ export const AddTimeBlockButton = ({ onClick, disabled, className, title }) => (
 // `minTime` (24-hour "HH:MM") is the earliest time any block may start or end — the Time Entry
 // screen's workday start. Hours/minutes before it are greyed out in both pickers rather than
 // merely rejected on save. Left unset, every time of day stays selectable.
+//
+// `descriptionRequired` (showDescription layout only) — the entity's "description mandatory for
+// every work-log line" rule. Swaps the "(optional)" captions for a required asterisk and flags any
+// started block (either time picked) whose description is still blank. Display only — the caller
+// still blocks the save.
 const TimeSegmentsInput = ({
   segments, onChange, disabled, showDescription = false, showAddButton = true, scrollRows = false,
-  minTime,
+  minTime, descriptionRequired = false,
 }) => {
   const scrollRef = useRef(null);
   const prevCountRef = useRef(segments.length);
@@ -139,8 +144,12 @@ const TimeSegmentsInput = ({
               <span>End Time</span>
               <span>Hours</span>
               {/* Called out as optional so an empty box doesn't read as an unfinished field —
-                  neither this component nor the Time Entry form validates it. */}
-              <span>Description <span className="font-normal">(optional)</span></span>
+                  unless the entity rule makes it mandatory, then it gets the required asterisk. */}
+              {descriptionRequired ? (
+                <span>Description <span className="text-destructive" aria-hidden="true">*</span></span>
+              ) : (
+                <span>Description <span className="font-normal">(optional)</span></span>
+              )}
               <span className="w-9" aria-hidden="true" />
             </div>
 
@@ -148,6 +157,21 @@ const TimeSegmentsInput = ({
               const isComplete = !!segment.start_time && !!segment.end_time;
               const isPartial = !segment.start_time !== !segment.end_time;
               const duration = isComplete ? sumSegmentHours([segment]) : 0;
+              // Only a started block is flagged — an untouched row is dropped on save anyway.
+              const isDescriptionMissing =
+                descriptionRequired &&
+                !!(segment.start_time || segment.end_time) &&
+                !String(segment.description ?? '').trim();
+              const descriptionMeta = (
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[10px] font-medium text-destructive">
+                    {isDescriptionMissing ? 'Description is required' : ''}
+                  </span>
+                  <span className="text-[10px] tabular-nums text-muted-foreground">
+                    {(segment.description ?? '').length} / {DESCRIPTION_MAX_LENGTH}
+                  </span>
+                </div>
+              );
               const descriptionField = (
                 <div className="flex flex-col gap-0.5">
                   <Input
@@ -157,10 +181,11 @@ const TimeSegmentsInput = ({
                     maxLength={DESCRIPTION_MAX_LENGTH}
                     placeholder="What did you work on?"
                     aria-label={`Description for time block ${index + 1}`}
+                    aria-required={descriptionRequired || undefined}
+                    aria-invalid={isDescriptionMissing || undefined}
+                    className={cn(isDescriptionMissing && 'border-destructive/70 focus-visible:ring-destructive/40')}
                   />
-                  <span className="self-end text-[10px] tabular-nums text-muted-foreground">
-                    {(segment.description ?? '').length} / {DESCRIPTION_MAX_LENGTH}
-                  </span>
+                  {descriptionMeta}
                 </div>
               );
               // Mobile-only — a full multi-line Textarea instead of the desktop row's single-line
@@ -175,11 +200,11 @@ const TimeSegmentsInput = ({
                     maxLength={DESCRIPTION_MAX_LENGTH}
                     placeholder="What did you work on?"
                     aria-label={`Description for time block ${index + 1}`}
-                    className="min-h-24"
+                    aria-required={descriptionRequired || undefined}
+                    aria-invalid={isDescriptionMissing || undefined}
+                    className={cn('min-h-24', isDescriptionMissing && 'border-destructive/70 focus-visible:ring-destructive/40')}
                   />
-                  <span className="self-end text-[10px] tabular-nums text-muted-foreground">
-                    {(segment.description ?? '').length} / {DESCRIPTION_MAX_LENGTH}
-                  </span>
+                  {descriptionMeta}
                 </div>
               );
               const hoursField = (
@@ -257,7 +282,12 @@ const TimeSegmentsInput = ({
 
                     <div className="space-y-1.5">
                       <p className="text-sm font-semibold text-foreground">
-                        Work Description <span className="text-xs font-normal text-muted-foreground">(optional)</span>
+                        Work Description{' '}
+                        {descriptionRequired ? (
+                          <span className="text-destructive" aria-hidden="true">*</span>
+                        ) : (
+                          <span className="text-xs font-normal text-muted-foreground">(optional)</span>
+                        )}
                       </p>
                       {descriptionFieldMobile}
                     </div>

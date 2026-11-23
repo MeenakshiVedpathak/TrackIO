@@ -3,6 +3,7 @@
 const { sequelize } = require('../models');
 const employeeWorkLogRepository = require('../repositories/employeeWorkLogRepository');
 const employeeWorkLogTimeEntryRepository = require('../repositories/employeeWorkLogTimeEntryRepository');
+const logDescriptionRuleService = require('./logDescriptionRuleService');
 const employeeRepository = require('../repositories/employeeRepository');
 const { sumHoursByMinute, toMinutes } = require('../utils/hoursSum');
 const timesheetService = require('./timesheetService');
@@ -460,7 +461,7 @@ const replaceDailyEntries = async (employeeId, companyId, data) => {
   // Approved-log lock (Employee + Date + PO): this replace-save never touches an approved row, and a
   // line against a PO that already has an approved log on this date is refused. Approved rows stay on the
   // date, so their hours still count towards the daily cap below.
-  await assertNoApprovedLogForPOs(employeeId, dateStr, dateStr, (data.entries || []).map((line) => line.service_po_id));
+  await assertNoApprovedLine(employeeId, dateStr, data.entries || []);
   const approvedHoursKept = (await employeeWorkLogRepository.findApprovedInRange(employeeId, dateStr, dateStr))
     .reduce((sum, row) => sum + parseFloat(row.hours), 0);
 
@@ -492,6 +493,12 @@ const replaceDailyEntries = async (employeeId, companyId, data) => {
   // resolveHoursAndTimeEntries(). The 12-hour/day cap below, and everything
   // downstream, uses these resolved values, never the raw line.hours.
   const resolvedTimes = lines.map((line) => resolveHoursAndTimeEntries(line));
+
+  await logDescriptionRuleService.assertDescriptionsProvided(employeeId, lines.map((line) => ({
+    description: line.description,
+    segmentDescriptions: (line.time_entries || []).map((entry) => entry.description),
+    label: `Service PO #${line.service_po_id}, ${dateStr}`,
+  })));
 
   // 12-hour/day cap, computed purely from this payload — the old rows for
   // this date are being replaced wholesale, so there is nothing left in the
@@ -668,6 +675,27 @@ const assertNoApprovedLogForPOs = async (employeeId, startDate, endDate, service
 };
 
 /**
+ * Approved-log lock, per LINE: a line is (service_po_id + hierarchy_node_id, null being its own line). Only
+ * a line that is already approved on that date is locked — other lines of the same PO (new / pending /
+ * reverted / rejected) stay open. Throws 409 only when one of the given lines IS an approved line.
+ *
+ * @param {number} employeeId
+ * @param {string} dateStr - "YYYY-MM-DD"
+ * @param {Array<{ service_po_id: number, hierarchy_node_id?: number|null }>} lines - the lines being written
+ * @param {{ excludeId?: number|null }} [options] - the row being edited (checked by its own status)
+ */
+const assertNoApprovedLine = async (employeeId, dateStr, lines, { excludeId = null } = {}) => {
+  const poIds = [...new Set((lines || []).map((l) => Number(l.service_po_id)).filter(Boolean))];
+  if (poIds.length === 0) return;
+  const approved = await employeeWorkLogRepository.findApprovedInRange(employeeId, dateStr, dateStr, { servicePOIds: poIds, excludeId });
+  if (approved.length === 0) return;
+  const approvedKeys = new Set(approved.map((r) => `${r.service_po_id}|${r.hierarchy_node_id || 0}`));
+  if (lines.some((l) => approvedKeys.has(`${l.service_po_id}|${l.hierarchy_node_id || 0}`))) {
+    throw conflictError(`This line is already approved for ${dateStr}. Ask your approver to revert it to edit.`);
+  }
+};
+
+/**
  * Update an existing work log entry. Employee may only edit their own
  * entries — EXCLUDING already-synced ones: once a row has been included in
  * a completed Sync run (status='synced'), the corresponding official record
@@ -749,7 +777,13 @@ const updateEntry = async (employeeId, companyId, id, data) => {
 
   const hierarchyNode = await resolveHierarchyNode(hierarchyNodeId, servicePOId);
 
-  await assertNoApprovedLogForPOs(employeeId, dateStr, dateStr, [servicePOId], { excludeId: id });
+  await assertNoApprovedLine(employeeId, dateStr, [{ service_po_id: servicePOId, hierarchy_node_id: hierarchyNodeId }], { excludeId: id });
+
+  await logDescriptionRuleService.assertDescriptionsProvided(employeeId, [{
+    description: effectiveDescription,
+    segmentDescriptions: effectiveTimeEntries.map((entry) => entry.description),
+    label: `Service PO #${servicePOId}, ${dateStr}`,
+  }]);
 
   const duplicate = await employeeWorkLogRepository.checkDuplicate(
     employeeId, servicePOId, hierarchyNodeId || null, dateStr, id, companyId
@@ -851,7 +885,7 @@ const addTimeEntries = async (employeeId, companyId, data) => {
   const dateStr = assertNotFutureDate(data.work_date);
   await assertNoMonthlyLogForDate(employeeId, dateStr, companyId, 'TIME_BASED');
   await assertProjectMapped(employeeId, data.service_po_id, companyId);
-  await assertNoApprovedLogForPOs(employeeId, dateStr, dateStr, [data.service_po_id]);
+  await assertNoApprovedLine(employeeId, dateStr, [{ service_po_id: data.service_po_id, hierarchy_node_id: data.hierarchy_node_id }]);
 
   const { po } = await timesheetService.resolveManualEntryReferences(
     { employee_id: employeeId, service_po_id: data.service_po_id, sub_project_id: data.sub_project_id },
@@ -918,6 +952,12 @@ const addTimeEntries = async (employeeId, companyId, data) => {
   const { hours: newTotalHours, resolvedEntries: combinedResolvedEntries } =
     resolveTimeEntries([...existingEntries, ...withFallbackDescription(data.time_entries, effectiveDescription)]);
   const newlyResolvedEntries = combinedResolvedEntries.slice(existingEntries.length);
+
+  await logDescriptionRuleService.assertDescriptionsProvided(employeeId, [{
+    description: effectiveDescription,
+    segmentDescriptions: combinedResolvedEntries.map((entry) => entry.description),
+    label: `Service PO #${data.service_po_id}, ${dateStr}`,
+  }]);
 
   await assertDailyCap(employeeId, dateStr, newTotalHours, companyId, existing ? existing.id : null);
 
@@ -1115,11 +1155,33 @@ const getEntries = async (employeeId, _companyId, query) => {
     };
   });
 
+  // include_deleted: the employee's one-at-a-time deleted lines ride along on page 1 only (never
+  // duplicated on later pages) and don't count toward meta, so pagination stays exactly as before.
+  if (query.include_deleted && page === 1 && (!query.status || query.status === 'deleted')) {
+    const deletedRows = await employeeWorkLogRepository.findDeletedByEmployee({
+      employeeId, startDate: query.startDate, endDate: query.endDate, poId: query.poId,
+    });
+    data.push(...deletedRows.map((row) => {
+      const plain = row.toJSON();
+      return {
+        ...plain,
+        status_before_delete: plain.status,
+        status: 'deleted',
+        is_deleted: true,
+        deleted_at: plain.deleted_at ? new Date(plain.deleted_at).toISOString() : null,
+        entry_type: (plain.timeEntries && plain.timeEntries.length > 0) ? 'TIME_BASED' : 'HOURLY',
+      };
+    }));
+  }
+
   const totalPages = Math.ceil(count / limit) || 0;
 
   return {
     data,
-    meta: { total: count, page, limit, totalPages, hasNext: page < totalPages, hasPrev: page > 1 },
+    meta: {
+      total: count, page, limit, totalPages, hasNext: page < totalPages, hasPrev: page > 1,
+      is_log_desc_mandatory: await logDescriptionRuleService.isLogDescriptionMandatory(employeeId),
+    },
   };
 };
 
@@ -1150,7 +1212,7 @@ const deleteEntry = async (employeeId, companyId, id) => {
     throw conflictError('This timesheet log is approved and cannot be deleted.');
   }
 
-  await employeeWorkLogRepository.deleteById(id, companyId);
+  await employeeWorkLogRepository.deleteById(id, companyId, employeeId);
   logger.info('Employee work log entry deleted', { workLogId: id, employeeId, companyId });
 
 };
@@ -1169,6 +1231,8 @@ const deleteEntry = async (employeeId, companyId, id) => {
 const getCalendarSummary = async (employeeId, month, year, companyId) => {
   const summaryRows = await employeeWorkLogRepository.getCalendarSummary({ employeeId, month, year, companyId });
   const summaryByDate = new Map(summaryRows.map((row) => [row.date, row]));
+  const statusCountRows = await employeeWorkLogRepository.getCalendarStatusCounts({ employeeId, month, year });
+  const statusCountsByDate = new Map(statusCountRows.map(({ date, ...counts }) => [date, counts]));
 
   const { startDate, endDate } = dateHelper.getMonthBounds(month, year);
   const todayStr = toDateString(dateHelper.nowDate());
@@ -1182,6 +1246,7 @@ const getCalendarSummary = async (employeeId, month, year, companyId) => {
       totalHours: entry ? entry.totalHours : 0,
       hasEntries: !!entry,
       futureDisabled: cursor > todayStr,
+      statusCounts: statusCountsByDate.get(cursor) || { approved: 0, pending: 0, rejected: 0, reverted: 0, deleted: 0 },
     });
     const next = new Date(cursor);
     next.setDate(next.getDate() + 1);
@@ -1328,7 +1393,7 @@ const getDailyEntries = async (employeeId, date, companyId) => {
   const hoursByPOId = groupHoursByServicePO(breakdownRows);
   const service_pos = buildServicePOsForDate(mappedPOs, hierarchyRowsByPOId, hoursByPOId);
 
-  return { date: dateStr, service_pos };
+  return { date: dateStr, service_pos, is_log_desc_mandatory: await logDescriptionRuleService.isLogDescriptionMandatory(employeeId) };
 };
 
 /**
@@ -1627,6 +1692,7 @@ const remindPrimaryManagerForApproval = async (employeeId, employeeName, company
 
 module.exports = {
   assertNoApprovedLogForPOs,
+  assertNoApprovedLine,
   replaceDailyEntries,
   updateEntry,
   addTimeEntries,

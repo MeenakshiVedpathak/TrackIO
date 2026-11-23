@@ -152,6 +152,18 @@ const EntityList = () => {
       size: 140,
       cell: (info) => <StatusToggle entity={info.row.original} />,
     }),
+    columnHelper.accessor('is_log_desc_mandatory', {
+      header: 'Log Description',
+      size: 150,
+      cell: (info) =>
+        info.getValue() === true ? (
+          <span className="inline-flex items-center rounded-full bg-blue-50 px-2 py-0.5 text-[11px] font-medium text-blue-700 ring-1 ring-inset ring-blue-200">
+            Mandatory
+          </span>
+        ) : (
+          <span className="text-xs text-muted-foreground">Optional</span>
+        ),
+    }),
     columnHelper.accessor('created_at', {
       header: 'Created Date',
       size: 140,
@@ -330,6 +342,12 @@ const EntityList = () => {
                     <span className={entity.status === 'active' ? 'text-green-600' : 'text-slate-400'}>
                       {entity.status === 'active' ? 'Active' : 'Inactive'}
                     </span>
+                    {entity.is_log_desc_mandatory === true && (
+                      <>
+                        {' · '}
+                        <span className="text-blue-700">Log description mandatory</span>
+                      </>
+                    )}
                   </p>
                 </div>
                 <DropdownMenu>

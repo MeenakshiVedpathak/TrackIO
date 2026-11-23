@@ -247,6 +247,8 @@ const TOKEN_KEYS = {
   AI_COPILOT_CONVERSATION: 'rut_ai_copilot_conversation',
   BUSINESS_UNITS: 'rut_business_units',
   ACTIVE_BU_ID: 'rut_active_bu_id',
+  LOG_DESC_MANDATORY: 'rut_log_desc_mandatory',
+  LOG_DESC_MANDATORY_PO_IDS: 'rut_log_desc_mandatory_po_ids',
 };
 
 export const getAccessToken = () => localStorage.getItem(TOKEN_KEYS.ACCESS);
@@ -331,6 +333,29 @@ export const saveActiveBuId = (buId) => {
   }
 };
 
+// Entity rule is_log_desc_mandatory — every work-log description is required when true.
+export const getStoredLogDescMandatory = () => localStorage.getItem(TOKEN_KEYS.LOG_DESC_MANDATORY) === 'true';
+
+// Per-Service-PO version of the rule: ids of the Service POs whose Entity requires a
+// description. null = unknown (older backend) -> fall back to the boolean above.
+export const getStoredLogDescMandatoryPOIds = () => {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(TOKEN_KEYS.LOG_DESC_MANDATORY_PO_IDS));
+    return Array.isArray(parsed) ? parsed.map(Number) : null;
+  } catch {
+    return null;
+  }
+};
+
+export const saveLogDescMandatoryPOIds = (ids) => {
+  if (Array.isArray(ids)) localStorage.setItem(TOKEN_KEYS.LOG_DESC_MANDATORY_PO_IDS, JSON.stringify(ids));
+  else localStorage.removeItem(TOKEN_KEYS.LOG_DESC_MANDATORY_PO_IDS);
+};
+
+export const saveLogDescMandatory = (value) => {
+  localStorage.setItem(TOKEN_KEYS.LOG_DESC_MANDATORY, value ? 'true' : 'false');
+};
+
 // Polls localStorage (not Redux — this module stays React-free, same reason
 // crossBuScopeForAdmin/canScopeAcrossBus above read from storage) for up to ~2s, waiting for
 // MainLayout's useSyncBusinessUnits() fetch (already in flight on every authenticated page load)
@@ -364,6 +389,8 @@ export const clearAuth = () => {
   localStorage.removeItem(TOKEN_KEYS.AI_COPILOT_CONVERSATION);
   localStorage.removeItem(TOKEN_KEYS.BUSINESS_UNITS);
   localStorage.removeItem(TOKEN_KEYS.ACTIVE_BU_ID);
+  localStorage.removeItem(TOKEN_KEYS.LOG_DESC_MANDATORY);
+  localStorage.removeItem(TOKEN_KEYS.LOG_DESC_MANDATORY_PO_IDS);
 };
 
 // ── Logout handler (avoids circular dependency with store) ──

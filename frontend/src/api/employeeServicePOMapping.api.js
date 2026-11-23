@@ -61,8 +61,14 @@ export const employeeServicePOMappingApi = {
   // Employee Master's "Manage Service PO Mapping" action — backend pre-filters eligible POs by
   // the employee's BU (or returns the whole tenant + `unrestricted: true` for Service PO
   // Admin/Delivery Head), so the frontend just renders what comes back.
-  getOptions: (employeeId) =>
-    apiClient.get(`/employee-servicepo-mapping/employee/${employeeId}/options`).then((r) => r.data?.data),
+  // `businessUnitIds` (optional): the BUs currently ticked, not yet saved — eligibility is then
+  // computed from them instead of the employee's saved BU mapping.
+  getOptions: (employeeId, businessUnitIds) =>
+    apiClient
+      .get(`/employee-servicepo-mapping/employee/${employeeId}/options`, {
+        params: businessUnitIds ? { business_unit_ids: businessUnitIds.join(',') } : undefined,
+      })
+      .then((r) => r.data?.data),
   // Replaces the full mapped set in one call — always send every checked id, not a diff. Each
   // entry is either a plain Service PO id (not PM) or `{ service_po_id, is_project_manager }`
   // for a row whose PM status needs to be stated.
