@@ -172,6 +172,7 @@ export const ROUTES = {
   REPORT_RESOURCE_COST_UTILIZATION: '/reports/resource-cost-utilization',
   REPORT_PROJECT_TIMESHEET: '/reports/project-timesheet',
   REPORT_CROSS_BU_EMPLOYEE_PO_HOURS: '/reports/cross-bu-employee-po-hours',
+  REPORT_WORK_LOG_SYNC_COMPARISON: '/reports/work-log-sync-comparison',
   REPORT_EMPLOYEE_ROLE_BU_MAPPING: '/reports/employee-role-bu-mapping',
   REPORT_TEAM_LEAD_EMPLOYEE_PROJECT_HOURS: '/reports/team-lead-employee-project-hours',
   REPORT_TEAM_LEAD_EMPLOYEE_PO_HOURS: '/reports/team-lead-employee-po-hours',

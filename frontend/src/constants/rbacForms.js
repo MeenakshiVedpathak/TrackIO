@@ -20,7 +20,7 @@ import {
   TrendingUp, LineChart, Target, Percent, Award, BatteryCharging, AlertTriangle, Crown,
   ReceiptText, GitCompare, Scale, BarChart3, Building, Activity, Armchair, Users2,
   ClipboardCheck, XCircle, UserCog, CalendarPlus, Briefcase, FileSpreadsheet,
-  Gauge, UsersRound, ArrowLeftRight, History,
+  Gauge, UsersRound, ArrowLeftRight, History, GitCompareArrows,
 } from 'lucide-react';
 import { ROUTES } from '@/constants/routes';
 
@@ -194,6 +194,9 @@ export const FORM_NAMES = {
   // Net-new report — no Form Master row exists yet; guessed name pending backend seeding (see
   // this file's own header comment).
   REPORT_CROSS_BU_EMPLOYEE_PO_HOURS: 'Cross-BU Employee & PO Hours',
+  // Net-new report — must match the Form Master row exactly (same caveat as the Cross-BU entry
+  // above). The route uses allowIfNoFormsMapped, same as Cross-BU / Team Lead reports.
+  REPORT_WORK_LOG_SYNC_COMPARISON: 'Work Log Sync Comparison',
   // Guessed name — brand new report (backend spec dated 2026, GET /reports/employee-role-bu-mapping
   // confirmed ready). Confirm against the real GET /roles/forms response once a Form Master row
   // is seeded — the route below uses allowIfNoFormsMapped so it still works by direct link before
@@ -300,6 +303,7 @@ export const FORM_ROUTE_CONFIG = {
   [FORM_NAMES.REPORT_RESOURCE_COST_UTILIZATION]: { to: ROUTES.REPORT_RESOURCE_COST_UTILIZATION, icon: IndianRupee, description: 'Per-employee monthly cost contribution, projected vs. actual utilization, across a month range.' },
   [FORM_NAMES.REPORT_PROJECT_TIMESHEET]: { to: ROUTES.REPORT_PROJECT_TIMESHEET, icon: FileSpreadsheet, description: 'Employee-wise, day-wise timesheet entries with work description, Project Manager, leave and approval status.' },
   [FORM_NAMES.REPORT_CROSS_BU_EMPLOYEE_PO_HOURS]: { to: ROUTES.REPORT_CROSS_BU_EMPLOYEE_PO_HOURS, icon: ArrowLeftRight, description: 'Employees logging hours on Service POs outside their own Business Unit, and how much of each BU’s work is covered cross-BU.' },
+  [FORM_NAMES.REPORT_WORK_LOG_SYNC_COMPARISON]: { to: ROUTES.REPORT_WORK_LOG_SYNC_COMPARISON, icon: GitCompareArrows, description: 'Every work log entry with the hours logged before sync next to the official hours after the monthly cap.' },
   [FORM_NAMES.REPORT_EMPLOYEE_ROLE_BU_MAPPING]: { to: ROUTES.REPORT_EMPLOYEE_ROLE_BU_MAPPING, icon: UserCog, description: "Each employee's assigned roles, Business Units, and Sub-BUs in one place." },
   [FORM_NAMES.REPORT_TEAM_LEAD_EMPLOYEE_PROJECT_HOURS]: { to: ROUTES.REPORT_TEAM_LEAD_EMPLOYEE_PROJECT_HOURS, icon: Users, description: 'Work-log entries of the employees mapped to you as Primary or Secondary manager.' },
   [FORM_NAMES.REPORT_TEAM_LEAD_EMPLOYEE_PO_HOURS]: { to: ROUTES.REPORT_TEAM_LEAD_EMPLOYEE_PO_HOURS, icon: Table2, description: 'Hours per Service PO for each employee mapped to you, as an employee × PO matrix.' },

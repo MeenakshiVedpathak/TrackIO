@@ -38,6 +38,7 @@ const NAV = [
   { label: 'BU Employee PO Hours', to: ROUTES.REPORT_BU_ADMIN_EMPLOYEE_PO_HOURS },
   { label: 'Project Manager Employee PO Hours', to: ROUTES.REPORT_PROJECT_MANAGER_EMPLOYEE_PO_HOURS },
   { label: 'Cross-BU Employee & PO Hours', to: ROUTES.REPORT_CROSS_BU_EMPLOYEE_PO_HOURS },
+  { label: 'Work Log Sync Comparison', to: ROUTES.REPORT_WORK_LOG_SYNC_COMPARISON },
 ];
 
 // Module-level so the context value keeps a stable identity across renders.

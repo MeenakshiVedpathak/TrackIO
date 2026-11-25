@@ -146,6 +146,7 @@ const ResourceWiseBenchReport = lazy(() => import('@/pages/reports/ResourceWiseB
 const ResourceCostUtilizationReport = lazy(() => import('@/pages/reports/ResourceCostUtilizationReport'));
 const ProjectWiseTimesheetReport = lazy(() => import('@/pages/reports/ProjectWiseTimesheetReport'));
 const CrossBuEmployeePoHoursReport = lazy(() => import('@/pages/reports/CrossBuEmployeePoHoursReport'));
+const WorkLogSyncComparisonReport = lazy(() => import('@/pages/reports/WorkLogSyncComparisonReport'));
 const EmployeeRoleBuMappingReport = lazy(() => import('@/pages/reports/EmployeeRoleBuMappingReport'));
 const TeamLeadEmployeeProjectHours = lazy(() => import('@/pages/reports/TeamLeadEmployeeProjectHours'));
 const TeamLeadEmployeePoHours = lazy(() => import('@/pages/reports/TeamLeadEmployeePoHours'));
@@ -478,6 +479,7 @@ const AppRoutes = () => {
           <Route path={ROUTES.REPORT_EMPLOYEE_WORK_LOG_HOURS_SUMMARY} element={<ProtectedRoute formName={FORM_NAMES.REPORT_EMPLOYEE_WORK_LOG_HOURS_SUMMARY} allowIfNoFormsMapped><EmployeeWorkLogHoursSummaryReport /></ProtectedRoute>} />
           <Route path={ROUTES.REPORT_PROJECT_TIMESHEET} element={<ProtectedRoute formName={FORM_NAMES.REPORT_PROJECT_TIMESHEET} allowIfNoFormsMapped><ProjectWiseTimesheetReport /></ProtectedRoute>} />
           <Route path={ROUTES.REPORT_CROSS_BU_EMPLOYEE_PO_HOURS} element={<ProtectedRoute formName={FORM_NAMES.REPORT_CROSS_BU_EMPLOYEE_PO_HOURS} allowIfNoFormsMapped><CrossBuEmployeePoHoursReport /></ProtectedRoute>} />
+          <Route path={ROUTES.REPORT_WORK_LOG_SYNC_COMPARISON} element={<ProtectedRoute formName={FORM_NAMES.REPORT_WORK_LOG_SYNC_COMPARISON} allowIfNoFormsMapped><WorkLogSyncComparisonReport /></ProtectedRoute>} />
           <Route path={ROUTES.REPORT_EMPLOYEE_ROLE_BU_MAPPING} element={<ProtectedRoute formName={FORM_NAMES.REPORT_EMPLOYEE_ROLE_BU_MAPPING} allowIfNoFormsMapped><EmployeeRoleBuMappingReport /></ProtectedRoute>} />
           <Route path={ROUTES.REPORT_TEAM_LEAD_EMPLOYEE_PROJECT_HOURS} element={<ProtectedRoute formName={FORM_NAMES.REPORT_TEAM_LEAD_EMPLOYEE_PROJECT_HOURS} allowIfNoFormsMapped><TeamLeadEmployeeProjectHours /></ProtectedRoute>} />
           <Route path={ROUTES.REPORT_TEAM_LEAD_EMPLOYEE_PO_HOURS} element={<ProtectedRoute formName={FORM_NAMES.REPORT_TEAM_LEAD_EMPLOYEE_PO_HOURS} allowIfNoFormsMapped><TeamLeadEmployeePoHours /></ProtectedRoute>} />

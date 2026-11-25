@@ -35,6 +35,8 @@ const DataTable = ({
   pagination,
   onPageChange,
   onPageSizeChange,
+  // Optional page-size choices for the "Rows per page" select (default 10/20/50/100).
+  pageSizeOptions,
   // Server-side sorting props
   sorting: externalSorting,
   onSortingChange: onExternalSortingChange,
@@ -419,7 +421,7 @@ const DataTable = ({
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    {Array.from(new Set([10, 20, 50, 100, Number(pagination.limit)])).sort((a,b) => a - b).map((size) => (
+                    {Array.from(new Set([...(pageSizeOptions ?? [10, 20, 50, 100]), Number(pagination.limit)])).sort((a,b) => a - b).map((size) => (
                       <SelectItem key={size} value={String(size)}>{size}</SelectItem>
                     ))}
                   </SelectContent>
